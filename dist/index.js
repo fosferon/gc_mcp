@@ -552,27 +552,25 @@ Actions: status (last runs, pending reviews), run (trigger sync), rules (list ru
     }),
 }, async (params) => daemonCall("/gc/sync", params));
 // ════════════════════════════════════════════════════════════════
-// DAEMON TOOLS — Tidewave (Elixir project introspection proxy)
+// DAEMON TOOLS — MCP Client Proxy
 // ════════════════════════════════════════════════════════════════
-server.registerTool("gc_tidewave", {
-    description: `Proxy to Tidewave for Elixir project introspection. Connect once, use from any agent.
-Actions: connect (to a Tidewave port), disconnect, status, eval (run Elixir code), docs (module/function docs),
-source (source location), sql (Ecto SQL query), schemas (list Ecto schemas), logs (application logs), search_docs (hex docs search).`,
+server.registerTool("gc_mcpclient", {
+    description: `General-purpose MCP client proxy. Connect to any MCP server once, use from any agent.
+Supports all transports: streamable_http (default), sse (e.g. Tidewave), stdio, websocket.
+Actions: connect (register + connect), disconnect, remove, servers (list registered), tools (list tools), call (invoke a tool), scan (health-check all).`,
     inputSchema: z.object({
-        action: z.enum(["connect", "disconnect", "status", "eval", "docs", "source", "sql", "schemas", "logs", "search_docs", "list_tools"]).describe("Action to perform"),
-        port: z.number().optional().describe("Tidewave port to connect to (for connect action)"),
-        code: z.string().optional().describe("Elixir code to evaluate (for eval)"),
-        reference: z.string().optional().describe("Module or Module.function/arity (for docs/source)"),
-        query: z.string().optional().describe("SQL query (for sql action)"),
-        repo: z.string().optional().describe("Ecto repo module name (for sql)"),
-        arguments: z.array(z.any()).optional().describe("Query arguments (for sql) or eval arguments"),
-        q: z.string().optional().describe("Search query (for search_docs)"),
-        packages: z.array(z.string()).optional().describe("Package names to search (for search_docs)"),
-        tail: z.number().optional().describe("Number of log entries (for logs, default 50)"),
-        grep: z.string().optional().describe("Filter logs by regex (for logs)"),
-        timeout: z.number().optional().describe("Eval timeout in ms"),
+        action: z.enum(["connect", "disconnect", "remove", "servers", "tools", "call", "scan"]).describe("Action to perform"),
+        name: z.string().optional().describe("Server name (for connect/disconnect/remove)"),
+        url: z.string().optional().describe("Server URL (for connect)"),
+        transport: z.string().optional().describe("Transport type: streamable_http (default), sse, stdio, websocket"),
+        description: z.string().optional().describe("Server description (for connect)"),
+        metadata: z.record(z.unknown()).optional().describe("Extra config (e.g. {command, args} for stdio)"),
+        server: z.string().optional().describe("Server name (for tools/call)"),
+        tool: z.string().optional().describe("Tool name to call (for call action)"),
+        arguments: z.record(z.unknown()).optional().describe("Tool arguments (for call)"),
+        timeout: z.number().optional().describe("Call timeout in seconds"),
     }),
-}, async (params) => daemonCall("/gc/tidewave", params));
+}, async (params) => daemonCall("/gc/mcpclient", params));
 // ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Ticker (Situational Awareness)
 // ════════════════════════════════════════════════════════════════
