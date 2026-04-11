@@ -22,14 +22,28 @@ import { homedir } from "node:os";
 // HTTP Client — gc_daemon at localhost:4242
 // ════════════════════════════════════════════════════════════════
 const GC_BASE = process.env.GC_DAEMON_URL || "http://localhost:4242";
-async function gcPost(path, body) {
+/**
+ * POST to gc_daemon.
+ *
+ * timeoutMs controls the client-side abort:
+ *   - undefined (default) → 15s, suitable for fire-and-forget tools
+ *   - positive number     → explicit client-side deadline in ms
+ *   - null                → no client-side abort at all (fetch waits forever)
+ *
+ * Long-running tools (wait-mode dispatch, workflow watch) must override the
+ * default — the 15s default exists only because most tools are interactive.
+ */
+async function gcPost(path, body, timeoutMs = 15_000) {
     const url = `${GC_BASE}${path}`;
-    const resp = await fetch(url, {
+    const init = {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(body),
-        signal: AbortSignal.timeout(15_000),
-    });
+    };
+    if (timeoutMs !== null && timeoutMs !== undefined) {
+        init.signal = AbortSignal.timeout(timeoutMs);
+    }
+    const resp = await fetch(url, init);
     if (!resp.ok) {
         const text = await resp.text().catch(() => "");
         throw new Error(`gc_daemon ${path} failed (${resp.status}): ${text}`);
@@ -61,9 +75,9 @@ function err(msg) {
     return { content: [{ type: "text", text: msg }], isError: true };
 }
 /** Call daemon and return formatted JSON */
-async function daemonCall(endpoint, params) {
+async function daemonCall(endpoint, params, timeoutMs = 15_000) {
     try {
-        const result = await gcPost(endpoint, clean(params));
+        const result = await gcPost(endpoint, clean(params), timeoutMs);
         return text(JSON.stringify(result, null, 2));
     }
     catch (e) {
@@ -389,10 +403,34 @@ Default is fire-and-forget (returns job_id immediately). Set wait=true to block 
         cwd: z.string().optional().describe("Working directory (optional, defaults to project default)"),
         issue: z.string().optional().describe("Bee issue ID to link (optional)"),
         wait: z.boolean().optional().describe("If true, block until agent completes (default: false)"),
-        timeout: z.number().optional().describe("Max seconds to wait when wait=true (default: 300)"),
+        timeout: z
+            .union([z.number(), z.literal("infinite"), z.literal("infinity")])
+            .optional()
+            .describe('Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity" to disable the wrapper kill entirely. Also governs the client-side HTTP deadline for wait=true calls.'),
         job_id: z.string().optional().describe("Job ID (for status/output actions)"),
     }),
-}, async (params) => daemonCall("/gc/dispatch", params));
+}, async (params) => {
+    // Compute the client-side HTTP abort deadline from the user's timeout.
+    // - Non-dispatch actions (status/output) → short default, they return fast.
+    // - wait: false → short default, daemon returns job_id immediately.
+    // - wait: true + "infinite" → no client abort at all.
+    // - wait: true + integer → (seconds * 1000) + 10s buffer past daemon deadline.
+    // - wait: true + undefined → 30 min default + 10s buffer.
+    let clientTimeoutMs = 15_000;
+    if (params.action === "dispatch" && params.wait === true) {
+        const t = params.timeout;
+        if (t === "infinite" || t === "infinity") {
+            clientTimeoutMs = null; // wait forever
+        }
+        else if (typeof t === "number" && t > 0) {
+            clientTimeoutMs = t * 1000 + 10_000;
+        }
+        else {
+            clientTimeoutMs = 1_800_000 + 10_000; // daemon default + buffer
+        }
+    }
+    return daemonCall("/gc/dispatch", params, clientTimeoutMs);
+});
 // ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Schedule
 // ════════════════════════════════════════════════════════════════
