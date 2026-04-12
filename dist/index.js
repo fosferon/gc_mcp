@@ -521,33 +521,68 @@ Due accepts: ISO timestamps, relative times.`,
 // DAEMON TOOLS — Workflow
 // ════════════════════════════════════════════════════════════════
 server.registerTool("gc_workflow", {
-    description: `Run deterministic workflows from .pi/workflows/.
+    description: `Run deterministic workflows from ~/.config/gc/workflows/.
 Workflows are YAML pipelines with step types: tool, prompt, dispatch, each, branch.
-Actions: run (sync by default), list, show, detail, context, watch, resume.
 
-Response shaping (run action):
-  - Default: returns only the LAST step's result (terse — saves tokens)
-  - select: "step_id" — return only that specific step's result
-  - select: "step_a,step_b" — return multiple specific steps
-  - return: "full" — return everything (all step results + trace) for debugging
-  - return: "steps" — return all step results keyed by step_id, no trace
-  - return: "trace" — return trace only, no results
-  - async: true — return execution_id immediately; fetch results later via show/context
+Actions:
+  - run (sync by default, or async: true)
+  - list_workflows — list YAML definitions (defaults to summary: name/file/description/size)
+  - list_executions — list past runs (defaults to summary: no runtime blob)
+  - list — alias for list_executions (backward compat)
+  - show (alias: get_execution) — one execution with full runtime
+  - detail — per-step breakdown for an execution
+  - context — inspect runtime context/keys for an execution
+  - resume — re-run from a checkpoint
+  - watch — poll until status changes
+
+Response shaping:
+
+  run:
+    - Default: returns only the LAST step's result (terse — saves tokens)
+    - select: "step_id" — return only that specific step's result
+    - select: "step_a,step_b" — return multiple specific steps
+    - return: "full" — everything (all step results + trace)
+    - return: "steps" — all step results keyed by step_id, no trace
+    - return: "trace" — trace only, no results
+    - async: true — return execution_id immediately
+
+  list_workflows:
+    - Default: summary — name, file, description, size_bytes (no YAML body)
+    - return: "full" — includes the YAML 'body' field for every workflow
+    - select: "name1,name2" — return full bodies for the named workflows only
+
+  list_executions:
+    - Default: summary — id, workflow, status, started_at, updated_at (no runtime blob)
+    - return: "full" — includes 'runtime' JSON for every row (can be large)
+    - select: "id,status" — return only the named fields per row
 
 Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
     inputSchema: z.object({
-        action: z.enum(["run", "list", "show", "detail", "context", "watch", "resume"]).describe("Action to perform"),
+        action: z.enum([
+            "run",
+            "list",
+            "list_workflows",
+            "list_executions",
+            "show",
+            "get_execution",
+            "detail",
+            "context",
+            "watch",
+            "resume",
+        ]).describe("Action to perform"),
         workflow: z.string().optional().describe("Workflow name (for run/resume)"),
         params: z.string().optional().describe("JSON parameters for the workflow"),
         async: z.boolean().optional().describe("If true, run returns immediately with execution_id (run action only)"),
+        status: z.string().optional().describe("Filter list_executions by status (running/completed/failed/halted)"),
+        limit: z.number().optional().describe("Max rows for list_executions (default 20)"),
         select: z
             .string()
             .optional()
-            .describe('Cherry-pick step result(s) by step ID. Single: "synthesise". Multiple: "step_a,step_b". Takes priority over return.'),
+            .describe('Cherry-pick fields/steps. run: step IDs ("step_a,step_b"). list_workflows: workflow names (returns full body). list_executions: execution field names. Takes priority over return.'),
         return: z
-            .enum(["result", "full", "steps", "trace"])
+            .enum(["result", "full", "steps", "trace", "summary"])
             .optional()
-            .describe('(run only) Response shape. "result" (default) = last step only. "full" = everything. "steps" = all results. "trace" = trace only.'),
+            .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full".'),
         id: z.string().optional().describe("Execution ID (for show/resume/detail/context/watch)"),
         execution_id: z.string().optional().describe("Execution ID (alias for id)"),
         key: z.string().optional().describe("Context key to inspect (for context action)"),
