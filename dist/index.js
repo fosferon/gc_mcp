@@ -103,25 +103,41 @@ const server = new McpServer({ name: "gc", version: "1.0.0" }, {
 server.registerTool("gc_recall", {
     description: `Search the memory bank for facts matching a query. Uses FTS5/BM25 — instant, zero cost.
 Falls back to hindsight (expensive, deep) only if no local results and hindsight is available.
-Returns ranked facts with bank attribution and match scores.`,
+Returns ranked facts with bank attribution and match scores.
+
+Superseded facts (those replaced via gc_retain supersedes) are EXCLUDED by default — you get current truth only.
+Each returned fact may include a "superseded_by" field pointing to the fact that replaced it (only visible when include_superseded: true).
+Use include_superseded: true for historical audits.`,
     inputSchema: z.object({
         query: z.string().describe("Natural language search query"),
         bank: z.string().optional().describe("Filter to specific bank (omit for global search)"),
         limit: z.number().optional().describe("Max results (default 15)"),
         mode: z.enum(["linear", "deep", "full"]).optional().describe('"linear" (default) = local facts only, recency-weighted. "deep" = includes HS-imports. "full" = everything, pure BM25 (debug).'),
         hindsight: z.enum(["never", "fallback", "always"]).optional().describe('"never" = local only, "fallback" = use if no local results, "always" = always call hindsight too'),
+        include_superseded: z.boolean().optional().describe("If true, include facts that have been superseded. Each such fact is returned with a superseded_by: <id> field. Default: false (current truth only)."),
     }),
 }, async (params) => daemonCall("/gc/recall", params));
 server.registerTool("gc_retain", {
     description: `Store a fact in the memory bank. Auto-routes to the best bank by keyword matching, or specify a bank.
-Deduplicates by content fingerprint + BM25 similarity — won't store near-duplicates.`,
+
+Deduplication:
+  - Fingerprint dedup only (exact normalized-content match). Fuzzy/BM25 dedup removed — it was silently rejecting corrections.
+  - Supersedes bypasses even fingerprint dedup — an explicit replacement signal always stores.
+
+Response contract (READ THIS):
+  - { stored: true, duplicate: false, id, bank }  → fact was stored
+  - { stored: false, duplicate: true, existing_id } → fact was NOT stored; same fingerprint already in DB
+  ALWAYS check 'stored' to know whether your content was persisted. 'ok: true' only means the call succeeded, not that storage happened.
+
+Supersedes + recall: when you pass supersedes: [<old-id>], the old fact is marked as replaced and won't show up in default recall results.
+Use recall with include_superseded: true to see historical versions.`,
     inputSchema: z.object({
         content: z.string().describe("The fact to store — be specific and include relevant context"),
         bank: z.string().optional().describe("Target bank (auto-routed if omitted)"),
         context: z.string().optional().describe("Category: architecture, decision, pattern, convention, bug, etc."),
         tags: z.array(z.string()).optional().describe("Tags for this fact"),
         source: z.string().optional().describe("Where this fact comes from"),
-        supersedes: z.union([z.string(), z.array(z.string())]).optional().describe("Fact ID(s) this new fact supersedes"),
+        supersedes: z.union([z.string(), z.array(z.string())]).optional().describe("Fact ID(s) this new fact supersedes. Marks the old fact(s) as replaced (hidden from default recall) AND bypasses fingerprint dedup so your correction is always stored."),
         origin: z.string().optional().describe("Origin: 'local' (default), 'hs-import', 'hs-echo'"),
         hindsight: z.boolean().optional().describe("Also push to Hindsight for deep memory"),
     }),
@@ -138,10 +154,11 @@ server.registerTool("gc_banks", {
     description: `Manage memory banks: list all banks with stats, or create new banks.
 Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statistics.`,
     inputSchema: z.object({
-        action: z.enum(["list", "create", "stats"]).describe("Action to perform"),
-        name: z.string().optional().describe("Bank name (for create)"),
+        action: z.enum(["list", "create", "delete", "stats"]).describe("Action to perform"),
+        name: z.string().optional().describe("Bank name (for create/delete)"),
         description: z.string().optional().describe("Bank description (for create)"),
         keywords: z.array(z.string()).optional().describe("Bank keywords (for create)"),
+        force: z.boolean().optional().describe("Force delete a non-empty bank (for delete)"),
     }),
 }, async (params) => daemonCall("/gc/banks", params));
 // ════════════════════════════════════════════════════════════════
@@ -150,13 +167,14 @@ Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statis
 server.registerTool("gc_directive", {
     description: `Manage behavioral directives using the @always/@never/@stop/@pin/@until vocabulary.
 Directives are injected into agent context automatically. Scoped to specific agents or global (*).
-Actions: "add" — create, "remove" — deactivate by ID, "list" — show active, "inject" — formatted for context injection.`,
+Actions: "add" — create, "remove" — hard delete by ID (confirm: true required for pinned), "deactivate" — soft disable (can reactivate later), "reactivate" — re-enable a deactivated directive, "list" — show active, "inject" — formatted for context injection.`,
     inputSchema: z.object({
-        action: z.enum(["add", "remove", "list", "inject"]).describe("Action to perform"),
+        action: z.enum(["add", "remove", "deactivate", "reactivate", "list", "inject"]).describe("Action to perform"),
         content: z.string().optional().describe("Directive text (for add)"),
         persistence: z.string().optional().describe("Persistence level: always, pin, never, stop, remember, until"),
         scope: z.string().optional().describe("Agent scope: * for all, or agent name(s) comma-separated"),
-        id: z.string().optional().describe("Directive ID (for remove)"),
+        id: z.string().optional().describe("Directive ID (for remove/deactivate/reactivate)"),
+        confirm: z.boolean().optional().describe("Required for remove/deactivate of pinned directives"),
         source: z.string().optional().describe("Where this directive came from"),
         expires_at: z.string().optional().describe("ISO date for @until directives"),
         query: z.string().optional().describe("Similarity query for inject (optional)"),
@@ -395,7 +413,13 @@ invest, update_investment, investments, causal_chain, project, projections, expe
 server.registerTool("gc_dispatch", {
     description: `On-demand agent dispatch. Spawn an agent with a task, check job status, retrieve output.
 Actions: dispatch (spawn agent), status (check job), output (get result).
-Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.`,
+Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
+
+Provider selection (CLI backend — Claude vs Droid):
+  - Default: resolves from the agent's declared model: field (~/.config/gc/agents/<agent>.md)
+  - All agents declare model: claude-sonnet-4-6 → Claude is used by default
+  - provider: "droid" — explicit override (use Droid for complex/intricate tasks)
+  - provider: "claude" — explicit override (force Claude)`,
     inputSchema: z.object({
         action: z.enum(["dispatch", "status", "output"]).describe("Action to perform"),
         agent: z.string().optional().describe("Agent name to dispatch (required for dispatch)"),
@@ -403,6 +427,10 @@ Default is fire-and-forget (returns job_id immediately). Set wait=true to block 
         cwd: z.string().optional().describe("Working directory (optional, defaults to project default)"),
         issue: z.string().optional().describe("Bee issue ID to link (optional)"),
         wait: z.boolean().optional().describe("If true, block until agent completes (default: false)"),
+        provider: z
+            .enum(["claude", "droid"])
+            .optional()
+            .describe('Explicit CLI backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.'),
         timeout: z
             .union([z.number(), z.literal("infinite"), z.literal("infinity")])
             .optional()
@@ -437,15 +465,28 @@ Default is fire-and-forget (returns job_id immediately). Set wait=true to block 
 server.registerTool("gc_schedule", {
     description: `Manage scheduled agent dispatches.
 Actions: list, create, enable, disable, delete, history, fire (manual trigger), tick (force check).
-Trigger types: cron, interval, session_start, once.`,
+Trigger types: cron, interval, session_start, once.
+
+CRON: pass a standard 5-field expression via 'cron' (preferred):
+  "min hour day-of-month month day-of-week"
+  Examples:
+    "0 9 * * mon-fri"       — weekdays at 09:00
+    "0 10 1 * *"            — 1st of every month at 10:00
+    "0 10 1 1,4,7,10 *"     — 1st of Jan/Apr/Jul/Oct at 10:00
+    "*/15 9-17 * * 1-5"     — every 15 min, 9am-5pm, weekdays
+
+The legacy 'hour'/'minute'/'days' params are deprecated but still accepted
+(the server converts them to a cron expression). They cannot express
+day-of-month, month-of-year, or ranges — use 'cron' for those.`,
     inputSchema: z.object({
         action: z.enum(["list", "create", "enable", "disable", "delete", "history", "fire", "tick"]).describe("Action to perform"),
         name: z.string().optional().describe("Schedule name"),
         description: z.string().optional().describe("Schedule description"),
         trigger: z.string().optional().describe("Trigger type: cron, interval, session_start, once"),
-        hour: z.number().optional().describe("Cron hour (0-23)"),
-        minute: z.number().optional().describe("Cron minute (0-59), default 0"),
-        days: z.array(z.string()).optional().describe('Days of week: ["mon","tue",...]'),
+        cron: z.string().optional().describe('Standard 5-field cron: "min hour dom month dow". Preferred over hour/minute/days.'),
+        hour: z.number().optional().describe("DEPRECATED — use 'cron'. Legacy cron hour (0-23)"),
+        minute: z.number().optional().describe("DEPRECATED — use 'cron'. Legacy cron minute (0-59), default 0"),
+        days: z.array(z.string()).optional().describe('DEPRECATED — use \'cron\'. Legacy days of week: ["mon","tue",...]'),
         interval: z.number().optional().describe("Interval in minutes"),
         fire_at: z.string().optional().describe("ISO timestamp for one-shot"),
         action_type: z.string().optional().describe("What to do: dispatch (default) or notify"),
@@ -482,16 +523,39 @@ Due accepts: ISO timestamps, relative times.`,
 server.registerTool("gc_workflow", {
     description: `Run deterministic workflows from .pi/workflows/.
 Workflows are YAML pipelines with step types: tool, prompt, dispatch, each, branch.
-Actions: run, list, show, detail, context, watch, resume.`,
+Actions: run (sync by default), list, show, detail, context, watch, resume.
+
+Response shaping (run action):
+  - Default: returns only the LAST step's result (terse — saves tokens)
+  - select: "step_id" — return only that specific step's result
+  - select: "step_a,step_b" — return multiple specific steps
+  - return: "full" — return everything (all step results + trace) for debugging
+  - return: "steps" — return all step results keyed by step_id, no trace
+  - return: "trace" — return trace only, no results
+  - async: true — return execution_id immediately; fetch results later via show/context
+
+Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
     inputSchema: z.object({
         action: z.enum(["run", "list", "show", "detail", "context", "watch", "resume"]).describe("Action to perform"),
-        workflow: z.string().optional().describe("Workflow name (from .pi/workflows/)"),
+        workflow: z.string().optional().describe("Workflow name (for run/resume)"),
         params: z.string().optional().describe("JSON parameters for the workflow"),
+        async: z.boolean().optional().describe("If true, run returns immediately with execution_id (run action only)"),
+        select: z
+            .string()
+            .optional()
+            .describe('Cherry-pick step result(s) by step ID. Single: "synthesise". Multiple: "step_a,step_b". Takes priority over return.'),
+        return: z
+            .enum(["result", "full", "steps", "trace"])
+            .optional()
+            .describe('(run only) Response shape. "result" (default) = last step only. "full" = everything. "steps" = all results. "trace" = trace only.'),
         id: z.string().optional().describe("Execution ID (for show/resume/detail/context/watch)"),
         execution_id: z.string().optional().describe("Execution ID (alias for id)"),
         key: z.string().optional().describe("Context key to inspect (for context action)"),
         interval: z.number().optional().describe("Poll interval in seconds for watch (default: 5)"),
-        timeout: z.number().optional().describe("Max seconds to wait for watch (default: 120)"),
+        timeout: z
+            .union([z.number(), z.literal("none")])
+            .optional()
+            .describe('Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" disables timeout entirely.'),
     }),
 }, async (params) => {
     // Normalize execution_id -> id for the handler
@@ -499,7 +563,27 @@ Actions: run, list, show, detail, context, watch, resume.`,
     if (normalized.execution_id && !normalized.id) {
         normalized.id = normalized.execution_id;
     }
-    return daemonCall("/gc/workflow", normalized);
+    // Compute client-side HTTP timeout:
+    // - async: true → 15s (daemon returns immediately)
+    // - timeout: "none" → null (no abort)
+    // - timeout: N → N * 1000
+    // - run/resume (no explicit timeout) → 300s default (workflows can take minutes)
+    // - everything else → 15s default
+    let clientTimeoutMs = 15_000;
+    const isLongAction = params.action === "run" || params.action === "resume";
+    if (params.async) {
+        clientTimeoutMs = 15_000; // async returns immediately
+    }
+    else if (params.timeout === "none") {
+        clientTimeoutMs = null;
+    }
+    else if (typeof params.timeout === "number" && params.timeout > 0) {
+        clientTimeoutMs = params.timeout * 1000;
+    }
+    else if (isLongAction) {
+        clientTimeoutMs = 300_000; // 5 min default for sync run/resume
+    }
+    return daemonCall("/gc/workflow", normalized, clientTimeoutMs);
 });
 // ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Mail
