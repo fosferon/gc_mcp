@@ -100,6 +100,31 @@ async function daemonCall(
 }
 
 // ════════════════════════════════════════════════════════════════
+// Schema helpers — value-shape parity with daemon's GcDaemon.Timeouts
+// ════════════════════════════════════════════════════════════════
+//
+// The daemon parses every timeout via GcDaemon.Timeouts.parse/2 which
+// accepts: integer | string-of-int | "none" | "infinity" | "infinite".
+// Pre-GC-773 the MCP shim declared `timeout: z.number()` which rejected
+// LLM-stringified values like "600" — the user couldn't watch a workflow
+// because the Zod layer rejected the call before it ever reached the
+// daemon. zTimeout / zPositiveNumber close that value-shape hole and
+// keep the MCP contract aligned with the daemon's parser.
+//
+// `z.coerce.number()` accepts numeric input AND parses string-of-int.
+// Combined with the literal alternatives we cover the full Timeouts.parse
+// value space.
+
+const zTimeout = z.union([
+  z.coerce.number().positive(),
+  z.literal("none"),
+  z.literal("infinity"),
+  z.literal("infinite"),
+]);
+
+const zPositiveNumber = z.coerce.number().positive();
+
+// ════════════════════════════════════════════════════════════════
 // MCP Server
 // ════════════════════════════════════════════════════════════════
 
@@ -525,11 +550,10 @@ Provider selection (CLI backend — Claude vs Droid):
         .describe(
           'Explicit CLI backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.',
         ),
-      timeout: z
-        .union([z.number(), z.literal("infinite"), z.literal("infinity")])
+      timeout: zTimeout
         .optional()
         .describe(
-          'Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity" to disable the wrapper kill entirely. Also governs the client-side HTTP deadline for wait=true calls.',
+          'Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity"/"none" to disable the wrapper kill entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
       job_id: z.string().optional().describe("Job ID (for status/output actions)"),
     }),
@@ -587,7 +611,7 @@ day-of-month, month-of-year, or ranges — use 'cron' for those.`,
       hour: z.number().optional().describe("DEPRECATED — use 'cron'. Legacy cron hour (0-23)"),
       minute: z.number().optional().describe("DEPRECATED — use 'cron'. Legacy cron minute (0-59), default 0"),
       days: z.array(z.string()).optional().describe('DEPRECATED — use \'cron\'. Legacy days of week: ["mon","tue",...]'),
-      interval: z.number().optional().describe("Interval in minutes"),
+      interval: zPositiveNumber.optional().describe("Interval in minutes (accepts string-of-int)"),
       fire_at: z.string().optional().describe("ISO timestamp for one-shot"),
       action_type: z.string().optional().describe("What to do: dispatch (default) or notify"),
       agent: z.string().optional().describe("Agent to dispatch"),
@@ -702,12 +726,13 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
       id: z.string().optional().describe("Execution ID (for show/resume/detail/context/watch)"),
       execution_id: z.string().optional().describe("Execution ID (alias for id)"),
       key: z.string().optional().describe("Context key to inspect (for context action)"),
-      interval: z.number().optional().describe("Poll interval in seconds for watch (default: 5)"),
-      timeout: z
-        .union([z.number(), z.literal("none")])
+      interval: zPositiveNumber
+        .optional()
+        .describe("Poll interval in seconds for watch (default: 5). Accepts string-of-int."),
+      timeout: zTimeout
         .optional()
         .describe(
-          'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" disables timeout entirely.',
+          'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
     }),
   },
@@ -808,7 +833,7 @@ Actions: get, post, put, delete. Supports bearer, basic, and header auth.`,
         name: z.string().optional().describe("Custom header name"),
         value: z.string().optional().describe("Custom header value"),
       }).optional().describe("Authentication config"),
-      timeout: z.number().optional().describe("Timeout in ms (default 30000)"),
+      timeout: zTimeout.optional().describe("Timeout in ms (default 30000). Accepts string-of-int / 'none' / 'infinity'."),
     }),
   },
   async (params) => daemonCall("/gc/http", params)
@@ -874,7 +899,7 @@ Actions: connect (register + connect), disconnect, remove, servers (list registe
       server: z.string().optional().describe("Server name (for tools/call)"),
       tool: z.string().optional().describe("Tool name to call (for call action)"),
       arguments: z.record(z.unknown()).optional().describe("Tool arguments (for call)"),
-      timeout: z.number().optional().describe("Call timeout in seconds"),
+      timeout: zTimeout.optional().describe("Call timeout in seconds. Accepts string-of-int / 'none' / 'infinity'."),
     }),
   },
   async (params) => daemonCall("/gc/mcpclient", params)
