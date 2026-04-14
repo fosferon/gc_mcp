@@ -467,6 +467,7 @@ Provider selection (CLI backend — Claude vs Droid):
             .enum(["claude", "droid"])
             .optional()
             .describe('Explicit CLI backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.'),
+        model: z.string().optional().describe('Model ID for the CLI subprocess (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Passed as --model to the CLI. Default: agent-defined or provider default.'),
         timeout: zTimeout
             .optional()
             .describe('Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity"/"none" to disable the wrapper kill entirely. Accepts string-of-int ("600") so LLM stringification is safe.'),
@@ -557,7 +558,7 @@ Due accepts: ISO timestamps, relative times.`,
 // ════════════════════════════════════════════════════════════════
 server.registerTool("gc_workflow", {
     description: `Run deterministic workflows from ~/.config/gc/workflows/.
-Workflows are YAML pipelines with step types: tool, prompt, dispatch, each, branch.
+Workflows are YAML pipelines with step types: tool, prompt, dispatch, shell, each, branch, halt.
 
 Actions:
   - run (sync by default, or async: true)
@@ -572,14 +573,26 @@ Actions:
 
 Response shaping:
 
-  run:
-    - Default: returns only the LAST step's result (terse — saves tokens)
-    - select: "step_id" — return only that specific step's result
-    - select: "step_a,step_b" — return multiple specific steps
-    - return: "full" — everything (all step results + trace)
-    - return: "steps" — all step results keyed by step_id, no trace
-    - return: "trace" — trace only, no results
-    - async: true — return execution_id immediately
+  run (sync):
+    - Default shape: { execution_id, status: "complete", last_step, result }.
+      \`result\` carries the last MEANINGFUL step's output — the shaper walks
+      the trace backwards and skips nil-returning tail steps (gc.retain /
+      gc.notify side-effects). \`last_step\` names whichever step produced
+      \`result\`. If every step returns nil, \`result\` is null but
+      \`last_step\` still names the actual final step.
+    - select: "step_id" — return one specific step's result (bypasses the
+      walk-past-nil default; use when you want an intermediate step or a
+      specific side-effect's receipt).
+    - select: "step_a,step_b" — return multiple specific steps (selected
+      map + \`result\` unset).
+    - return: "full" — everything (all step results + trace).
+    - return: "steps" — all step results keyed by step_id, no trace.
+    - return: "trace" — trace only, no results.
+
+  run (async: true):
+    - Returns { ok: true, status: "started", execution_id } immediately.
+    - Goes through Oban; survives daemon restart (idempotent resume —
+      crash mid-run → row marked failed with reason "crashed-resume").
 
   list_workflows:
     - Default: summary — name, file, description, size_bytes (no YAML body)
@@ -812,6 +825,23 @@ function getResolveBridgePath() {
         return piExtPath;
     // Fallback: check relative to this file
     const localPath = resolve(dirname(import.meta.url.replace("file://", "")), "..", "..", ".pi", "extensions", "davinci-resolve", "resolve-bridge.py");
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Hot Config Reload
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_reload", {
+        description: `Hot-reload gc_daemon configuration from secrets.toml without restarting the daemon.
+Re-reads ~/.config/gc/secrets.toml and applies changed values to Application env.
+
+Currently reloads:
+  - [providers] section (appliance model, context, tokens, base_url)
+  - [api] section (API keys: openrouter, zai, hindsight)
+
+Use after: editing secrets.toml, swapping models in LM Studio, rotating API keys.
+No daemon restart needed — values take effect on the next LLM call.`,
+        inputSchema: z.object({
+            section: z.enum(["providers", "api"]).optional().describe("Reload only this section (omit for all)"),
+        }),
+    }, async (params) => daemonCall("/gc/reload", params));
     if (existsSync(localPath))
         return localPath;
     throw new Error("resolve-bridge.py not found");
