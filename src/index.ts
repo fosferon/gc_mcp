@@ -277,10 +277,10 @@ server.registerTool(
   "gc_work",
   {
     description: `Work coordination with dependency DAG.
-Actions: create, list, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, backfill_projects.
+Actions: create, list, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, focus, backfill_projects.
 Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see what's unblocked. 'plan' for critical path.`,
     inputSchema: z.object({
-      action: z.enum(["create", "list", "ready", "show", "update", "done", "cancel", "block", "unblock", "claim", "release", "comment", "plan", "tree", "stale", "backfill_projects"]).describe("Action to perform"),
+      action: z.enum(["create", "list", "ready", "show", "update", "done", "cancel", "block", "unblock", "claim", "release", "comment", "plan", "tree", "stale", "focus", "backfill_projects"]).describe("Action to perform"),
       title: z.string().optional().describe("Issue title"),
       description: z.string().optional().describe("Issue description"),
       priority: zNumber.optional().describe("Priority (higher = more important)"),
@@ -294,9 +294,10 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
       note: z.string().optional().describe("Comment text or close reason"),
       status: z.string().optional().describe("Filter by status: open, in_progress, closed, all"),
       assigned: z.string().optional().describe("Filter by assigned agent"),
+      days: zNumber.optional().describe("For action=stale/focus: stale threshold in days (default 7)"),
       dry_run: zBoolean.optional().describe("For action=backfill_projects: when true, preview only (default true)"),
       fallback_project: z.string().optional().describe("For action=backfill_projects: fallback project id for GC-* issues (default gc_daemon)"),
-      limit: zNumber.optional().describe("For action=backfill_projects: maximum number of rows to update"),
+      limit: zNumber.optional().describe("For action=stale/focus/backfill_projects: max rows or sample size"),
     }),
   },
   async (params) => daemonCall("/gc/work", params)
@@ -549,36 +550,63 @@ server.registerTool(
   "gc_dispatch",
   {
     description: `On-demand agent dispatch. Spawn an agent with a task, check job status, retrieve output.
-Actions: dispatch (spawn agent), status (check job), output (get result).
+Actions: dispatch (spawn agent), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
 
-Provider selection (CLI backend — Claude vs Droid):
+Provider selection (dispatch backend):
   - Default: resolves from the agent's declared model: field (~/.config/gc/agents/<agent>.md)
   - All agents declare model: claude-sonnet-4-6 → Claude is used by default
+  - provider: "pi" — explicit override to run via Pi CLI
   - provider: "droid" — explicit override (use Droid for complex/intricate tasks)
-  - provider: "claude" — explicit override (force Claude)`,
+  - provider: "claude" — explicit override (force Claude)
+
+Claude-specific permission controls:
+  - permission_mode: default|auto|dontAsk|acceptEdits|plan|bypassPermissions
+  - dangerously_skip_permissions: true adds --dangerously-skip-permissions
+  - allow_dangerously_skip_permissions: true adds --allow-dangerously-skip-permissions`,
     inputSchema: z.object({
-      action: z.enum(["dispatch", "status", "output"]).describe("Action to perform"),
+      action: z.enum(["dispatch", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
       agent: z.string().optional().describe("Agent name to dispatch (required for dispatch)"),
       task: z.string().optional().describe("Task text (required for dispatch)"),
       cwd: z.string().optional().describe("Working directory (optional, defaults to project default)"),
       issue: z.string().optional().describe("Bee issue ID to link (optional)"),
       wait: zBoolean.optional().describe("If true, block until agent completes (default: false)"),
       provider: z
-        .enum(["claude", "droid"])
+        .enum(["claude", "droid", "pi"])
         .optional()
         .describe(
-          'Explicit CLI backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.',
+          'Explicit dispatch backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.',
         ),
       model: z.string().optional().describe(
         'Model ID for the CLI subprocess (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Passed as --model to the CLI. Default: agent-defined or provider default.',
       ),
+      permission_mode: z
+        .enum(["default", "auto", "dontAsk", "acceptEdits", "plan", "bypassPermissions"])
+        .optional()
+        .describe("Claude permission mode override (passed as --permission-mode)"),
+      dangerously_skip_permissions: zBoolean
+        .optional()
+        .describe("Claude only: pass --dangerously-skip-permissions"),
+      allow_dangerously_skip_permissions: zBoolean
+        .optional()
+        .describe("Claude only: pass --allow-dangerously-skip-permissions"),
+      allowed_tools: z.string().optional().describe("Claude only: comma-separated allowed tools"),
+      disallowed_tools: z.string().optional().describe("Claude only: comma-separated disallowed tools"),
+      add_dir: z.string().optional().describe("Claude only: additional directory to allow tool access to"),
       timeout: zTimeout
         .optional()
         .describe(
           'Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity"/"none" to disable the wrapper kill entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
       job_id: z.string().optional().describe("Job ID (for status/output actions)"),
+      status: z.string().optional().describe("Filter by status (for list/prune)"),
+      scheduled: zBoolean.optional().describe("Filter scheduled jobs only (for list)"),
+      since_hours: zNumber.optional().describe("Only jobs newer than N hours (for list)"),
+      include_hidden: zBoolean.optional().describe("Include hidden jobs (list/prune; default false)"),
+      reason: z.string().optional().describe("Dismiss reason (for dismiss)"),
+      force: zBoolean.optional().describe("Force deletion of running job (for delete)"),
+      older_than_hours: zNumber.optional().describe("Minimum age in hours for prune (default 24)"),
+      limit: zNumber.optional().describe("Max rows to return/delete (list/prune)"),
     }),
   },
   async (params) => {
@@ -693,6 +721,9 @@ Actions:
   - context — inspect runtime context/keys for an execution
   - resume — re-run from a checkpoint
   - watch — poll until status changes
+  - dismiss — hide an execution from default listings
+  - delete — remove one execution (and checkpoint)
+  - prune — bulk-delete old terminal executions
 
 Response shaping:
 
@@ -740,6 +771,9 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         "context",
         "watch",
         "resume",
+        "dismiss",
+        "delete",
+        "prune",
       ]).describe("Action to perform"),
       workflow: z.string().optional().describe("Workflow name (for run/resume)"),
       params: z.string().optional().describe("JSON parameters for the workflow"),
@@ -769,6 +803,10 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         .describe(
           'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
+      include_hidden: zBoolean.optional().describe("Include hidden rows in list/prune (default false for list, true for prune)"),
+      reason: z.string().optional().describe("Dismiss reason (for action=dismiss)"),
+      force: zBoolean.optional().describe("Force deletion of running execution (for action=delete)"),
+      older_than_hours: zNumber.optional().describe("Minimum age in hours for action=prune (default 24)"),
     }),
   },
   async (params) => {
