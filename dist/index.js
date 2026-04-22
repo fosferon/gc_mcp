@@ -222,10 +222,10 @@ Actions: "add" — create, "remove" — hard delete by ID (confirm: true require
 // ════════════════════════════════════════════════════════════════
 server.registerTool("gc_work", {
     description: `Work coordination with dependency DAG.
-Actions: create, list, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale.
+Actions: create, list, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, backfill_projects.
 Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see what's unblocked. 'plan' for critical path.`,
     inputSchema: z.object({
-        action: z.enum(["create", "list", "ready", "show", "update", "done", "cancel", "block", "unblock", "claim", "release", "comment", "plan", "tree", "stale"]).describe("Action to perform"),
+        action: z.enum(["create", "list", "ready", "show", "update", "done", "cancel", "block", "unblock", "claim", "release", "comment", "plan", "tree", "stale", "backfill_projects"]).describe("Action to perform"),
         title: z.string().optional().describe("Issue title"),
         description: z.string().optional().describe("Issue description"),
         priority: zNumber.optional().describe("Priority (higher = more important)"),
@@ -239,6 +239,9 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
         note: z.string().optional().describe("Comment text or close reason"),
         status: z.string().optional().describe("Filter by status: open, in_progress, closed, all"),
         assigned: z.string().optional().describe("Filter by assigned agent"),
+        dry_run: zBoolean.optional().describe("For action=backfill_projects: when true, preview only (default true)"),
+        fallback_project: z.string().optional().describe("For action=backfill_projects: fallback project id for GC-* issues (default gc_daemon)"),
+        limit: zNumber.optional().describe("For action=backfill_projects: maximum number of rows to update"),
     }),
 }, async (params) => daemonCall("/gc/work", params));
 // ════════════════════════════════════════════════════════════════
