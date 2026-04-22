@@ -131,6 +131,7 @@ const server = new McpServer({ name: "gc", version: "1.0.0" }, {
         "gc_plan answers 'what should I work on next?' with scored recommendations.",
         "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
         "gc_ticker provides situational awareness snapshots.",
+        "gc_a2a is the Agent-to-Agent protocol client — send tasks to agents, check status, register as a worker.",
     ].join(" "),
 });
 // ════════════════════════════════════════════════════════════════
@@ -842,6 +843,127 @@ No daemon restart needed — values take effect on the next LLM call.`,
             section: z.enum(["providers", "api"]).optional().describe("Reload only this section (omit for all)"),
         }),
     }, async (params) => daemonCall("/gc/reload", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOL — A2A (Agent-to-Agent Protocol)
+    // ════════════════════════════════════════════════════════════════
+    const A2A_RPC_METHODS = new Set(["message/send", "tasks/get", "tasks/cancel"]);
+    async function a2aRpc(method, params) {
+        const url = `${GC_BASE}/a2a`;
+        const id = Date.now();
+        const body = { jsonrpc: "2.0", id, method, params };
+        const resp = await fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(15_000),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            throw new Error(`A2A ${method} error: ${data.error.message || JSON.stringify(data.error)}`);
+        }
+        return data.result;
+    }
+    server.registerTool("gc_a2a", {
+        description: `Agent-to-Agent (A2A) protocol client. Interact with the A2A broker to create tasks, check status, cancel tasks, and discover agent capabilities.
+
+Actions:
+- **send**: Create a new A2A task (message/send). Params: message (with role + parts), worker (optional target agent), idempotencyKey (optional dedup).
+- **get**: Get task status by ID (tasks/get). Params: id (task ID).
+- **cancel**: Cancel a running task (tasks/cancel). Params: id (task ID).
+- **card**: Fetch an agent's public card. Params: name (agent name).
+- **list**: List tasks with optional filters. Params: state, worker_agent.
+- **register**: Register as an A2A worker agent. Params: agent_name, card_url?, cascade_priority?.
+- **inbox**: Get submitted tasks for a worker. Params: worker_agent.
+- **respond**: Transition a task state + optionally append a message. Params: task_id, state (working|completed|failed|canceled|rejected), message?.
+
+The A2A protocol follows the Google A2A specification (JSON-RPC 2.0 over HTTP).
+Task states: submitted → working → completed | failed | canceled | rejected.`,
+        inputSchema: z.object({
+            action: z.enum(["send", "get", "cancel", "card", "list", "register", "inbox", "respond"]).describe("A2A action to perform"),
+            // send / get / cancel
+            id: z.string().optional().describe("Task ID (for get/cancel)"),
+            message: z.object({
+                role: z.string().optional().describe("Message role (default: user)"),
+                parts: z.array(z.object({
+                    type: z.string().describe("Part type (e.g. 'text')"),
+                    text: z.string().optional().describe("Text content"),
+                })).optional().describe("Message parts"),
+                taskId: z.string().optional().describe("Explicit task ID (auto-generated if omitted)"),
+                contextId: z.string().optional().describe("Context ID for conversation threading"),
+                metadata: z.record(z.unknown()).optional().describe("Message metadata"),
+            }).optional().describe("Message payload (for send action)"),
+            worker: z.string().optional().describe("Target worker agent name (for send action)"),
+            idempotencyKey: z.string().optional().describe("Deduplication key (for send action)"),
+            // card
+            name: z.string().optional().describe("Agent name (for card action)"),
+            // list / inbox
+            state: z.string().optional().describe("Filter by task state (for list)"),
+            worker_agent: z.string().optional().describe("Filter by worker agent (for list/inbox)"),
+            // register
+            agent_name: z.string().optional().describe("Agent name to register (for register action)"),
+            card_url: z.string().optional().describe("Agent card URL (for register action)"),
+            cascade_priority: z.array(z.string()).optional().describe("Cascade priority list (for register action)"),
+            // respond
+            task_id: z.string().optional().describe("Task ID to respond to (for respond action)"),
+        }),
+    }, async (params) => {
+        try {
+            switch (params.action) {
+                case "send": {
+                    const rpcParams = clean({
+                        message: params.message,
+                        worker: params.worker,
+                        idempotencyKey: params.idempotencyKey,
+                    });
+                    const result = await a2aRpc("message/send", rpcParams);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "get": {
+                    const result = await a2aRpc("tasks/get", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "cancel": {
+                    const result = await a2aRpc("tasks/cancel", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "card": {
+                    const result = await gcGet(`/.well-known/agents/${params.name}.json`);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                // Admin actions — route through /gc/a2a_admin
+                case "register":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "register",
+                        agent_name: params.agent_name,
+                        card_url: params.card_url,
+                        cascade_priority: params.cascade_priority,
+                    });
+                case "inbox":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "inbox",
+                        worker_agent: params.worker_agent,
+                    });
+                case "respond":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "respond",
+                        task_id: params.task_id,
+                        state: params.state,
+                        message: params.message,
+                    });
+                case "list":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "list",
+                        state: params.state,
+                        worker_agent: params.worker_agent,
+                    });
+                default:
+                    return err(`Unknown A2A action: ${params.action}`);
+            }
+        }
+        catch (e) {
+            return err(`gc_a2a error: ${e.message}`);
+        }
+    });
     if (existsSync(localPath))
         return localPath;
     throw new Error("resolve-bridge.py not found");
