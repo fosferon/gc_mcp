@@ -14,6 +14,7 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { execSync } from "node:child_process";
 import { readFileSync, existsSync } from "node:fs";
@@ -66,6 +67,19 @@ async function gcGet(path: string): Promise<any> {
   return resp.json();
 }
 
+async function gcDelete(path: string): Promise<any> {
+  const url = `${GC_BASE}${path}`;
+  const resp = await fetch(url, {
+    method: "DELETE",
+    signal: AbortSignal.timeout(5_000),
+  });
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`gc_daemon ${path} failed (${resp.status}): ${text}`);
+  }
+  return resp.json();
+}
+
 /** Strip undefined values from params before sending to daemon */
 function clean(params: Record<string, unknown>): Record<string, unknown> {
   const out: Record<string, unknown> = {};
@@ -83,6 +97,49 @@ function text(t: string) {
 /** Standard MCP error result */
 function err(msg: string) {
   return { content: [{ type: "text" as const, text: msg }], isError: true as const };
+}
+
+function resolveJsonPointer(root: unknown, ref: string): unknown {
+  if (!ref.startsWith("#/")) return undefined;
+
+  return ref
+    .slice(2)
+    .split("/")
+    .map((part) => part.replace(/~1/g, "/").replace(/~0/g, "~"))
+    .reduce<unknown>((current, key) => {
+      if (current && typeof current === "object" && key in (current as Record<string, unknown>)) {
+        return (current as Record<string, unknown>)[key];
+      }
+      return undefined;
+    }, root);
+}
+
+function inlineLocalRefs<T>(schema: T): T {
+  const root = structuredClone(schema);
+
+  const visit = (node: unknown): unknown => {
+    if (Array.isArray(node)) {
+      return node.map(visit);
+    }
+
+    if (!node || typeof node !== "object") {
+      return node;
+    }
+
+    const record = node as Record<string, unknown>;
+
+    if (typeof record.$ref === "string" && record.$ref.startsWith("#/")) {
+      const target = resolveJsonPointer(root, record.$ref);
+      if (target && typeof target === "object") {
+        const { $ref: _ignored, ...rest } = record;
+        return visit({ ...(structuredClone(target as Record<string, unknown>)), ...rest });
+      }
+    }
+
+    return Object.fromEntries(Object.entries(record).map(([key, value]) => [key, visit(value)]));
+  };
+
+  return visit(root) as T;
 }
 
 /** Call daemon and return formatted JSON */
@@ -108,37 +165,39 @@ async function daemonCall(
 // Pre-GC-773 the MCP shim declared `timeout: z.number()` which rejected
 // LLM-stringified values like "600" — the user couldn't watch a workflow
 // because the Zod layer rejected the call before it ever reached the
-// daemon. zTimeout / zPositiveNumber close that value-shape hole and
+// daemon. zTimeout() / zPositiveNumber() close that value-shape hole and
 // keep the MCP contract aligned with the daemon's parser.
 //
 // `z.coerce.number()` accepts numeric input AND parses string-of-int.
 // Combined with the literal alternatives we cover the full Timeouts.parse
 // value space.
 
-const zTimeout = z.union([
-  z.coerce.number().positive(),
-  z.literal("none"),
-  z.literal("infinity"),
-  z.literal("infinite"),
-]);
+const zTimeout = () =>
+  z.union([
+    z.coerce.number().positive(),
+    z.literal("none"),
+    z.literal("infinity"),
+    z.literal("infinite"),
+  ]);
 
-const zPositiveNumber = z.coerce.number().positive();
+const zPositiveNumber = () => z.coerce.number().positive();
 
 // Generic numeric coercion — accepts int, float, and string-of-number.
 // Same semantic as the old `z.number()` but string-tolerant. Apply to every
-// numeric field by default; reach for zPositiveNumber / zTimeout only when
+// numeric field by default; reach for zPositiveNumber() / zTimeout() only when
 // the field carries additional constraints.
-const zNumber = z.coerce.number();
+const zNumber = () => z.coerce.number();
 
 // Boolean with string tolerance. NB: NOT `z.coerce.boolean()` — that coerces
 // any truthy value and silently turns the string "false" into `true`, which
 // is the opposite of what an LLM that stringified the literal means. This
 // helper accepts only real booleans and the exact strings "true"/"false".
-const zBoolean = z.union([
-  z.boolean(),
-  z.literal("true").transform(() => true),
-  z.literal("false").transform(() => false),
-]);
+const zBoolean = () =>
+  z.union([
+    z.boolean(),
+    z.literal("true").transform(() => true),
+    z.literal("false").transform(() => false),
+  ]);
 
 // ════════════════════════════════════════════════════════════════
 // MCP Server
@@ -155,6 +214,7 @@ const server = new McpServer(
       "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
       "gc_ticker provides situational awareness snapshots.",
       "gc_a2a is the Agent-to-Agent protocol client — send tasks to agents, check status, register as a worker.",
+      "gc_peer_conversation is the chat-style lane for ongoing dialogue with external A2A peers; use it instead of gc_dispatch when you want a conversation rather than a job.",
     ].join(" "),
   }
 );
@@ -176,10 +236,10 @@ Use include_superseded: true for historical audits.`,
     inputSchema: z.object({
       query: z.string().describe("Natural language search query"),
       bank: z.string().optional().describe("Filter to specific bank (omit for global search)"),
-      limit: zNumber.optional().describe("Max results (default 15)"),
+      limit: zNumber().optional().describe("Max results (default 15)"),
       mode: z.enum(["linear", "deep", "full"]).optional().describe('"linear" (default) = local facts only, recency-weighted. "deep" = includes HS-imports. "full" = everything, pure BM25 (debug).'),
       hindsight: z.enum(["never", "fallback", "always"]).optional().describe('"never" = local only, "fallback" = use if no local results, "always" = always call hindsight too'),
-      include_superseded: zBoolean.optional().describe("If true, include facts that have been superseded. Each such fact is returned with a superseded_by: <id> field. Default: false (current truth only)."),
+      include_superseded: zBoolean().optional().describe("If true, include facts that have been superseded. Each such fact is returned with a superseded_by: <id> field. Default: false (current truth only)."),
     }),
   },
   async (params) => daemonCall("/gc/recall", params)
@@ -209,7 +269,7 @@ Use recall with include_superseded: true to see historical versions.`,
       source: z.string().optional().describe("Where this fact comes from"),
       supersedes: z.union([z.string(), z.array(z.string())]).optional().describe("Fact ID(s) this new fact supersedes. Marks the old fact(s) as replaced (hidden from default recall) AND bypasses fingerprint dedup so your correction is always stored."),
       origin: z.string().optional().describe("Origin: 'local' (default), 'hs-import', 'hs-echo'"),
-      hindsight: zBoolean.optional().describe("Also push to Hindsight for deep memory"),
+      hindsight: zBoolean().optional().describe("Also push to Hindsight for deep memory"),
     }),
   },
   async (params) => daemonCall("/gc/retain", params)
@@ -238,7 +298,7 @@ Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statis
       name: z.string().optional().describe("Bank name (for create/delete)"),
       description: z.string().optional().describe("Bank description (for create)"),
       keywords: z.array(z.string()).optional().describe("Bank keywords (for create)"),
-      force: zBoolean.optional().describe("Force delete a non-empty bank (for delete)"),
+      force: zBoolean().optional().describe("Force delete a non-empty bank (for delete)"),
     }),
   },
   async (params) => daemonCall("/gc/banks", params)
@@ -260,13 +320,57 @@ Actions: "add" — create, "remove" — hard delete by ID (confirm: true require
       persistence: z.string().optional().describe("Persistence level: always, pin, never, stop, remember, until"),
       scope: z.string().optional().describe("Agent scope: * for all, or agent name(s) comma-separated"),
       id: z.string().optional().describe("Directive ID (for remove/deactivate/reactivate)"),
-      confirm: zBoolean.optional().describe("Required for remove/deactivate of pinned directives"),
+      confirm: zBoolean().optional().describe("Required for remove/deactivate of pinned directives"),
       source: z.string().optional().describe("Where this directive came from"),
       expires_at: z.string().optional().describe("ISO date for @until directives"),
       query: z.string().optional().describe("Similarity query for inject (optional)"),
     }),
   },
   async (params) => daemonCall("/gc/directive", params)
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Skills
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_skill",
+  {
+    description: `GC-native procedural skill registry.
+Use this when you want to know whether GC already has a reusable procedure for a task before inventing a new workflow or doing ad-hoc work.
+
+Key actions:
+- suggest: rank candidate skills for a task. Returns suggestions plus a recommended top match.
+- resolve: like suggest, but only sets resolved when one skill clearly dominates; use this when you need a safe yes/no pick.
+- list/show: inspect existing skills and their metadata.
+- create/update/deprecate: maintain the skill registry itself.
+
+Matching behavior:
+- task text is scored against aliases, skill name, slug, and intent tags
+- project-scoped skills are strongly preferred when project matches
+- mode can bias toward skills that explicitly support baseline or deep execution`,
+    inputSchema: z.object({
+      action: z.enum(["list", "show", "create", "update", "suggest", "resolve", "deprecate"]).describe("Skill action to perform"),
+      task: z.string().optional().describe("Task text to match against skills. Required for suggest and resolve."),
+      project: z.string().optional().describe("Optional active project. Helps project-scoped skills outrank general fallbacks."),
+      mode: z.enum(["baseline", "deep"]).optional().describe("Optional execution depth hint used during ranking."),
+      slug: z.string().optional().describe("Skill slug for show, update, and deprecate. If omitted on create, daemon derives it from name."),
+      name: z.string().optional().describe("Human-readable skill name. Required for create."),
+      description: z.string().optional().describe("What the skill does and when to use it."),
+      scope: z.enum(["general", "project"]).optional().describe("Explicit skill scope. If omitted, daemon infers project scope when project is present."),
+      status: z.enum(["draft", "active", "deprecated"]).optional().describe("Lifecycle status. Draft is the default on create."),
+      entry_workflow: z.string().optional().describe("Canonical workflow entrypoint this skill should invoke when selected."),
+      workflow_entrypoint: z.string().optional().describe("Backward-compatible alias for entry_workflow."),
+      aliases: z.array(z.string()).optional().describe("Exact phrases or shorthand that operators use for this skill."),
+      intent_tags: z.array(z.string()).optional().describe("Intent keywords used for softer matching during suggest/resolve."),
+      intents: z.array(z.string()).optional().describe("Backward-compatible alias for intent_tags."),
+      supports_baseline: zBoolean().optional().describe("Whether the skill supports baseline execution mode. Defaults to true."),
+      supports_deep: zBoolean().optional().describe("Whether the skill supports deep execution mode. Defaults to false."),
+      include_deprecated: zBoolean().optional().describe("For list: include deprecated skills instead of hiding them by default."),
+      limit: zNumber().optional().describe("For list/suggest: max rows to return. Suggest defaults to 5, list defaults to 20."),
+    }),
+  },
+  async (params) => daemonCall("/gc/skill", params)
 );
 
 // ════════════════════════════════════════════════════════════════
@@ -283,7 +387,7 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
       action: z.enum(["create", "list", "ready", "show", "update", "done", "cancel", "block", "unblock", "claim", "release", "comment", "plan", "tree", "stale", "focus", "backfill_projects"]).describe("Action to perform"),
       title: z.string().optional().describe("Issue title"),
       description: z.string().optional().describe("Issue description"),
-      priority: zNumber.optional().describe("Priority (higher = more important)"),
+      priority: zNumber().optional().describe("Priority (higher = more important)"),
       type: z.string().optional().describe("Issue type: task, bug, epic, objective"),
       project: z.string().optional().describe("Project name"),
       parent: z.string().optional().describe("Parent issue ID (for sub-tasks)"),
@@ -294,10 +398,10 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
       note: z.string().optional().describe("Comment text or close reason"),
       status: z.string().optional().describe("Filter by status: open, in_progress, closed, all"),
       assigned: z.string().optional().describe("Filter by assigned agent"),
-      days: zNumber.optional().describe("For action=stale/focus: stale threshold in days (default 7)"),
-      dry_run: zBoolean.optional().describe("For action=backfill_projects: when true, preview only (default true)"),
+      days: zNumber().optional().describe("For action=stale/focus: stale threshold in days (default 7)"),
+      dry_run: zBoolean().optional().describe("For action=backfill_projects: when true, preview only (default true)"),
       fallback_project: z.string().optional().describe("For action=backfill_projects: fallback project id for GC-* issues (default gc_daemon)"),
-      limit: zNumber.optional().describe("For action=stale/focus/backfill_projects: max rows or sample size"),
+      limit: zNumber().optional().describe("For action=stale/focus/backfill_projects: max rows or sample size"),
     }),
   },
   async (params) => daemonCall("/gc/work", params)
@@ -314,23 +418,23 @@ server.registerTool(
 Actions: create_event, update_event, delete_event, get, link, unlink, query, today, upcoming_deadlines, slipped.`,
     inputSchema: z.object({
       action: z.enum(["create_event", "update_event", "delete_event", "get", "link", "unlink", "query", "today", "upcoming_deadlines", "slipped"]).describe("Action to perform"),
-      id: z.union([zNumber, z.string()]).optional().describe("Event or link ID"),
+      id: z.union([zNumber(), z.string()]).optional().describe("Event or link ID"),
       title: z.string().optional().describe("Event title"),
       type: z.string().optional().describe("Event type: deadline, appointment, block, milestone"),
       starts_at: z.string().optional().describe("Start time (ISO 8601)"),
       ends_at: z.string().optional().describe("End time (ISO 8601)"),
-      all_day: zBoolean.optional().describe("All-day event"),
+      all_day: zBoolean().optional().describe("All-day event"),
       recurrence: z.string().optional().describe("Recurrence: daily, weekly, monthly, yearly"),
       labels: z.array(z.string()).optional().describe("Labels"),
       notes: z.string().optional().describe("Notes"),
-      event_id: zNumber.optional().describe("Event ID (for linking)"),
+      event_id: zNumber().optional().describe("Event ID (for linking)"),
       linkable_type: z.string().optional().describe("Link target type: bee_issue, reminder, external"),
       linkable_id: z.string().optional().describe("Link target ID"),
       role: z.string().optional().describe("Link role: deadline_for, blocks, related"),
       from: z.string().optional().describe("Query range start (ISO)"),
       to: z.string().optional().describe("Query range end (ISO)"),
-      hours: zNumber.optional().describe("Deadline lookahead hours (default 48)"),
-      limit: zNumber.optional().describe("Max results"),
+      hours: zNumber().optional().describe("Deadline lookahead hours (default 48)"),
+      limit: zNumber().optional().describe("Max results"),
     }),
   },
   async (params) => daemonCall("/gc/timeline", params)
@@ -348,25 +452,56 @@ Actions: start_timer, stop_timer, log, log_agent_job, delete, running, query, ag
     inputSchema: z.object({
       action: z.enum(["start_timer", "stop_timer", "log", "log_agent_job", "delete", "running", "query", "aggregate", "capacity", "duration_estimate"]).describe("Action to perform"),
       resource: z.string().optional().describe("Resource name: leonidas, mobus, ops, etc."),
-      id: zNumber.optional().describe("Time entry ID"),
+      id: zNumber().optional().describe("Time entry ID"),
       bee_issue_id: z.string().optional().describe("Bee issue ID to link to"),
-      event_id: zNumber.optional().describe("Timeline event ID to link to"),
+      event_id: zNumber().optional().describe("Timeline event ID to link to"),
       started_at: z.string().optional().describe("Start time (ISO 8601)"),
       ended_at: z.string().optional().describe("End time (ISO 8601)"),
-      duration_minutes: zNumber.optional().describe("Explicit duration in minutes"),
+      duration_minutes: zNumber().optional().describe("Explicit duration in minutes"),
       labels: z.array(z.string()).optional().describe("Labels for categorization"),
       notes: z.string().optional().describe("Notes about the work"),
       source: z.string().optional().describe("Source: manual, agent, auto"),
       from: z.string().optional().describe("Query range start (ISO)"),
       to: z.string().optional().describe("Query range end (ISO)"),
       dimension: z.string().optional().describe("Aggregation dimension: resource, bee_issue_id, source"),
-      limit: zNumber.optional().describe("Max results"),
+      limit: zNumber().optional().describe("Max results"),
       agent: z.string().optional().describe("Agent name (for log_agent_job)"),
       issue: z.string().optional().describe("Issue ID (for log_agent_job)"),
       task: z.string().optional().describe("Task description (for log_agent_job)"),
     }),
   },
   async (params) => daemonCall("/gc/time", params)
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Engagement / Timesheets
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_engagement",
+  {
+    description: `Reconstruct engaged-attention hours from Timing presence plus project-touch events across Claude Code, pi, Codex, and Bee.
+Screen-first by default. File output only when target=file|both.
+Actions: compute, per_day, audit, sensitivity, projects, timesheet_export.`,
+    inputSchema: z.object({
+      action: z.enum(["compute", "per_day", "audit", "sensitivity", "projects", "timesheet_export"]).describe("Action to perform"),
+      from: z.string().optional().describe("Period start (ISO date or datetime)"),
+      to: z.string().optional().describe("Period end (ISO date or datetime)"),
+      project: z.string().optional().describe("Single project id or display name"),
+      projects: z.array(z.string()).optional().describe("Project ids or display names"),
+      bin_minutes: zNumber().optional().describe("Bin width in minutes (default 5)"),
+      tolerance_minutes: zNumber().optional().describe("Burst tolerance in minutes (default 10)"),
+      target: z.enum(["screen", "file", "both"]).optional().describe("screen (default), file, both"),
+      out_path: z.string().optional().describe("Exact file destination for single-project exports"),
+      out_dir: z.string().optional().describe("Directory destination for generated files"),
+      filename: z.string().optional().describe("Explicit filename for single-project exports"),
+      filename_prefix: z.string().optional().describe("Filename prefix for generated files"),
+      audit_filename: z.string().optional().describe("Explicit audit filename when include_audit=true"),
+      include_audit: zBoolean().optional().describe("Also export audit CSVs in timesheet_export"),
+      k_values: z.array(zNumber()).optional().describe("Tolerance values for sensitivity"),
+    }),
+  },
+  async (params) => daemonCall("/gc/engagement", params)
 );
 
 // ════════════════════════════════════════════════════════════════
@@ -380,25 +515,25 @@ server.registerTool(
 Actions: add, update, delete, get, query, runway, monthly, forecast, drift.`,
     inputSchema: z.object({
       action: z.enum(["add", "update", "delete", "get", "query", "runway", "monthly", "forecast", "drift"]).describe("Action to perform"),
-      id: zNumber.optional().describe("Entry ID"),
+      id: zNumber().optional().describe("Entry ID"),
       title: z.string().optional().describe("Entry title"),
       type: z.string().optional().describe("income or expense"),
       category: z.string().optional().describe("Category: client_work, retainer, infrastructure, subscriptions, etc."),
-      amount: zNumber.optional().describe("Amount in cents (1250 = €12.50) or euros as float (12.50)"),
+      amount: zNumber().optional().describe("Amount in cents (1250 = €12.50) or euros as float (12.50)"),
       date: z.string().optional().describe("Date (ISO: 2026-03-07)"),
       currency: z.string().optional().describe("Currency code (default EUR)"),
       status: z.string().optional().describe("expected, confirmed, received, or paid"),
       recurrence: z.string().optional().describe("monthly, quarterly, yearly"),
-      confidence: zNumber.optional().describe("0.0-1.0 confidence for expected entries"),
+      confidence: zNumber().optional().describe("0.0-1.0 confidence for expected entries"),
       source_type: z.string().optional().describe("project, client, bee_issue"),
       source_id: z.string().optional().describe("Source entity ID"),
       notes: z.string().optional().describe("Notes"),
       labels: z.array(z.string()).optional().describe("Labels"),
       from: z.string().optional().describe("Query range start (ISO date)"),
       to: z.string().optional().describe("Query range end (ISO date)"),
-      cash_on_hand: zNumber.optional().describe("Current cash in euros (for runway)"),
-      months: zNumber.optional().describe("Lookback or lookahead months"),
-      limit: zNumber.optional().describe("Max results"),
+      cash_on_hand: zNumber().optional().describe("Current cash in euros (for runway)"),
+      months: zNumber().optional().describe("Lookback or lookahead months"),
+      limit: zNumber().optional().describe("Max results"),
     }),
   },
   async (params) => daemonCall("/gc/cash", params)
@@ -427,30 +562,30 @@ Actions: create (piece), post (distribution), snapshot (manual metrics), ingest 
       piece_id: z.string().optional().describe("Piece ID to link to"),
       platform: z.string().optional().describe("Platform: linkedin, medium, x, youtube, hackernews, tiktok, instagram, substack"),
       platform_id: z.string().optional().describe("Platform-specific post ID/URN"),
-      round: zNumber.optional().describe("Distribution round (1, 2, 3)"),
+      round: zNumber().optional().describe("Distribution round (1, 2, 3)"),
       angle: z.string().optional().describe("Content angle: behaviour_hook, research_evidence, philosophical, general"),
       posted_at: z.string().optional().describe("Post date (ISO datetime)"),
       // metrics
-      post_id: zNumber.optional().describe("Post ID (for snapshot, ingest, trend)"),
+      post_id: zNumber().optional().describe("Post ID (for snapshot, ingest, trend)"),
       snapshot_at: z.string().optional().describe("Snapshot date (ISO)"),
-      impressions: zNumber.optional().describe("Impressions count"),
-      reach: zNumber.optional().describe("Members reached"),
-      link_clicks: zNumber.optional().describe("Link clicks"),
-      reactions: zNumber.optional().describe("Reactions count"),
-      comments: zNumber.optional().describe("Comments count"),
-      reposts: zNumber.optional().describe("Reposts count"),
-      saves: zNumber.optional().describe("Saves count"),
-      profile_views: zNumber.optional().describe("Profile views from post"),
-      followers_gained: zNumber.optional().describe("Followers gained"),
+      impressions: zNumber().optional().describe("Impressions count"),
+      reach: zNumber().optional().describe("Members reached"),
+      link_clicks: zNumber().optional().describe("Link clicks"),
+      reactions: zNumber().optional().describe("Reactions count"),
+      comments: zNumber().optional().describe("Comments count"),
+      reposts: zNumber().optional().describe("Reposts count"),
+      saves: zNumber().optional().describe("Saves count"),
+      profile_views: zNumber().optional().describe("Profile views from post"),
+      followers_gained: zNumber().optional().describe("Followers gained"),
       demographics: z.string().optional().describe("Demographics JSON"),
       // ingest
       file: z.string().optional().describe("File path for ingest"),
       snapshot_date: z.string().optional().describe("Override snapshot date for ingest (ISO)"),
-      force: zBoolean.optional().describe("Force ingest even if duplicate snapshot exists"),
+      force: zBoolean().optional().describe("Force ingest even if duplicate snapshot exists"),
       // list/compare
       type: z.string().optional().describe("List type: pieces or posts"),
       dimension: z.string().optional().describe("Compare dimension: round, angle, platform, piece"),
-      limit: zNumber.optional().describe("Max results"),
+      limit: zNumber().optional().describe("Max results"),
     }),
   },
   async (params) => daemonCall("/gc/publishing", params)
@@ -471,20 +606,20 @@ Actions: next, replan, profile, switch_profile, list_profiles, upsert_profile, r
       name: z.string().optional().describe("Profile or resource name"),
       description: z.string().optional().describe("Profile description"),
       weights: z.any().optional().describe("Weight vector: {label: weight, ...}"),
-      active: zBoolean.optional().describe("Set as active profile"),
+      active: zBoolean().optional().describe("Set as active profile"),
       type: z.string().optional().describe("Resource type: human or agent"),
-      capacity_hours_day: zNumber.optional().describe("Hours per day"),
-      capacity_hours_week: zNumber.optional().describe("Hours per week"),
+      capacity_hours_day: zNumber().optional().describe("Hours per day"),
+      capacity_hours_week: zNumber().optional().describe("Hours per week"),
       availability: z.string().optional().describe("weekdays, always, or custom"),
       labels: z.array(z.string()).optional().describe("Labels"),
       scenario: z.string().optional().describe("Named scenario: current, stress, optimistic, revenue_mode, six_month"),
-      n: zNumber.optional().describe("Number of Monte Carlo runs (default: 100)"),
-      horizon_days: zNumber.optional().describe("Simulation horizon in days"),
-      cash_balance: zNumber.optional().describe("Override starting cash balance (euros)"),
-      inject_disruptions: zBoolean.optional().describe("Inject random disruptions"),
-      base_seed: zNumber.optional().describe("Base seed for reproducible Monte Carlo"),
-      seed: zNumber.optional().describe("Random seed for single simulation"),
-      time_limit_ms: zNumber.optional().describe("Solver time limit in ms (default: 10000)"),
+      n: zNumber().optional().describe("Number of Monte Carlo runs (default: 100)"),
+      horizon_days: zNumber().optional().describe("Simulation horizon in days"),
+      cash_balance: zNumber().optional().describe("Override starting cash balance (euros)"),
+      inject_disruptions: zBoolean().optional().describe("Inject random disruptions"),
+      base_seed: zNumber().optional().describe("Base seed for reproducible Monte Carlo"),
+      seed: zNumber().optional().describe("Random seed for single simulation"),
+      time_limit_ms: zNumber().optional().describe("Solver time limit in ms (default: 10000)"),
     }),
   },
   async (params) => daemonCall("/gc/plan", params)
@@ -522,21 +657,21 @@ invest, update_investment, investments, causal_chain, project, projections, expe
       id: z.string().optional().describe("Linkable ID or link ID (for unlink)"),
       linkable_type: z.string().optional().describe("For set_leverage"),
       linkable_id: z.string().optional().describe("For set_leverage"),
-      coefficient: zNumber.optional().describe("Leverage coefficient (>1 = amplifier)"),
+      coefficient: zNumber().optional().describe("Leverage coefficient (>1 = amplifier)"),
       evidence: z.string().optional().describe("Why this leverage coefficient"),
-      window: zNumber.optional().describe("Window in days for report (default 30)"),
-      days: zNumber.optional().describe("Backfill period in days (default 90)"),
+      window: zNumber().optional().describe("Window in days for report (default 30)"),
+      days: zNumber().optional().describe("Backfill period in days (default 90)"),
       // Investment tracking
       investment_id: z.string().optional().describe("Investment ID (for causal_chain)"),
-      amount: zNumber.optional().describe("Investment amount"),
+      amount: zNumber().optional().describe("Investment amount"),
       // Projection
       projection_id: z.string().optional().describe("Projection ID (for expected_value, resolve_projection)"),
-      actual: zNumber.optional().describe("Actual outcome value (for resolve_projection)"),
+      actual: zNumber().optional().describe("Actual outcome value (for resolve_projection)"),
       // Snapshot
       label: z.string().optional().describe("Snapshot label"),
       // Events
       event_type: z.string().optional().describe("Convergence event type"),
-      limit: zNumber.optional().describe("Max results"),
+      limit: zNumber().optional().describe("Max results"),
     }),
   },
   async (params) => daemonCall("/gc/convergence", params)
@@ -547,11 +682,151 @@ invest, update_investment, investments, causal_chain, project, projections, expe
 // ════════════════════════════════════════════════════════════════
 
 server.registerTool(
+  "gc_project_registry",
+  {
+    description: `Canonical project registry for Grand Central.
+Actions:
+  - list: list all registered projects
+  - get: fetch one project by id
+  - upsert: create or update one project (supports partial payloads; metadata is merged)
+  - sync: sync projects from ~/.config/gc/registry.toml into the registry DB
+  - repos: list registered git repos
+
+Use this as the source of truth for project metadata such as repo paths, canonical docs,
+related projects, and strategy-sync metadata. Prefer this over maintaining sidecar maps.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["list", "get", "upsert", "sync", "repos"])
+        .describe("Project registry action"),
+      id: z.string().optional().describe("Project id for action=get or action=upsert"),
+      name: z.string().optional().describe("Human-readable project name for action=upsert"),
+      path: z.string().optional().describe("Primary repo/worktree path for action=upsert"),
+      canonical_path: z.string().optional().describe("Canonical path when path is a worktree or alias"),
+      description: z.string().optional().describe("Project description"),
+      stack: z.string().optional().describe("Tech stack summary"),
+      domain: z.string().optional().describe("Primary domain"),
+      repo_url: z.string().optional().describe("Repo remote URL"),
+      branch: z.string().optional().describe("Default or canonical branch"),
+      binary_path: z.string().optional().describe("Binary path, if applicable"),
+      launchd_service: z.string().optional().describe("launchd service name, if applicable"),
+      data_dir: z.string().optional().describe("Primary data directory, if applicable"),
+      notes: z.string().optional().describe("Operator notes"),
+      status: z.string().optional().describe("Project status"),
+      ports: z.record(z.unknown()).optional().describe("Named ports map"),
+      domains: z.array(z.string()).optional().describe("Associated domains"),
+      tags: z.array(z.string()).optional().describe("Project tags"),
+      commands: z.array(z.string()).optional().describe("Useful commands"),
+      key_files: z.array(z.string()).optional().describe("Key file paths"),
+      related_projects: z.array(z.string()).optional().describe("Related project ids"),
+      metadata: z.record(z.unknown()).optional().describe("Additional metadata; merged into existing metadata_json"),
+      source: z.string().optional().describe("Source tag for upsert"),
+      last_synced_at: z.string().optional().describe("ISO timestamp override"),
+    }),
+  },
+  async (params) => daemonCall("/gc/project_registry", params)
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Dispatch (on-demand agent execution)
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_peer_conversation",
+  {
+    description: `Persistent chat-style sessions with external A2A peers such as Pluto. Use this for dialogue, clarification, synthesis, and back-and-forth coordination. Do NOT use gc_dispatch for conversational turns; gc_dispatch is for job assignments.
+
+Actions:
+  - create: open a new peer conversation session and bind it to a registered A2A peer
+  - turn: send one user message into an existing session and get the peer's reply
+  - get: fetch the full current state of one session, including transcript and remote threading metadata
+  - list: list all peer conversation sessions
+  - delete: destroy one peer conversation session
+
+Important semantics:
+  - Sessions are persistent and conversation-oriented, not job-oriented.
+  - Turns create no dispatch jobs and no dispatch audit rows.
+  - The daemon preserves transcript locally and reuses remote A2A context/threading under the hood.
+  - peer_agent must be the name of a registered A2A peer (for example: "pluto").
+
+Typical flow:
+  1. action="create", peer_agent="pluto"
+  2. action="turn", session_id="<returned id>", message="..."
+  3. action="get" or action="list" to inspect session state later`,
+    inputSchema: z.object({
+      action: z
+        .enum(["create", "turn", "get", "list", "delete"])
+        .describe("Conversation action: create a session, send a turn, fetch one session, list sessions, or delete a session"),
+      peer_agent: z
+        .string()
+        .optional()
+        .describe('Registered A2A peer name for action="create" (for example: "pluto")'),
+      agent: z
+        .string()
+        .optional()
+        .describe('Alias for peer_agent on action="create". Prefer peer_agent for clarity.'),
+      config: z
+        .record(z.unknown())
+        .optional()
+        .describe("Optional session config stored with the conversation at creation time (e.g. purpose, project, strategy context)"),
+      session_id: z
+        .string()
+        .optional()
+        .describe("Existing peer conversation session ID, required for turn/get/delete"),
+      message: z
+        .string()
+        .optional()
+        .describe('User message to send into the peer session, required for action="turn"'),
+    }),
+  },
+  async (params) => {
+    try {
+      if (params.action === "create") {
+        const result = await gcPost("/gc/peer_conversation", clean({
+          peer_agent: params.peer_agent ?? params.agent,
+          config: params.config,
+        }));
+        return text(JSON.stringify(result, null, 2));
+      }
+
+      if (params.action === "turn") {
+        const sessionId = params.session_id;
+        if (!sessionId) return err('ERROR: session_id is required for action="turn"');
+        const result = await gcPost(`/gc/peer_conversation/${sessionId}/turn`, clean({
+          message: params.message,
+        }), 120_000);
+        return text(JSON.stringify(result, null, 2));
+      }
+
+      if (params.action === "get") {
+        const sessionId = params.session_id;
+        if (!sessionId) return err('ERROR: session_id is required for action="get"');
+        const result = await gcGet(`/gc/peer_conversation/${sessionId}`);
+        return text(JSON.stringify(result, null, 2));
+      }
+
+      if (params.action === "delete") {
+        const sessionId = params.session_id;
+        if (!sessionId) return err('ERROR: session_id is required for action="delete"');
+        const result = await gcDelete(`/gc/peer_conversation/${sessionId}`);
+        return text(JSON.stringify(result, null, 2));
+      }
+
+      const result = await gcGet("/gc/peer_conversation");
+      return text(JSON.stringify(result, null, 2));
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+server.registerTool(
   "gc_dispatch",
   {
-    description: `On-demand agent dispatch. Spawn an agent with a task, check job status, retrieve output.
-Actions: dispatch (spawn agent), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
+    description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, check job status, retrieve output.
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
+
+Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
 
 Provider selection (dispatch backend):
   - Default: resolves from the agent's declared model: field (~/.config/gc/agents/<agent>.md)
@@ -565,12 +840,13 @@ Claude-specific permission controls:
   - dangerously_skip_permissions: true adds --dangerously-skip-permissions
   - allow_dangerously_skip_permissions: true adds --allow-dangerously-skip-permissions`,
     inputSchema: z.object({
-      action: z.enum(["dispatch", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
+      action: z.enum(["dispatch", "list_agents", "list_targets", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
+      kind: z.enum(["all", "agent", "persona", "a2a"]).optional().describe("Target filter for list_targets (default: all)"),
       agent: z.string().optional().describe("Agent name to dispatch (required for dispatch)"),
       task: z.string().optional().describe("Task text (required for dispatch)"),
       cwd: z.string().optional().describe("Working directory (optional, defaults to project default)"),
       issue: z.string().optional().describe("Bee issue ID to link (optional)"),
-      wait: zBoolean.optional().describe("If true, block until agent completes (default: false)"),
+      wait: zBoolean().optional().describe("If true, block until agent completes (default: false)"),
       provider: z
         .enum(["claude", "droid", "pi"])
         .optional()
@@ -584,29 +860,29 @@ Claude-specific permission controls:
         .enum(["default", "auto", "dontAsk", "acceptEdits", "plan", "bypassPermissions"])
         .optional()
         .describe("Claude permission mode override (passed as --permission-mode)"),
-      dangerously_skip_permissions: zBoolean
+      dangerously_skip_permissions: zBoolean()
         .optional()
         .describe("Claude only: pass --dangerously-skip-permissions"),
-      allow_dangerously_skip_permissions: zBoolean
+      allow_dangerously_skip_permissions: zBoolean()
         .optional()
         .describe("Claude only: pass --allow-dangerously-skip-permissions"),
       allowed_tools: z.string().optional().describe("Claude only: comma-separated allowed tools"),
       disallowed_tools: z.string().optional().describe("Claude only: comma-separated disallowed tools"),
       add_dir: z.string().optional().describe("Claude only: additional directory to allow tool access to"),
-      timeout: zTimeout
+      timeout: zTimeout()
         .optional()
         .describe(
           'Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity"/"none" to disable the wrapper kill entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
       job_id: z.string().optional().describe("Job ID (for status/output actions)"),
       status: z.string().optional().describe("Filter by status (for list/prune)"),
-      scheduled: zBoolean.optional().describe("Filter scheduled jobs only (for list)"),
-      since_hours: zNumber.optional().describe("Only jobs newer than N hours (for list)"),
-      include_hidden: zBoolean.optional().describe("Include hidden jobs (list/prune; default false)"),
+      scheduled: zBoolean().optional().describe("Filter scheduled jobs only (for list)"),
+      since_hours: zNumber().optional().describe("Only jobs newer than N hours (for list)"),
+      include_hidden: zBoolean().optional().describe("Include hidden jobs (list/prune; default false)"),
       reason: z.string().optional().describe("Dismiss reason (for dismiss)"),
-      force: zBoolean.optional().describe("Force deletion of running job (for delete)"),
-      older_than_hours: zNumber.optional().describe("Minimum age in hours for prune (default 24)"),
-      limit: zNumber.optional().describe("Max rows to return/delete (list/prune)"),
+      force: zBoolean().optional().describe("Force deletion of running job (for delete)"),
+      older_than_hours: zNumber().optional().describe("Minimum age in hours for prune (default 24)"),
+      limit: zNumber().optional().describe("Max rows to return/delete (list/prune)"),
     }),
   },
   async (params) => {
@@ -659,10 +935,10 @@ day-of-month, month-of-year, or ranges — use 'cron' for those.`,
       description: z.string().optional().describe("Schedule description"),
       trigger: z.string().optional().describe("Trigger type: cron, interval, session_start, once"),
       cron: z.string().optional().describe('Standard 5-field cron: "min hour dom month dow". Preferred over hour/minute/days.'),
-      hour: zNumber.optional().describe("DEPRECATED — use 'cron'. Legacy cron hour (0-23)"),
-      minute: zNumber.optional().describe("DEPRECATED — use 'cron'. Legacy cron minute (0-59), default 0"),
+      hour: zNumber().optional().describe("DEPRECATED — use 'cron'. Legacy cron hour (0-23)"),
+      minute: zNumber().optional().describe("DEPRECATED — use 'cron'. Legacy cron minute (0-59), default 0"),
       days: z.array(z.string()).optional().describe('DEPRECATED — use \'cron\'. Legacy days of week: ["mon","tue",...]'),
-      interval: zPositiveNumber.optional().describe("Interval in minutes (accepts string-of-int)"),
+      interval: zPositiveNumber().optional().describe("Interval in minutes (accepts string-of-int)"),
       fire_at: z.string().optional().describe("ISO timestamp for one-shot"),
       action_type: z.string().optional().describe("What to do: dispatch (default) or notify"),
       agent: z.string().optional().describe("Agent to dispatch"),
@@ -670,7 +946,7 @@ day-of-month, month-of-year, or ranges — use 'cron' for those.`,
       cwd: z.string().optional().describe("Working directory"),
       issue: z.string().optional().describe("Linked bee issue"),
       id: z.string().optional().describe("Schedule ID"),
-      limit: zNumber.optional().describe("History limit (default 20)"),
+      limit: zNumber().optional().describe("History limit (default 20)"),
     }),
   },
   async (params) => daemonCall("/gc/schedule", params)
@@ -776,10 +1052,10 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         "prune",
       ]).describe("Action to perform"),
       workflow: z.string().optional().describe("Workflow name (for run/resume)"),
-      params: z.string().optional().describe("JSON parameters for the workflow"),
-      async: zBoolean.optional().describe("If true, run returns immediately with execution_id (run action only)"),
+      params: z.string().optional().describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["gc_daemon"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
+      async: zBoolean().optional().describe("If true, run returns immediately with execution_id (run action only)"),
       status: z.string().optional().describe("Filter list_executions by status (running/completed/failed/halted)"),
-      limit: zNumber.optional().describe("Max rows for list_executions (default 20)"),
+      limit: zNumber().optional().describe("Max rows for list_executions (default 20)"),
       select: z
         .string()
         .optional()
@@ -795,18 +1071,18 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
       id: z.string().optional().describe("Execution ID (for show/resume/detail/context/watch)"),
       execution_id: z.string().optional().describe("Execution ID (alias for id)"),
       key: z.string().optional().describe("Context key to inspect (for context action)"),
-      interval: zPositiveNumber
+      interval: zPositiveNumber()
         .optional()
         .describe("Poll interval in seconds for watch (default: 5). Accepts string-of-int."),
-      timeout: zTimeout
+      timeout: zTimeout()
         .optional()
         .describe(
           'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
-      include_hidden: zBoolean.optional().describe("Include hidden rows in list/prune (default false for list, true for prune)"),
+      include_hidden: zBoolean().optional().describe("Include hidden rows in list/prune (default false for list, true for prune)"),
       reason: z.string().optional().describe("Dismiss reason (for action=dismiss)"),
-      force: zBoolean.optional().describe("Force deletion of running execution (for action=delete)"),
-      older_than_hours: zNumber.optional().describe("Minimum age in hours for action=prune (default 24)"),
+      force: zBoolean().optional().describe("Force deletion of running execution (for action=delete)"),
+      older_than_hours: zNumber().optional().describe("Minimum age in hours for action=prune (default 24)"),
     }),
   },
   async (params) => {
@@ -857,19 +1133,19 @@ seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfi
         "add_endpoint", "remove_endpoint", "enable_endpoint", "disable_endpoint", "update_endpoint",
         "seed_rules", "sender_queue", "classify_sender", "dismiss_sender", "ignore_sender", "backfill_senders",
       ]).describe("Action to perform"),
-      months: zNumber.optional().describe("Burn rate lookback months (default 3)"),
+      months: zNumber().optional().describe("Burn rate lookback months (default 3)"),
       category: z.string().optional().describe("Filter messages by category"),
       from: z.string().optional().describe("Filter messages by sender (substring)"),
       since: z.string().optional().describe("Filter messages since date (ISO)"),
       direction: z.string().optional().describe("Financial direction: expense or income"),
       vat_period: z.string().optional().describe("VAT period filter"),
-      limit: zNumber.optional().describe("Max results"),
+      limit: zNumber().optional().describe("Max results"),
       // Endpoint management
       id: z.string().optional().describe("Endpoint or sender ID"),
       email: z.string().optional().describe("Email address (for add_endpoint)"),
       name: z.string().optional().describe("Endpoint name"),
       imap_host: z.string().optional().describe("IMAP host (default: imap.zoho.com)"),
-      imap_port: zNumber.optional().describe("IMAP port (default: 993)"),
+      imap_port: zNumber().optional().describe("IMAP port (default: 993)"),
       username: z.string().optional().describe("IMAP username"),
       app_key: z.string().optional().describe("IMAP app-specific password"),
       scan_folders: z.array(z.string()).optional().describe("Folders to scan (default: [INBOX])"),
@@ -906,7 +1182,7 @@ Actions: get, post, put, delete. Supports bearer, basic, and header auth.`,
         name: z.string().optional().describe("Custom header name"),
         value: z.string().optional().describe("Custom header value"),
       }).optional().describe("Authentication config"),
-      timeout: zTimeout.optional().describe("Timeout in ms (default 30000). Accepts string-of-int / 'none' / 'infinity'."),
+      timeout: zTimeout().optional().describe("Timeout in ms (default 30000). Accepts string-of-int / 'none' / 'infinity'."),
     }),
   },
   async (params) => daemonCall("/gc/http", params)
@@ -946,7 +1222,7 @@ Actions: status (last runs, pending reviews), run (trigger sync), rules (list ru
       id: z.string().optional().describe("Review item ID (for classify/dismiss)"),
       resolution: z.record(z.unknown()).optional().describe("Resolution data (for classify)"),
       reason: z.string().optional().describe("Reason for dismiss"),
-      limit: zNumber.optional().describe("Max results"),
+      limit: zNumber().optional().describe("Max results"),
     }),
   },
   async (params) => daemonCall("/gc/sync", params)
@@ -972,7 +1248,7 @@ Actions: connect (register + connect), disconnect, remove, servers (list registe
       server: z.string().optional().describe("Server name (for tools/call)"),
       tool: z.string().optional().describe("Tool name to call (for call action)"),
       arguments: z.record(z.unknown()).optional().describe("Tool arguments (for call)"),
-      timeout: zTimeout.optional().describe("Call timeout in seconds. Accepts string-of-int / 'none' / 'infinity'."),
+      timeout: zTimeout().optional().describe("Call timeout in seconds. Accepts string-of-int / 'none' / 'infinity'."),
     }),
   },
   async (params) => daemonCall("/gc/mcpclient", params)
@@ -1019,8 +1295,8 @@ Actions: "push" = send a notification, "drain" = get unread notifications, "list
       action: z.enum(["push", "drain", "list"]).describe("Action to perform"),
       source: z.string().optional().describe("Notification source (for push)"),
       content: z.string().optional().describe("Notification content (for push)"),
-      priority: zNumber.optional().describe("Notification priority (for push, default 0)"),
-      limit: zNumber.optional().describe("Max notifications to drain (default 10)"),
+      priority: zNumber().optional().describe("Notification priority (for push, default 0)"),
+      limit: zNumber().optional().describe("Max notifications to drain (default 10)"),
       status: z.string().optional().describe("Filter by status: unread (default)"),
     }),
   },
@@ -1224,14 +1500,14 @@ set_lut, copy_grades, quick_export, media_storage.`,
         "quick_export", "media_storage",
       ]).describe("Action to perform"),
       name: z.string().optional().describe("Project/timeline name"),
-      index: zNumber.optional().describe("Timeline index (1-based)"),
+      index: zNumber().optional().describe("Timeline index (1-based)"),
       timeline: z.string().optional().describe("Timeline name"),
       track_type: z.string().optional().describe("Track type: video, audio, subtitle"),
-      track_index: zNumber.optional().describe("Track index (1-based)"),
-      frame_id: zNumber.optional().describe("Frame position for marker"),
+      track_index: zNumber().optional().describe("Track index (1-based)"),
+      frame_id: zNumber().optional().describe("Frame position for marker"),
       color: z.string().optional().describe("Marker color"),
       note: z.string().optional().describe("Marker note"),
-      duration: zNumber.optional().describe("Marker duration in frames"),
+      duration: zNumber().optional().describe("Marker duration in frames"),
       custom_data: z.string().optional().describe("Marker custom data"),
       source: z.string().optional().describe("Marker source: timeline or clip"),
       target: z.string().optional().describe("Target for marker: timeline or clip"),
@@ -1245,20 +1521,20 @@ set_lut, copy_grades, quick_export, media_storage.`,
       filename: z.string().optional().describe("Output filename"),
       format: z.string().optional().describe("Render format"),
       codec: z.string().optional().describe("Render codec"),
-      width: zNumber.optional().describe("Output width"),
-      height: zNumber.optional().describe("Output height"),
+      width: zNumber().optional().describe("Output width"),
+      height: zNumber().optional().describe("Output height"),
       quality: z.any().optional().describe("Video quality"),
-      export_video: zBoolean.optional().describe("Export video track"),
-      export_audio: zBoolean.optional().describe("Export audio track"),
+      export_video: zBoolean().optional().describe("Export video track"),
+      export_audio: zBoolean().optional().describe("Export audio track"),
       job_id: z.string().optional().describe("Render job ID"),
       job_ids: z.array(z.string()).optional().describe("Render job IDs to start"),
-      all: zBoolean.optional().describe("Apply to all"),
+      all: zBoolean().optional().describe("Apply to all"),
       file_path: z.string().optional().describe("File path for export"),
       export_type: z.string().optional().describe("Export type: AAF, EDL, FCPXML_1_10, CSV, OTIO, etc."),
       key: z.string().optional().describe("Settings key"),
       value: z.any().optional().describe("Settings value"),
       language: z.string().optional().describe("Language for subtitles/transcription"),
-      node_index: zNumber.optional().describe("Node index (1-based)"),
+      node_index: zNumber().optional().describe("Node index (1-based)"),
       lut_path: z.string().optional().describe("LUT file path"),
       target_clips: z.array(z.string()).optional().describe("Target clip names for grade copy"),
       preset: z.string().optional().describe("Quick export preset name"),
@@ -1322,9 +1598,9 @@ Actions: search (full-text search), similar (find similar documents), read (get 
       action: z.enum(["search", "similar", "read", "databases"]).describe("Action to perform"),
       query: z.string().optional().describe("Search query (supports AND, OR, NOT, NEAR, wildcards, phrase quotes)"),
       uuid: z.string().optional().describe("Document UUID (for read and similar)"),
-      limit: zNumber.optional().describe("Max results (default 20, max 50)"),
+      limit: zNumber().optional().describe("Max results (default 20, max 50)"),
       database: z.string().optional().describe("Database name to search in (omit for all)"),
-      content_length: zNumber.optional().describe("Max chars of content per search result (default 200, 0 for metadata only)"),
+      content_length: zNumber().optional().describe("Max chars of content per search result (default 200, 0 for metadata only)"),
     }),
   },
   async (params) => {
@@ -1516,7 +1792,7 @@ server.registerTool(
       state: z.string().optional().describe("open|closed|all (default: open)"),
       assignee: z.string().optional().describe("GitHub username filter"),
       labels: z.string().optional().describe("Comma-separated labels"),
-      limit: zNumber.optional().describe("Max results (default: 30)"),
+      limit: zNumber().optional().describe("Max results (default: 30)"),
     }),
   },
   async (params) => {
@@ -1568,7 +1844,7 @@ server.registerTool(
   {
     description: `View a single GitHub issue with full body and comments.`,
     inputSchema: z.object({
-      number: zNumber.describe("Issue number"),
+      number: zNumber().describe("Issue number"),
       repo: z.string().optional().describe("owner/repo (default: owner/repo)"),
     }),
   },
@@ -1590,7 +1866,7 @@ server.registerTool(
   {
     description: `Edit a GitHub issue — change assignee, labels, title, or state.`,
     inputSchema: z.object({
-      number: zNumber.describe("Issue number"),
+      number: zNumber().describe("Issue number"),
       repo: z.string().optional().describe("owner/repo (default: owner/repo)"),
       title: z.string().optional().describe("New title"),
       assignee: z.string().optional().describe("Set assignee"),
@@ -1631,7 +1907,7 @@ server.registerTool(
   {
     description: `Add a comment to a GitHub issue.`,
     inputSchema: z.object({
-      number: zNumber.describe("Issue number"),
+      number: zNumber().describe("Issue number"),
       body: z.string().describe("Comment body (markdown)"),
       repo: z.string().optional().describe("owner/repo (default: owner/repo)"),
     }),
@@ -1650,6 +1926,23 @@ server.registerTool(
     }
   }
 );
+
+const rawListToolsHandler = (server.server as any)._requestHandlers.get("tools/list");
+
+if (rawListToolsHandler) {
+  server.server.setRequestHandler(ListToolsRequestSchema, async (request, extra) => {
+    const result = await rawListToolsHandler(request, extra);
+
+    return {
+      ...result,
+      tools: result.tools.map((tool: Record<string, unknown>) => ({
+        ...tool,
+        inputSchema: inlineLocalRefs(tool.inputSchema),
+        ...(tool.outputSchema ? { outputSchema: inlineLocalRefs(tool.outputSchema) } : {}),
+      })),
+    };
+  });
+}
 
 // ════════════════════════════════════════════════════════════════
 // Connect and start
