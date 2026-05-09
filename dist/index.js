@@ -691,25 +691,28 @@ Typical flow:
     }
 });
 server.registerTool("gc_dispatch", {
-    description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, check job status, retrieve output.
-Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
+    description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
 
 Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
+Do not inspect past sessions to guess provider/model defaults. Use list_agents, list_providers, list_models, and especially resolve_dispatch instead.
 
 Provider selection (dispatch backend):
-  - Default: resolves from the agent's declared model: field (~/.config/gc/agents/<agent>.md)
-  - All agents declare model: claude-sonnet-4-6 → Claude is used by default
-  - provider: "pi" — explicit override to run via Pi CLI
-  - provider: "droid" — explicit override (use Droid for complex/intricate tasks)
-  - provider: "claude" — explicit override (force Claude)
+  - Default: omit provider and let the daemon resolve from the agent's declared provider/model fields plus configured fallback order
+  - provider: "native" — explicit in-process/native dispatch
+  - provider: "native:<backend>" — explicit native backend pin, for example provider: "native:zai"
+  - provider: "claude" | "droid" | "pi" — explicit CLI override for those built-ins
+  - provider: "kimi" — explicit dynamic CLI override when kimi is installed
+  - provider: "<other-cli-label>" — any other installed CLI provider label or alias accepted by the daemon
+  - action=list_providers — inspect the currently valid native + CLI override strings before choosing one
 
 Claude-specific permission controls:
   - permission_mode: default|auto|dontAsk|acceptEdits|plan|bypassPermissions
   - dangerously_skip_permissions: true adds --dangerously-skip-permissions
   - allow_dangerously_skip_permissions: true adds --allow-dangerously-skip-permissions`,
     inputSchema: z.object({
-        action: z.enum(["dispatch", "list_agents", "list_targets", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
+        action: z.enum(["dispatch", "list_agents", "list_providers", "list_models", "resolve_dispatch", "list_targets", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
         kind: z.enum(["all", "agent", "persona", "a2a"]).optional().describe("Target filter for list_targets (default: all)"),
         agent: z.string().optional().describe("Agent name to dispatch (required for dispatch)"),
         task: z.string().optional().describe("Task text (required for dispatch)"),
@@ -717,10 +720,10 @@ Claude-specific permission controls:
         issue: z.string().optional().describe("Bee issue ID to link (optional)"),
         wait: zBoolean().optional().describe("If true, block until agent completes (default: false)"),
         provider: z
-            .enum(["claude", "droid", "pi"])
+            .string()
             .optional()
-            .describe('Explicit dispatch backend override. Default: derived from agent model: field. Use "droid" for complex/intricate tasks where the extra cost is justified.'),
-        model: z.string().optional().describe('Model ID for the CLI subprocess (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Passed as --model to the CLI. Default: agent-defined or provider default.'),
+            .describe('Explicit dispatch backend override or provider hint/filter for list_providers, list_models, or resolve_dispatch. Accepts dynamic CLI labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".'),
+        model: z.string().optional().describe('Model ID for the CLI subprocess, or a model hint for list_providers/resolve_dispatch (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Default: agent-defined or provider default.'),
         permission_mode: z
             .enum(["default", "auto", "dontAsk", "acceptEdits", "plan", "bypassPermissions"])
             .optional()
