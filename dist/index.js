@@ -412,6 +412,42 @@ Actions: compute, per_day, audit, sensitivity, projects, timesheet_export.`,
     }),
 }, async (params) => daemonCall("/gc/engagement", params));
 // ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Sessions
+// ════════════════════════════════════════════════════════════════
+server.registerTool("gc_sessions", {
+    description: `Session ingestion ops — scanner status, attribution repair, manual scans, and knowledge backlog control.
+Actions: status, scan, pending_knowledge, enqueue_pending_knowledge, backfill_project_ids, backfill_attributions, enqueue_attribution_backfill, review_attributions, next_review_item, apply_review_decision, work_item_summary, process_session_file.`,
+    inputSchema: z.object({
+        action: z
+            .enum([
+            "status",
+            "scan",
+            "pending_knowledge",
+            "enqueue_pending_knowledge",
+            "backfill_project_ids",
+            "backfill_attributions",
+            "enqueue_attribution_backfill",
+            "review_attributions",
+            "next_review_item",
+            "apply_review_decision",
+            "work_item_summary",
+            "process_session_file",
+        ])
+            .describe("Action to perform"),
+        session_file_id: zNumber().optional().describe("Session file id for process_session_file"),
+        limit: zNumber().optional().describe("Max results / enqueue batch size"),
+        agent: z.string().optional().describe("Optional agent filter for attribution backfill"),
+        from: z.string().optional().describe("Optional ISO date/datetime lower bound"),
+        to: z.string().optional().describe("Optional ISO date/datetime upper bound"),
+        provider: z.string().optional().describe("Optional provider filter for attribution review"),
+        review_id: zNumber().optional().describe("Review row id for apply_review_decision"),
+        decision: z.enum(["accept", "reject", "skip"]).optional().describe("Review decision for apply_review_decision"),
+        project_id: z.string().optional().describe("Project id for apply_review_decision"),
+        note: z.string().optional().describe("Optional note for apply_review_decision"),
+        worker_limit: zNumber().optional().describe("Optional worker limit for batch attribution enqueue"),
+    }),
+}, async (params) => daemonCall("/gc/sessions", params));
+// ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Cash Flow
 // ════════════════════════════════════════════════════════════════
 server.registerTool("gc_cash", {
@@ -690,6 +726,61 @@ Typical flow:
         return err(`ERROR: ${e.message}`);
     }
 });
+server.registerTool("gc_peer", {
+    description: `Legacy alias for gc_peer_conversation.
+Actions: spawn, turn, get, list, destroy.`,
+    inputSchema: z.object({
+        action: z.enum(["spawn", "turn", "get", "list", "destroy"]).describe("Legacy peer action"),
+        peer_agent: z.string().optional().describe('Registered A2A peer name for action="spawn"'),
+        session_id: z.string().optional().describe("Session ID for turn/get/destroy"),
+        message: z.string().optional().describe('User message for action="turn"'),
+        config: z.record(z.unknown()).optional().describe("Optional conversation config for spawn"),
+    }),
+}, async (params) => {
+    try {
+        if (params.action === "spawn") {
+            const result = await gcPost("/gc/peer_conversation", clean({
+                peer_agent: params.peer_agent,
+                config: params.config,
+            }));
+            return text(JSON.stringify(result, null, 2));
+        }
+        if (params.action === "turn") {
+            const sessionId = params.session_id;
+            if (!sessionId)
+                return err('ERROR: session_id is required for action="turn"');
+            const result = await gcPost(`/gc/peer_conversation/${sessionId}/turn`, clean({
+                message: params.message,
+            }), 120_000);
+            return text(JSON.stringify(result, null, 2));
+        }
+        if (params.action === "get") {
+            const sessionId = params.session_id;
+            if (!sessionId)
+                return err('ERROR: session_id is required for action="get"');
+            const result = await gcGet(`/gc/peer_conversation/${sessionId}`);
+            return text(JSON.stringify(result, null, 2));
+        }
+        if (params.action === "destroy") {
+            const sessionId = params.session_id;
+            if (!sessionId)
+                return err('ERROR: session_id is required for action="destroy"');
+            const result = await gcDelete(`/gc/peer_conversation/${sessionId}`);
+            return text(JSON.stringify(result, null, 2));
+        }
+        const result = await gcGet("/gc/peer_conversation");
+        return text(JSON.stringify(result, null, 2));
+    }
+    catch (e) {
+        return err(`ERROR: ${e.message}`);
+    }
+});
+server.registerTool("gc_project_status", {
+    description: `Legacy alias for gc_ticker/get. Returns the latest ecosystem status snapshot.`,
+    inputSchema: z.object({
+        name: z.string().optional().describe("Optional project name or 'all' for overview"),
+    }),
+}, async (params) => daemonCall("/gc/ticker", { action: "get", ...params }));
 server.registerTool("gc_dispatch", {
     description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
 Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
