@@ -728,6 +728,10 @@ Claude-specific permission controls:
         task: z.string().optional().describe("Task text (required for dispatch)"),
         cwd: z.string().optional().describe("Working directory (optional, defaults to project default)"),
         issue: z.string().optional().describe("Bee issue ID to link (optional)"),
+        on_complete: z
+            .string()
+            .optional()
+            .describe('Terminal hook for dispatch. Currently supports "notify" to emit a mailbox event when the job finishes.'),
         wait: zBoolean().optional().describe("If true, block until agent completes (default: false)"),
         provider: z
             .string()
@@ -1108,15 +1112,27 @@ Actions: "get" (default) = latest snapshot, "tick" = force a fresh tick.`,
 // DAEMON TOOLS — Notifications
 // ════════════════════════════════════════════════════════════════
 server.registerTool("gc_notify", {
-    description: `Push and drain notifications.
-Actions: "push" = send a notification, "drain" = get unread notifications, "list" = list by status.`,
+    description: `Notification mailbox for durable consumer polling.
+Actions: "push" = append a mailbox event, "drain" = fetch unread items and mark them read, "list" = inspect mailbox contents by status/checkpoint.
+
+Recommended integration pattern:
+  - Persist a per-consumer checkpoint
+  - Poll gc_notify with action: "drain", since: <checkpoint>
+  - Handle returned events
+  - Advance the checkpoint to the newest handled created_at
+
+Daemon guarantees durable mailbox creation plus unread/read semantics. Harnesses decide how to surface drained events.`,
     inputSchema: z.object({
         action: z.enum(["push", "drain", "list"]).describe("Action to perform"),
         source: z.string().optional().describe("Notification source (for push)"),
         content: z.string().optional().describe("Notification content (for push)"),
         priority: zNumber().optional().describe("Notification priority (for push, default 0)"),
-        limit: zNumber().optional().describe("Max notifications to drain (default 10)"),
-        status: z.string().optional().describe("Filter by status: unread (default)"),
+        limit: zNumber().optional().describe("Max rows to drain/list (default 10 for drain, 50 for list)"),
+        status: z.string().optional().describe("For list: unread, read, all"),
+        since: z
+            .string()
+            .optional()
+            .describe("Optional ISO timestamp checkpoint. For drain/list, only return notifications newer than this."),
     }),
 }, async (params) => daemonCall("/gc/notify", params));
 // ════════════════════════════════════════════════════════════════
