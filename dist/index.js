@@ -698,14 +698,24 @@ Default is fire-and-forget (returns job_id immediately). Set wait=true to block 
 Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
 Do not inspect past sessions to guess provider/model defaults. Use list_agents, list_providers, list_models, and especially resolve_dispatch instead.
 
-Provider selection (dispatch backend):
+Semantics:
+  - provider = GC dispatch route, not upstream vendor and not CLI binary name
+  - model = real provider-native model id only
+  - resolve_dispatch shows provider_type, binary, model_source, and model_resolution so you can see exactly what GC will do
+
+Provider selection (dispatch backend / route):
   - Default: omit provider and let the daemon resolve from the agent's declared provider/model fields plus configured fallback order
-  - provider: "native" — explicit in-process/native dispatch
+  - provider: "native" — explicit in-process/native dispatch route
   - provider: "native:<backend>" — explicit native backend pin, for example provider: "native:zai"
-  - provider: "claude" | "droid" | "pi" — explicit CLI override for those built-ins
-  - provider: "kimi" — explicit dynamic CLI override when kimi is installed
-  - provider: "<other-cli-label>" — any other installed CLI provider label or alias accepted by the daemon
-  - action=list_providers — inspect the currently valid native + CLI override strings before choosing one
+  - provider: "claude" | "droid" | "pi" — explicit built-in CLI route override
+  - provider: "kimi" — explicit dynamic CLI route override when kimi is installed
+  - provider: "<other-cli-label>" — any other installed CLI route label or alias accepted by the daemon
+  - action=list_providers — inspect the currently valid native + CLI route strings before choosing one
+
+Model selection:
+  - For CLI providers with model_resolution=provider_runtime, omit model unless you know a valid provider-native model id
+  - Never pass transport labels such as "kimi-cli" or "claude-code-cli" as model values
+  - action=list_models shows exact live inventories where GC can verify them, and clearly labeled hints otherwise
 
 Claude-specific permission controls:
   - permission_mode: default|auto|dontAsk|acceptEdits|plan|bypassPermissions
@@ -722,8 +732,8 @@ Claude-specific permission controls:
         provider: z
             .string()
             .optional()
-            .describe('Explicit dispatch backend override or provider hint/filter for list_providers, list_models, or resolve_dispatch. Accepts dynamic CLI labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".'),
-        model: z.string().optional().describe('Model ID for the CLI subprocess, or a model hint for list_providers/resolve_dispatch (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Default: agent-defined or provider default.'),
+            .describe('Explicit GC dispatch route override, or route hint/filter for list_providers, list_models, or resolve_dispatch. This is not the upstream vendor and not the CLI binary name. Accepts dynamic CLI route labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".'),
+        model: z.string().optional().describe('Explicit real model id override, or a model hint for list_providers/resolve_dispatch (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Do not pass CLI labels such as "kimi-cli" or "claude-code-cli". Default: agent-defined, GC default, or provider runtime default depending on resolve_dispatch.'),
         permission_mode: z
             .enum(["default", "auto", "dontAsk", "acceptEdits", "plan", "bypassPermissions"])
             .optional()
