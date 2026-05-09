@@ -692,7 +692,7 @@ Typical flow:
 });
 server.registerTool("gc_dispatch", {
     description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
-Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup).
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
 
 Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
@@ -712,7 +712,7 @@ Claude-specific permission controls:
   - dangerously_skip_permissions: true adds --dangerously-skip-permissions
   - allow_dangerously_skip_permissions: true adds --allow-dangerously-skip-permissions`,
     inputSchema: z.object({
-        action: z.enum(["dispatch", "list_agents", "list_providers", "list_models", "resolve_dispatch", "list_targets", "status", "output", "list", "dismiss", "delete", "prune"]).describe("Action to perform"),
+        action: z.enum(["dispatch", "list_agents", "list_providers", "list_models", "resolve_dispatch", "list_targets", "status", "output", "list", "dismiss", "delete", "prune", "repair_stale"]).describe("Action to perform"),
         kind: z.enum(["all", "agent", "persona", "a2a"]).optional().describe("Target filter for list_targets (default: all)"),
         agent: z.string().optional().describe("Agent name to dispatch (required for dispatch)"),
         task: z.string().optional().describe("Task text (required for dispatch)"),
@@ -748,6 +748,8 @@ Claude-specific permission controls:
         reason: z.string().optional().describe("Dismiss reason (for dismiss)"),
         force: zBoolean().optional().describe("Force deletion of running job (for delete)"),
         older_than_hours: zNumber().optional().describe("Minimum age in hours for prune (default 24)"),
+        older_than_minutes: zNumber().optional().describe("Minimum age in minutes for repair_stale (default 30)"),
+        dry_run: zBoolean().optional().describe("Preview repair_stale without mutating"),
         limit: zNumber().optional().describe("Max rows to return/delete (list/prune)"),
     }),
 }, async (params) => {
@@ -843,6 +845,7 @@ Actions:
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
   - show (alias: get_execution) — one execution with full runtime
+  - report — reliability summary, stale-running detection, recent failures
   - detail — per-step breakdown for an execution
   - context — inspect runtime context/keys for an execution
   - resume — re-run from a checkpoint
@@ -850,6 +853,7 @@ Actions:
   - dismiss — hide an execution from default listings
   - delete — remove one execution (and checkpoint)
   - prune — bulk-delete old terminal executions
+  - repair_stale — mark stale running executions failed and clear checkpoints
 
 Response shaping:
 
@@ -893,6 +897,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             "list_executions",
             "show",
             "get_execution",
+            "report",
             "detail",
             "context",
             "watch",
@@ -900,6 +905,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             "dismiss",
             "delete",
             "prune",
+            "repair_stale",
         ]).describe("Action to perform"),
         workflow: z.string().optional().describe("Workflow name (for run/resume)"),
         params: z.string().optional().describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["gc_daemon"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
@@ -927,6 +933,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         reason: z.string().optional().describe("Dismiss reason (for action=dismiss)"),
         force: zBoolean().optional().describe("Force deletion of running execution (for action=delete)"),
         older_than_hours: zNumber().optional().describe("Minimum age in hours for action=prune (default 24)"),
+        dry_run: zBoolean().optional().describe("Preview repair_stale without mutating"),
     }),
 }, async (params) => {
     // Normalize execution_id -> id for the handler
