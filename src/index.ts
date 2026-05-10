@@ -1963,16 +1963,23 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
 
     // Compute client-side HTTP timeout:
     // - async: true → 15s (daemon returns immediately)
-    // - timeout: "none" → null (no abort)
+    // - timeout: none/infinity/infinite → null (no abort)
     // - timeout: N → N * 1000
-    // - run/resume (no explicit timeout) → 300s default (workflows can take minutes)
+    // - run/resume/wait (no explicit timeout) → 300s default (workflows can take minutes)
     // - everything else → 15s default
     let clientTimeoutMs: number | null | undefined = 15_000;
-    const isLongAction = params.action === "run" || params.action === "resume";
+    const isLongAction =
+      params.action === "run" ||
+      params.action === "resume" ||
+      params.action === "wait";
 
     if (params.async) {
       clientTimeoutMs = 15_000; // async returns immediately
-    } else if (params.timeout === "none") {
+    } else if (
+      params.timeout === "none" ||
+      params.timeout === "infinity" ||
+      params.timeout === "infinite"
+    ) {
       clientTimeoutMs = null;
     } else if (typeof params.timeout === "number" && params.timeout > 0) {
       clientTimeoutMs = params.timeout * 1000;
