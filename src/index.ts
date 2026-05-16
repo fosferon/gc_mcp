@@ -6,7 +6,9 @@
  * Plus 3 standalone tools: davinci_resolve, devonthink, gh_issues
  *
  * Usage:
- *   node dist/index.js
+ *   node dist/index.js                          # stdio (default)
+ *   GC_MCP_TRANSPORT=streamable-http node dist/index.js
+ *   GC_MCP_TRANSPORT=all node dist/index.js
  *
  * Config:
  *   { "mcpServers": { "gc": { "command": "node", "args": ["~/Sites/agents/gc_mcp/dist/index.js"] } } }
@@ -14,10 +16,13 @@
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { execSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
+import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { resolve, dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -67,6 +72,24 @@ async function gcGet(path: string): Promise<any> {
   return resp.json();
 }
 
+async function gcGetResponse(
+  path: string,
+  timeoutMs: number | null | undefined = 15_000,
+): Promise<Response> {
+  const url = `${GC_BASE}${path}`;
+  const init: RequestInit = {};
+  if (timeoutMs !== null && timeoutMs !== undefined) {
+    init.signal = AbortSignal.timeout(timeoutMs);
+  }
+
+  const resp = await fetch(url, init);
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => "");
+    throw new Error(`gc_daemon ${path} failed (${resp.status}): ${text}`);
+  }
+  return resp;
+}
+
 async function gcDelete(path: string): Promise<any> {
   const url = `${GC_BASE}${path}`;
   const resp = await fetch(url, {
@@ -100,6 +123,136 @@ function err(msg: string) {
     content: [{ type: "text" as const, text: msg }],
     isError: true as const,
   };
+}
+
+type WorkflowWatchEvent = {
+  event: string;
+  data: unknown;
+  rawData: string;
+};
+
+function toJsonText(value: unknown): string {
+  return JSON.stringify(value, null, 2);
+}
+
+function summarizeWatchEvent(event: WorkflowWatchEvent): string {
+  if (event.data && typeof event.data === "object") {
+    const data = event.data as Record<string, unknown>;
+    const bits = [event.event];
+    if (typeof data.status === "string") bits.push(`status=${data.status}`);
+    if (typeof data.step === "string") bits.push(`step=${data.step}`);
+    if (typeof data.id === "string") bits.push(`id=${data.id}`);
+    return bits.join(" ");
+  }
+
+  return `${event.event} ${event.rawData}`.trim();
+}
+
+function isTerminalWatchEvent(event: WorkflowWatchEvent): boolean {
+  if (event.event === "final") return true;
+  if (event.data && typeof event.data === "object") {
+    const data = event.data as Record<string, unknown>;
+    return data.final === true || data.settled === true;
+  }
+  return false;
+}
+
+function isFailedWatchEvent(event: WorkflowWatchEvent): boolean {
+  if (event.event === "error") return true;
+  if (event.data && typeof event.data === "object") {
+    const data = event.data as Record<string, unknown>;
+    return data.status === "failed";
+  }
+  return false;
+}
+
+async function readWorkflowWatchStream(
+  executionId: string,
+  timeoutMs: number | null | undefined,
+  onEvent?: (event: WorkflowWatchEvent, index: number) => Promise<void> | void,
+): Promise<{ events: WorkflowWatchEvent[]; terminal?: WorkflowWatchEvent }> {
+  const resp = await gcGetResponse(
+    `/gc/workflow/${encodeURIComponent(executionId)}/watch`,
+    timeoutMs,
+  );
+
+  if (!resp.body) {
+    throw new Error("gc_daemon workflow watch returned no response body");
+  }
+
+  const reader = resp.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  let eventName = "message";
+  let dataLines: string[] = [];
+  const events: WorkflowWatchEvent[] = [];
+  let terminal: WorkflowWatchEvent | undefined;
+
+  const flushEvent = async () => {
+    if (dataLines.length === 0) return;
+
+    const rawData = dataLines.join("\n");
+    let data: unknown = rawData;
+    try {
+      data = JSON.parse(rawData);
+    } catch {}
+
+    const event: WorkflowWatchEvent = {
+      event: eventName || "message",
+      data,
+      rawData,
+    };
+
+    events.push(event);
+    await onEvent?.(event, events.length);
+
+    if (isTerminalWatchEvent(event)) {
+      terminal = event;
+    }
+
+    eventName = "message";
+    dataLines = [];
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value, { stream: !done });
+
+    while (true) {
+      const newlineIndex = buffer.indexOf("\n");
+      if (newlineIndex === -1) break;
+
+      let line = buffer.slice(0, newlineIndex);
+      buffer = buffer.slice(newlineIndex + 1);
+      if (line.endsWith("\r")) line = line.slice(0, -1);
+
+      if (line === "") {
+        await flushEvent();
+        if (terminal) {
+          await reader.cancel().catch(() => undefined);
+          return { events, terminal };
+        }
+        continue;
+      }
+
+      if (line.startsWith(":")) continue;
+      if (line.startsWith("event:")) {
+        eventName = line.slice("event:".length).trim() || "message";
+        continue;
+      }
+      if (line.startsWith("data:")) {
+        dataLines.push(line.slice("data:".length).trimStart());
+      }
+    }
+
+    if (done) {
+      if (buffer.trim() || dataLines.length > 0) {
+        if (buffer.trim()) dataLines.push(buffer.trim());
+        await flushEvent();
+      }
+      return { events, terminal };
+    }
+  }
 }
 
 function resolveJsonPointer(root: unknown, ref: string): unknown {
@@ -215,9 +368,10 @@ const zBoolean = () =>
 // MCP Server
 // ════════════════════════════════════════════════════════════════
 
-const server = new McpServer(
-  { name: "gc", version: "1.0.0" },
-  {
+function buildMcpServer() {
+  const server = new McpServer(
+    { name: "gc", version: "1.0.0" },
+    {
     instructions: [
       "Grand Central operations hub. All tools route to gc_daemon (localhost:4242).",
       "Use gc_recall for memory search (FTS5, instant). gc_retain to store facts.",
@@ -228,8 +382,8 @@ const server = new McpServer(
       "gc_a2a is the Agent-to-Agent protocol client — send tasks to agents, check status, register as a worker.",
       "gc_peer_conversation is the chat-style lane for ongoing dialogue with external A2A peers; use it instead of gc_dispatch when you want a conversation rather than a job.",
     ].join(" "),
-  },
-);
+    },
+  );
 
 // ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Memory
@@ -363,6 +517,21 @@ Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statis
     }),
   },
   async (params) => daemonCall("/gc/banks", params),
+);
+
+server.registerTool(
+  "gc_vault",
+  {
+    description: `Vault knowledge base indexing.
+Indexes Obsidian vault .md files into the memory bank for fast retrieval via gc_recall.
+Actions: "reindex" = enqueue a full reindex now, "status" = show vault config and indexed chunk count.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["reindex", "status"])
+        .describe("Action to perform"),
+    }),
+  },
+  async (params) => daemonCall("/gc/vault", params),
 );
 
 // ════════════════════════════════════════════════════════════════
@@ -1814,7 +1983,8 @@ Actions:
   - context — inspect runtime context/keys for an execution
   - resume — re-run from a checkpoint
   - wait — bounded poll until terminal state or timeout
-  - watch — real continuity stream over HTTP SSE at GET /gc/workflow/:id/watch
+  - watch — stream daemon SSE continuity through MCP progress notifications, then return the terminal event
+  - cancel — stop one execution and cancel any backing Oban workflow job
   - dismiss — hide an execution from default listings
   - delete — remove one execution (and checkpoint)
   - prune — bulk-delete old terminal executions
@@ -1867,7 +2037,9 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
           "detail",
           "context",
           "wait",
+          "watch",
           "resume",
+          "cancel",
           "dismiss",
           "delete",
           "prune",
@@ -1914,7 +2086,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         .string()
         .optional()
         .describe(
-          "Execution ID (for show/resume/detail/context/wait). Real watch streaming is GET /gc/workflow/:id/watch.",
+          "Execution ID (for show/resume/detail/context/wait/watch).",
         ),
       execution_id: z
         .string()
@@ -1934,6 +2106,14 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         .describe(
           'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
+      run_timeout: zTimeout()
+        .optional()
+        .describe(
+          'Server-side workflow execution timeout in seconds for action=run only. Distinct from client timeout. "none" / "infinity" / "infinite" disable the server-side run deadline.',
+        ),
+      execution_timeout: zTimeout()
+        .optional()
+        .describe("Alias for run_timeout"),
       include_hidden: zBoolean()
         .optional()
         .describe(
@@ -1954,7 +2134,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         .describe("Preview repair_stale without mutating"),
     }),
   },
-  async (params) => {
+  async (params, extra) => {
     // Normalize execution_id -> id for the handler
     const normalized = { ...params };
     if (normalized.execution_id && !normalized.id) {
@@ -1971,7 +2151,8 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
     const isLongAction =
       params.action === "run" ||
       params.action === "resume" ||
-      params.action === "wait";
+      params.action === "wait" ||
+      params.action === "watch";
 
     if (params.async) {
       clientTimeoutMs = 15_000; // async returns immediately
@@ -1985,6 +2166,49 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
       clientTimeoutMs = params.timeout * 1000;
     } else if (isLongAction) {
       clientTimeoutMs = 300_000; // 5 min default for sync run/resume
+    }
+
+    if (params.action === "watch") {
+      const executionId =
+        typeof normalized.id === "string" ? normalized.id : undefined;
+      if (!executionId) {
+        return err("ERROR: execution id is required for action=watch");
+      }
+
+      try {
+        const { events, terminal } = await readWorkflowWatchStream(
+          executionId,
+          clientTimeoutMs,
+          async (event, index) => {
+            if (extra._meta?.progressToken === undefined) return;
+
+            await extra.sendNotification({
+              method: "notifications/progress",
+              params: {
+                progressToken: extra._meta.progressToken,
+                progress: index,
+                message: summarizeWatchEvent(event),
+              },
+            });
+          },
+        );
+
+        const finalEvent = terminal || events.at(-1);
+        const payload = {
+          ok: true,
+          id: executionId,
+          event_count: events.length,
+          final_event: finalEvent?.event ?? null,
+          terminal: finalEvent?.data ?? null,
+          events,
+        };
+
+        return isFailedWatchEvent(finalEvent as WorkflowWatchEvent)
+          ? err(toJsonText(payload))
+          : text(toJsonText(payload));
+      } catch (e: any) {
+        return err(`ERROR: ${e.message}`);
+      }
     }
 
     return daemonCall("/gc/workflow", normalized, clientTimeoutMs);
@@ -2334,14 +2558,17 @@ function getResolveBridgePath(): string {
 Re-reads ~/.config/gc/secrets.toml and applies changed values to Application env.
 
 Currently reloads:
-  - [providers] section (appliance model, context, tokens, base_url)
-  - [api] section (API keys: openrouter, zai, hindsight)
+  - [providers] section
+  - [api] section
+  - [env] section
+  - [paths] section
+  - [telegram] section
 
 Use after: editing secrets.toml, swapping models in LM Studio, rotating API keys.
 No daemon restart needed — values take effect on the next LLM call.`,
       inputSchema: z.object({
         section: z
-          .enum(["providers", "api"])
+          .enum(["providers", "api", "env", "paths", "telegram"])
           .optional()
           .describe("Reload only this section (omit for all)"),
       }),
@@ -3138,37 +3365,206 @@ server.registerTool(
   },
 );
 
-const rawListToolsHandler = (server.server as any)._requestHandlers.get(
-  "tools/list",
-);
-
-if (rawListToolsHandler) {
-  server.server.setRequestHandler(
-    ListToolsRequestSchema,
-    async (request, extra) => {
-      const result = await rawListToolsHandler(request, extra);
-
-      return {
-        ...result,
-        tools: result.tools.map((tool: Record<string, unknown>) => ({
-          ...tool,
-          inputSchema: inlineLocalRefs(tool.inputSchema),
-          ...(tool.outputSchema
-            ? { outputSchema: inlineLocalRefs(tool.outputSchema) }
-            : {}),
-        })),
-      };
-    },
+  const rawListToolsHandler = (server.server as any)._requestHandlers.get(
+    "tools/list",
   );
+
+  if (rawListToolsHandler) {
+    server.server.setRequestHandler(
+      ListToolsRequestSchema,
+      async (request, extra) => {
+        const result = await rawListToolsHandler(request, extra);
+
+        return {
+          ...result,
+          tools: result.tools.map((tool: Record<string, unknown>) => ({
+            ...tool,
+            inputSchema: inlineLocalRefs(tool.inputSchema),
+            ...(tool.outputSchema
+              ? { outputSchema: inlineLocalRefs(tool.outputSchema) }
+              : {}),
+          })),
+        };
+      },
+    );
+  }
+
+  return server;
 }
 
 // ════════════════════════════════════════════════════════════════
 // Connect and start
 // ════════════════════════════════════════════════════════════════
 
+type BootstrapTransport = "stdio" | "streamable-http" | "all";
+
+type HttpSession = {
+  server: McpServer;
+  transport: StreamableHTTPServerTransport;
+};
+
+const HTTP_HOST = process.env.GC_MCP_HOST || "127.0.0.1";
+const HTTP_PORT = Number(process.env.GC_MCP_PORT || "8765");
+const HTTP_PATH = process.env.GC_MCP_PATH || "/mcp";
+
+function getBootstrapTransport(): BootstrapTransport {
+  const raw = (process.env.GC_MCP_TRANSPORT || "stdio").toLowerCase();
+  if (raw === "stdio" || raw === "streamable-http" || raw === "all") {
+    return raw;
+  }
+
+  throw new Error(
+    `Invalid GC_MCP_TRANSPORT=${raw}. Expected stdio, streamable-http, or all.`,
+  );
+}
+
+function isInitializePayload(payload: unknown): boolean {
+  return (
+    !!payload &&
+    typeof payload === "object" &&
+    "method" in payload &&
+    (payload as { method?: unknown }).method === "initialize"
+  );
+}
+
+async function readJsonBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+
+  for await (const chunk of req) {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  }
+
+  if (chunks.length === 0) return undefined;
+
+  const raw = Buffer.concat(chunks).toString("utf8").trim();
+  if (!raw) return undefined;
+
+  return JSON.parse(raw);
+}
+
+function writeJsonError(
+  res: ServerResponse,
+  status: number,
+  message: string,
+): void {
+  if (res.headersSent) return;
+
+  res.statusCode = status;
+  res.setHeader("Content-Type", "application/json");
+  res.end(
+    JSON.stringify({
+      jsonrpc: "2.0",
+      error: { code: -32000, message },
+      id: null,
+    }),
+  );
+}
+
+async function startStreamableHttpServer(): Promise<void> {
+  const sessions = new Map<string, HttpSession>();
+
+  const listener = createServer(async (req, res) => {
+    try {
+      const url = new URL(
+        req.url || "/",
+        `http://${req.headers.host || HTTP_HOST}`,
+      );
+      if (url.pathname !== HTTP_PATH) {
+        res.statusCode = 404;
+        res.end("Not found");
+        return;
+      }
+
+      const sessionIdHeader = req.headers["mcp-session-id"];
+      const sessionId =
+        typeof sessionIdHeader === "string" ? sessionIdHeader : undefined;
+
+      if (req.method === "POST") {
+        const body = await readJsonBody(req);
+        const session = sessionId ? sessions.get(sessionId) : undefined;
+
+        if (!session) {
+          if (sessionId || !isInitializePayload(body)) {
+            writeJsonError(
+              res,
+              400,
+              "Bad Request: No valid session ID provided",
+            );
+            return;
+          }
+
+          const server = buildMcpServer();
+          let transport!: StreamableHTTPServerTransport;
+          transport = new StreamableHTTPServerTransport({
+            sessionIdGenerator: () => randomUUID(),
+            onsessioninitialized: (newSessionId) => {
+              sessions.set(newSessionId, { server, transport });
+            },
+          });
+
+          transport.onclose = async () => {
+            const sid = transport.sessionId;
+            if (sid) sessions.delete(sid);
+            await server.close().catch(() => undefined);
+          };
+
+          await server.connect(transport);
+          await transport.handleRequest(req, res, body);
+          return;
+        }
+
+        await session.transport.handleRequest(req, res, body);
+        return;
+      }
+
+      if (req.method === "GET" || req.method === "DELETE") {
+        if (!sessionId) {
+          writeJsonError(res, 400, "Bad Request: Missing MCP session ID");
+          return;
+        }
+
+        const session = sessions.get(sessionId);
+        if (!session) {
+          writeJsonError(res, 404, "Unknown MCP session ID");
+          return;
+        }
+
+        await session.transport.handleRequest(req, res);
+        return;
+      }
+
+      res.statusCode = 405;
+      res.setHeader("Allow", "GET, POST, DELETE");
+      res.end("Method not allowed");
+    } catch (e: any) {
+      writeJsonError(res, 500, e.message || "Internal server error");
+    }
+  });
+
+  await new Promise<void>((resolveListen, rejectListen) => {
+    listener.once("error", rejectListen);
+    listener.listen(HTTP_PORT, HTTP_HOST, () => {
+      listener.off("error", rejectListen);
+      process.stderr.write(
+        `gc_mcp streamable_http listening on http://${HTTP_HOST}:${HTTP_PORT}${HTTP_PATH}\n`,
+      );
+      resolveListen();
+    });
+  });
+}
+
 async function main() {
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  const mode = getBootstrapTransport();
+
+  if (mode === "stdio" || mode === "all") {
+    const server = buildMcpServer();
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
+
+  if (mode === "streamable-http" || mode === "all") {
+    await startStreamableHttpServer();
+  }
 }
 
 main().catch((e) => {
