@@ -711,13 +711,14 @@ server.registerTool(
   "gc_work",
   {
     description: `Work coordination with dependency DAG.
-Actions: create, list, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, focus, backfill_projects.
-Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see what's unblocked. 'plan' for critical path.`,
+Actions: create, list, search, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, focus, backfill_projects, rebuild_search_index.
+Use action=search to check if an issue about a topic already exists (FTS, ranked, matches title+description regardless of project_id tagging) instead of listing the whole DAG. Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see what's unblocked. 'plan' for critical path.`,
     inputSchema: z.object({
       action: z
         .enum([
           "create",
           "list",
+          "search",
           "ready",
           "show",
           "update",
@@ -733,6 +734,7 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
           "stale",
           "focus",
           "backfill_projects",
+          "rebuild_search_index",
         ])
         .describe("Action to perform"),
       title: z.string().optional().describe("Issue title"),
@@ -751,10 +753,18 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
       depends_on: z.string().optional().describe("Issue ID this depends on"),
       agent: z.string().optional().describe("Agent name for claim/assign"),
       note: z.string().optional().describe("Comment text or close reason"),
+      q: z
+        .string()
+        .optional()
+        .describe(
+          "Full-text query for action=search — matches issue title + description, ranked by relevance. Bypasses project_id tagging. Punctuation-only queries return an annotated empty result.",
+        ),
       status: z
         .string()
         .optional()
-        .describe("Filter by status: open, in_progress, closed, all"),
+        .describe(
+          "Filter by status: open, in_progress, closed, all. list defaults to open; search defaults to all statuses.",
+        ),
       assigned: z.string().optional().describe("Filter by assigned agent"),
       days: zNumber()
         .optional()
@@ -775,7 +785,7 @@ Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see w
       limit: zNumber()
         .optional()
         .describe(
-          "For action=stale/focus/backfill_projects: max rows or sample size",
+          "Max results. list: default 50, cap 500 (newest-first; also returns `total` = full pre-limit count). search: default 10, cap 50. ready: opt-in, no default. stale/focus/backfill_projects: max rows or sample size.",
         ),
     }),
   },
