@@ -2349,13 +2349,14 @@ Actions:
 
 Targets (examples):
   providers, api_keys, env, paths, telegram_routing, telegram_bot_token,
-  vault, a2a_auth, mcp_client, workflows, personas, session_registry,
-  sync_rules, project_registry
+  vault, a2a_auth, mcp_client, llm_core_providers, llm_core_routing,
+  workflows, personas, session_registry, sync_rules, project_registry
 
 Use after: editing secrets.toml or YAML config, swapping models in LM Studio,
-rotating API keys, updating workflow definitions.
+rotating API keys, updating workflow definitions, or reloading llm_core.toml
+provider definitions such as custom CLI providers.
 
-Legacy section names (providers, api, env, paths, telegram, vault, a2a, mcp)
+Legacy section names (providers, api, env, paths, telegram, vault, a2a, mcp, llm_core)
 are still accepted via the section parameter for backward compatibility.`,
         inputSchema: z.object({
             action: z
@@ -2365,7 +2366,7 @@ are still accepted via the section parameter for backward compatibility.`,
             target: z
                 .string()
                 .optional()
-                .describe("Single reload target (e.g. providers, api_keys, env, paths, telegram_routing, vault, a2a_auth, mcp_client, workflows, personas, session_registry, sync_rules, project_registry)."),
+                .describe("Single reload target (e.g. providers, api_keys, env, paths, telegram_routing, vault, a2a_auth, mcp_client, llm_core_providers, llm_core_routing, workflows, personas, session_registry, sync_rules, project_registry)."),
             targets: z
                 .array(z.string())
                 .optional()
@@ -2377,7 +2378,7 @@ are still accepted via the section parameter for backward compatibility.`,
             section: z
                 .string()
                 .optional()
-                .describe("Legacy compatibility: section name (providers, api, env, paths, telegram, vault, a2a, mcp)."),
+                .describe("Legacy compatibility: section name (providers, api, env, paths, telegram, vault, a2a, mcp, llm_core)."),
         }),
     }, async (params) => daemonCall("/gc/reload", params));
     server.registerTool("davinci_resolve", {
