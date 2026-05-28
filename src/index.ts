@@ -2558,35 +2558,6 @@ function getResolveBridgePath(): string {
     "resolve-bridge.py",
   );
   // ════════════════════════════════════════════════════════════════
-  // DAEMON TOOLS — Hot Config Reload
-  // ════════════════════════════════════════════════════════════════
-
-  server.registerTool(
-    "gc_reload",
-    {
-      description: `Hot-reload gc_daemon configuration from secrets.toml without restarting the daemon.
-Re-reads ~/.config/gc/secrets.toml and applies changed values to Application env.
-
-Currently reloads:
-  - [providers] section
-  - [api] section
-  - [env] section
-  - [paths] section
-  - [telegram] section
-
-Use after: editing secrets.toml, swapping models in LM Studio, rotating API keys.
-No daemon restart needed — values take effect on the next LLM call.`,
-      inputSchema: z.object({
-        section: z
-          .enum(["providers", "api", "env", "paths", "telegram"])
-          .optional()
-          .describe("Reload only this section (omit for all)"),
-      }),
-    },
-    async (params) => daemonCall("/gc/reload", params),
-  );
-
-  // ════════════════════════════════════════════════════════════════
   // DAEMON TOOL — A2A (Agent-to-Agent Protocol)
   // ════════════════════════════════════════════════════════════════
 
@@ -2787,6 +2758,57 @@ Task states: submitted → working → completed | failed | canceled | rejected.
   if (existsSync(localPath)) return localPath;
   throw new Error("resolve-bridge.py not found");
 }
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Hot Config Reload
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_reload",
+  {
+    description: `Runtime config reload control plane for YAML/TOML-backed operator config.
+Supports status, preview, apply, selective targets, safe bulk reload, and legacy section-based requests.
+
+Actions:
+  - status:  Show current reload targets and their live-safe status.
+  - preview: Dry-run — show what would change without applying.
+  - apply:   Apply the reload for the specified target(s).
+
+Targets (examples):
+  providers, api_keys, env, paths, telegram_routing, telegram_bot_token,
+  vault, a2a_auth, mcp_client, workflows, personas, session_registry,
+  sync_rules, project_registry
+
+Use after: editing secrets.toml or YAML config, swapping models in LM Studio,
+rotating API keys, updating workflow definitions.
+
+Legacy section names (providers, api, env, paths, telegram, vault, a2a, mcp)
+are still accepted via the section parameter for backward compatibility.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["status", "preview", "apply"])
+        .optional()
+        .describe("Reload action: status (inspect), preview (dry-run), or apply (execute). Defaults to status."),
+      target: z
+        .string()
+        .optional()
+        .describe("Single reload target (e.g. providers, api_keys, env, paths, telegram_routing, vault, a2a_auth, mcp_client, workflows, personas, session_registry, sync_rules, project_registry)."),
+      targets: z
+        .array(z.string())
+        .optional()
+        .describe("Multiple reload targets. Use all_safe=true or omit targets to apply all safe targets."),
+      all_safe: z
+        .boolean()
+        .optional()
+        .describe("Expand to all live-safe targets (excludes dangerous-sync and restart-required targets)."),
+      section: z
+        .string()
+        .optional()
+        .describe("Legacy compatibility: section name (providers, api, env, paths, telegram, vault, a2a, mcp)."),
+    }),
+  },
+  async (params) => daemonCall("/gc/reload", params),
+);
 
 server.registerTool(
   "davinci_resolve",
