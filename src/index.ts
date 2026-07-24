@@ -166,18 +166,12 @@ function isFailedWatchEvent(event: WorkflowWatchEvent): boolean {
   return false;
 }
 
-async function readWorkflowWatchStream(
-  executionId: string,
-  timeoutMs: number | null | undefined,
+async function readSseStream(
+  resp: Response,
   onEvent?: (event: WorkflowWatchEvent, index: number) => Promise<void> | void,
 ): Promise<{ events: WorkflowWatchEvent[]; terminal?: WorkflowWatchEvent }> {
-  const resp = await gcGetResponse(
-    `/gc/workflow/${encodeURIComponent(executionId)}/watch`,
-    timeoutMs,
-  );
-
   if (!resp.body) {
-    throw new Error("gc_daemon workflow watch returned no response body");
+    throw new Error("gc_daemon SSE stream returned no response body");
   }
 
   const reader = resp.body.getReader();
@@ -253,6 +247,18 @@ async function readWorkflowWatchStream(
       return { events, terminal };
     }
   }
+}
+
+async function readWorkflowWatchStream(
+  executionId: string,
+  timeoutMs: number | null | undefined,
+  onEvent?: (event: WorkflowWatchEvent, index: number) => Promise<void> | void,
+): Promise<{ events: WorkflowWatchEvent[]; terminal?: WorkflowWatchEvent }> {
+  const resp = await gcGetResponse(
+    `/gc/workflow/${encodeURIComponent(executionId)}/watch`,
+    timeoutMs,
+  );
+  return readSseStream(resp, onEvent);
 }
 
 function resolveJsonPointer(root: unknown, ref: string): unknown {
@@ -382,6 +388,10 @@ function buildMcpServer() {
       "gc_cost checks cost ceilings, spend, and breaker state.",
       "gc_posture tunes operator trust levels for autonomous actions.",
       "gc_hindsight queries the deep-memory Hindsight cache.",
+      "gc_conversation / gc_agent_conversation / gc_aden manage interactive chat sessions.",
+      "gc_run watches and controls observable workflow/execution runs.",
+      "gc_checkpoint fetches and resolves approval checkpoints.",
+      "gc_workflow_watch follows a workflow execution live via SSE.",
       "gc_work manages the Bee DAG — issues, dependencies, assignments.",
       "gc_plan answers 'what should I work on next?' with scored recommendations.",
       "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
@@ -1015,6 +1025,510 @@ server.registerTool(
     try {
       const result = await gcGet("/gc/telegram/status");
       return text(JSON.stringify(result, null, 2));
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — AI Conversation
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_conversation",
+  {
+    description: `Interactive AI conversation sessions (backend-neutral).
+Actions:
+- spawn: create a new session (persona/agent_name, optional config, make_apex)
+- turn: send a message and get the assistant response
+- submit_tool_results: provide results for pending tool calls
+- cut_in: inject an operator message into a running session
+- get/list/delete: inspect or close sessions
+- diagnostics: persona/path resolution diagnostics
+- apex_status: show the active apex session
+- activate_apex: bind a session as the apex`,
+    inputSchema: z.object({
+      action: z
+        .enum([
+          "spawn",
+          "turn",
+          "submit_tool_results",
+          "cut_in",
+          "get",
+          "list",
+          "delete",
+          "diagnostics",
+          "apex_status",
+          "activate_apex",
+        ])
+        .describe("Action to perform"),
+      persona: z.string().optional().describe("Persona/agent name (for spawn)"),
+      agent_name: z.string().optional().describe("Alias for persona (for spawn)"),
+      agent: z.string().optional().describe("Alias for persona (for spawn)"),
+      config: z.record(z.any()).optional().describe("Session config object (for spawn)"),
+      make_apex: zBoolean()
+        .optional()
+        .describe("Activate as apex after spawn (default true)"),
+      session_id: z.string().optional().describe("Session ID (for turn/get/delete/etc.)"),
+      id: z.string().optional().describe("Alias for session_id"),
+      message: z.string().optional().describe("User message (for turn/cut_in)"),
+      from: z.string().optional().describe("Cut-in sender label (for cut_in)"),
+      tool_results: z
+        .array(z.any())
+        .optional()
+        .describe("Tool results array (for submit_tool_results)"),
+      results: z
+        .array(z.any())
+        .optional()
+        .describe("Alias for tool_results"),
+    }),
+  },
+  async (params) => {
+    const action = params.action;
+    const sessionId = params.session_id || params.id;
+
+    try {
+      if (action === "spawn") {
+        const result = await gcPost("/gc/conversation", params);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "list" || action === "diagnostics" || action === "apex_status") {
+        const path =
+          action === "list"
+            ? "/gc/conversation"
+            : action === "diagnostics"
+              ? "/gc/conversation/diagnostics"
+              : "/gc/conversation/apex";
+        const result = await gcGet(path);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "activate_apex") {
+        const result = await gcPost("/gc/conversation/apex", {
+          session_id: sessionId,
+          id: sessionId,
+        });
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "turn" || action === "submit_tool_results" || action === "cut_in") {
+        if (!sessionId) return err("session_id (or id) is required");
+        const path =
+          action === "turn"
+            ? `/gc/conversation/${encodeURIComponent(sessionId)}/turn`
+            : action === "cut_in"
+              ? `/gc/conversation/${encodeURIComponent(sessionId)}/cut_in`
+              : `/gc/conversation/${encodeURIComponent(sessionId)}/tool_results`;
+        const result = await gcPost(path, params);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "get" || action === "delete") {
+        if (!sessionId) return err("session_id (or id) is required");
+        const path = `/gc/conversation/${encodeURIComponent(sessionId)}`;
+        const result =
+          action === "get" ? await gcGet(path) : await gcDelete(path);
+        return text(JSON.stringify(result, null, 2));
+      }
+      return err(`unsupported gc_conversation action: ${action}`);
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Local Agent Conversation
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_agent_conversation",
+  {
+    description: `Chat-style sessions with local GC agents.
+Actions: spawn, turn, get, list, delete.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["spawn", "turn", "get", "list", "delete"])
+        .describe("Action to perform"),
+      agent_name: z.string().optional().describe("Agent name (for spawn)"),
+      agent: z.string().optional().describe("Alias for agent_name (for spawn)"),
+      config: z.record(z.any()).optional().describe("Session config (for spawn)"),
+      session_id: z.string().optional().describe("Session ID"),
+      id: z.string().optional().describe("Alias for session_id"),
+      message: z.string().optional().describe("Message (for turn)"),
+    }),
+  },
+  async (params) => {
+    const action = params.action;
+    const sessionId = params.session_id || params.id;
+
+    try {
+      if (action === "spawn") {
+        const result = await gcPost("/gc/agent_conversation", params);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "list") {
+        const result = await gcGet("/gc/agent_conversation");
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "turn") {
+        if (!sessionId) return err("session_id (or id) is required");
+        const result = await gcPost(
+          `/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`,
+          params,
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "get" || action === "delete") {
+        if (!sessionId) return err("session_id (or id) is required");
+        const path = `/gc/agent_conversation/${encodeURIComponent(sessionId)}`;
+        const result =
+          action === "get" ? await gcGet(path) : await gcDelete(path);
+        return text(JSON.stringify(result, null, 2));
+      }
+      return err(`unsupported gc_agent_conversation action: ${action}`);
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Aden Conversation
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_aden",
+  {
+    description: `Aden conversation instances.
+Actions: spawn, turn, get, list, delete.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["spawn", "turn", "get", "list", "delete"])
+        .describe("Action to perform"),
+      business_name: z.string().optional().describe("Business name (for spawn)"),
+      pre_research: z.string().optional().describe("Pre-research context (for spawn)"),
+      persona: z.string().optional().describe("Persona (for spawn, default noah)"),
+      instance_id: z.string().optional().describe("Instance ID"),
+      id: z.string().optional().describe("Alias for instance_id"),
+      message: z.string().optional().describe("Message (for turn)"),
+    }),
+  },
+  async (params) => {
+    const action = params.action;
+    const instanceId = params.instance_id || params.id;
+
+    try {
+      if (action === "spawn") {
+        const result = await gcPost("/gc/aden", params);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "list") {
+        const result = await gcGet("/gc/aden");
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "turn") {
+        if (!instanceId) return err("instance_id (or id) is required");
+        const result = await gcPost(
+          `/gc/aden/${encodeURIComponent(instanceId)}/turn`,
+          params,
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "get" || action === "delete") {
+        if (!instanceId) return err("instance_id (or id) is required");
+        const path = `/gc/aden/${encodeURIComponent(instanceId)}`;
+        const result =
+          action === "get" ? await gcGet(path) : await gcDelete(path);
+        return text(JSON.stringify(result, null, 2));
+      }
+      return err(`unsupported gc_aden action: ${action}`);
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Observable Runs
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_run",
+  {
+    description: `Observable run control and event history.
+Actions:
+- events: durable event log since a seq (non-SSE history read)
+- control: operator control (abort)
+- watch: SSE live tail (collects events until terminal or timeout)`,
+    inputSchema: z.object({
+      action: z.enum(["events", "control", "watch"]).describe("Action to perform"),
+      execution_id: z.string().describe("Run execution ID"),
+      id: z.string().optional().describe("Alias for execution_id"),
+      since: zNumber().optional().describe("Start seq (for events/watch, default 0)"),
+      control_action: z
+        .enum(["abort"])
+        .optional()
+        .describe("Control action (for control)"),
+      reason: z.string().optional().describe("Abort reason (for control)"),
+      timeout: zTimeout().optional().describe("Watch timeout (for watch)"),
+      heartbeat: zNumber().optional().describe("Watch heartbeat ms (for watch)"),
+    }),
+  },
+  async (params) => {
+    const action = params.action;
+    const executionId = params.execution_id || params.id;
+    if (!executionId) return err("execution_id (or id) is required");
+
+    try {
+      if (action === "events") {
+        const since = params.since ?? 0;
+        const result = await gcGet(
+          `/gc/run/${encodeURIComponent(executionId)}/events?since=${encodeURIComponent(since)}`,
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "control") {
+        const result = await gcPost(
+          `/gc/run/${encodeURIComponent(executionId)}/control`,
+          {
+            action: params.control_action || "abort",
+            reason: params.reason,
+          },
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "watch") {
+        const timeoutMs =
+          params.timeout === "infinite" || params.timeout === "infinity"
+            ? null
+            : typeof params.timeout === "number"
+              ? params.timeout * 1000
+              : 30_000;
+        const url = `${GC_BASE}/gc/run/${encodeURIComponent(executionId)}/watch?since=${encodeURIComponent(params.since ?? 0)}`;
+        const resp = await fetch(url, {
+          signal:
+            timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
+        });
+        if (!resp.ok) {
+          const textBody = await resp.text().catch(() => "");
+          throw new Error(`gc_daemon run watch failed (${resp.status}): ${textBody}`);
+        }
+        const { events, terminal } = await readSseStream(resp);
+        const summary = terminal
+          ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+          : `\nStream ended without terminal event (${events.length} events)`;
+        return text(
+          JSON.stringify(
+            {
+              execution_id: executionId,
+              event_count: events.length,
+              terminal_event: terminal
+                ? {
+                    event: terminal.event,
+                    data: terminal.data,
+                  }
+                : null,
+              events: events.map((e) => ({
+                event: e.event,
+                data: e.data,
+              })),
+            },
+            null,
+            2,
+          ) + summary,
+        );
+      }
+      return err(`unsupported gc_run action: ${action}`);
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Approval Checkpoints
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_checkpoint",
+  {
+    description: `Approval checkpoints (Story 3.5a).
+- get: fetch a held action's render payload + risk dot
+- resolve: approve or reject a checkpoint; edited_args supports edit-then-approve`,
+    inputSchema: z.object({
+      action: z.enum(["get", "resolve"]).describe("Action to perform"),
+      id: z.string().describe("Checkpoint ID"),
+      decision: z
+        .enum(["approve", "reject"])
+        .optional()
+        .describe("Decision (for resolve)"),
+      edited_args: z
+        .record(z.any())
+        .optional()
+        .describe("Edited args for edit-then-approve (for resolve)"),
+    }),
+  },
+  async (params) => {
+    const action = params.action;
+    const id = params.id;
+    if (!id) return err("id is required");
+
+    try {
+      if (action === "get") {
+        const result = await gcGet(`/gc/checkpoint/${encodeURIComponent(id)}`);
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "resolve") {
+        if (!params.decision) return err("decision is required for resolve");
+        const result = await gcPost(
+          `/gc/checkpoint/${encodeURIComponent(id)}/resolve`,
+          {
+            decision: params.decision,
+            edited_args: params.edited_args,
+          },
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      return err(`unsupported gc_checkpoint action: ${action}`);
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Relay Ingress
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_relay",
+  {
+    description: `Relay ingress for external peers (e.g. Pluto). Sends a message to an existing agent session or creates a new one. Defaults to the daemon-owned ingress agent (charon).`,
+    inputSchema: z.object({
+      message: z.string().describe("Message to relay"),
+      session_id: z
+        .string()
+        .optional()
+        .describe("Existing session ID (if omitted, a new session is spawned)"),
+      agent: z.string().optional().describe("Target agent name (default charon)"),
+      config: z.record(z.any()).optional().describe("Session config (for new sessions)"),
+    }),
+  },
+  async (params) => daemonCall("/gc/relay", params),
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Workflow Watch (SSE)
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_workflow_watch",
+  {
+    description: `Live SSE watch of a workflow execution. Collects status events until the execution settles, times out, or the client aborts. Use gc_workflow action=wait for a simpler polling alternative.`,
+    inputSchema: z.object({
+      execution_id: z.string().describe("Workflow execution ID"),
+      id: z.string().optional().describe("Alias for execution_id"),
+      since: zNumber().optional().describe("Start seq (default 0)"),
+      timeout: zTimeout().optional().describe("Max watch time in seconds"),
+      heartbeat: zNumber().optional().describe("Heartbeat interval ms"),
+    }),
+  },
+  async (params) => {
+    const executionId = params.execution_id || params.id;
+    if (!executionId) return err("execution_id (or id) is required");
+
+    try {
+      const timeoutMs =
+        params.timeout === "infinite" || params.timeout === "infinity"
+          ? null
+          : typeof params.timeout === "number"
+            ? params.timeout * 1000
+            : 30_000;
+      const { events, terminal } = await readWorkflowWatchStream(
+        executionId,
+        timeoutMs,
+      );
+      const summary = terminal
+        ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+        : `\nStream ended without terminal event (${events.length} events)`;
+      return text(
+        JSON.stringify(
+          {
+            execution_id: executionId,
+            event_count: events.length,
+            terminal_event: terminal
+              ? {
+                  event: terminal.event,
+                  data: terminal.data,
+                }
+              : null,
+            events: events.map((e) => ({
+              event: e.event,
+              data: e.data,
+            })),
+          },
+          null,
+          2,
+        ) + summary,
+      );
+    } catch (e: any) {
+      return err(`ERROR: ${e.message}`);
+    }
+  },
+);
+
+// ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Capability Watch (SSE)
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_capability_watch",
+  {
+    description: `Live SSE watch of capability-state changes. Returns the initial snapshot plus any capability state changes until timeout.`,
+    inputSchema: z.object({
+      timeout: zTimeout().optional().describe("Max watch time in seconds"),
+      heartbeat: zNumber().optional().describe("Heartbeat interval ms"),
+    }),
+  },
+  async (params) => {
+    try {
+      const timeoutMs =
+        params.timeout === "infinite" || params.timeout === "infinity"
+          ? null
+          : typeof params.timeout === "number"
+            ? params.timeout * 1000
+            : 30_000;
+      const url = `${GC_BASE}/gc/capability/watch`;
+      const resp = await fetch(url, {
+        signal:
+          timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
+      });
+      if (!resp.ok) {
+        const textBody = await resp.text().catch(() => "");
+        throw new Error(`gc_daemon capability watch failed (${resp.status}): ${textBody}`);
+      }
+      const { events, terminal } = await readSseStream(resp);
+      const summary = terminal
+        ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+        : `\nStream ended without terminal event (${events.length} events)`;
+      return text(
+        JSON.stringify(
+          {
+            event_count: events.length,
+            terminal_event: terminal
+              ? {
+                  event: terminal.event,
+                  data: terminal.data,
+                }
+              : null,
+            events: events.map((e) => ({
+              event: e.event,
+              data: e.data,
+            })),
+          },
+          null,
+          2,
+        ) + summary,
+      );
     } catch (e: any) {
       return err(`ERROR: ${e.message}`);
     }
