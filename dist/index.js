@@ -310,6 +310,7 @@ function buildMcpServer() {
         instructions: [
             "Grand Central operations hub. All tools route to gc_daemon (localhost:4242).",
             "Use gc_recall for memory search (FTS5, instant). gc_retain to store facts.",
+            "gc_docs queries the packaged gc_daemon user manual — use it for setup, configuration, workflows, templates, and troubleshooting.",
             "gc_work manages the Bee DAG — issues, dependencies, assignments.",
             "gc_plan answers 'what should I work on next?' with scored recommendations.",
             "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
@@ -429,6 +430,56 @@ Actions: "reindex" = enqueue a full reindex now, "status" = show vault config an
                 .describe("Action to perform"),
         }),
     }, async (params) => daemonCall("/gc/vault", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Documentation
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_docs", {
+        description: `Query the packaged gc_daemon user manual.
+Use this whenever you need authoritative help with daemon setup, configuration, workflows, templates, or troubleshooting.
+Actions:
+- search: keyword search over doc titles, ids, and tags
+- get: retrieve a doc body by id or path
+- list: list docs, templates, workflows, or checklists
+- guide: return a ranked guide (docs + checklists + templates) for a topic
+- template: return the raw contents of a starter template by name
+- validate: check that the manual package is intact`,
+        inputSchema: z.object({
+            action: z
+                .enum(["search", "get", "list", "guide", "template", "validate"])
+                .describe("Action to perform"),
+            query: z
+                .string()
+                .optional()
+                .describe("Keyword query (for search)"),
+            tags: z
+                .array(z.string())
+                .optional()
+                .describe("Filter by tags (for search/list)"),
+            limit: zNumber()
+                .optional()
+                .describe("Max results (for search/guide, default 10, cap 100)"),
+            id: z
+                .string()
+                .optional()
+                .describe("Doc id (for get)"),
+            path: z
+                .string()
+                .optional()
+                .describe("Doc path (for get)"),
+            kind: z
+                .enum(["doc", "template", "workflow", "checklist"])
+                .optional()
+                .describe("Collection kind (for list, default doc)"),
+            topic: z
+                .string()
+                .optional()
+                .describe("Topic for guided results (for guide)"),
+            name: z
+                .string()
+                .optional()
+                .describe("Template name or id (for template)"),
+        }),
+    }, async (params) => daemonCall("/gc/docs", params));
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Directives
     // ════════════════════════════════════════════════════════════════
