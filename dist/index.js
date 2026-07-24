@@ -311,6 +311,12 @@ function buildMcpServer() {
             "Grand Central operations hub. All tools route to gc_daemon (localhost:4242).",
             "Use gc_recall for memory search (FTS5, instant). gc_retain to store facts.",
             "gc_docs queries the packaged gc_daemon user manual — use it for setup, configuration, workflows, templates, and troubleshooting.",
+            "gc_onboarding drives the guided setup DAG and setup-degree checks.",
+            "gc_control executes deterministic, approval-gated operations directly.",
+            "gc_capability reports which features are currently lit up.",
+            "gc_cost checks cost ceilings, spend, and breaker state.",
+            "gc_posture tunes operator trust levels for autonomous actions.",
+            "gc_hindsight queries the deep-memory Hindsight cache.",
             "gc_work manages the Bee DAG — issues, dependencies, assignments.",
             "gc_plan answers 'what should I work on next?' with scored recommendations.",
             "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
@@ -480,6 +486,353 @@ Actions:
                 .describe("Template name or id (for template)"),
         }),
     }, async (params) => daemonCall("/gc/docs", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Memory Maintenance
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_rebuild_fts", {
+        description: `Emergency rebuild of the memory-bank FTS5 index.
+Use when recall/search is returning stale or incomplete results despite facts existing in the bank. This is a maintenance operation, not a daily tool.`,
+        inputSchema: z.object({}),
+    }, async () => daemonCall("/gc/rebuild_fts", {}));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Uniform Tool Call Surface
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_tool_call", {
+        description: `Execute any daemon tool by name through the uniform tool-call surface (GC-2632).
+Useful when you know the exact tool name and want to dispatch it without a dedicated MCP tool. Handler tools (gc_*) are always available. Code tools (bash, read_file, etc.) require server-side code-tool execution to be enabled.`,
+        inputSchema: z.object({
+            name: z.string().describe("Tool name to execute"),
+            arguments: z
+                .record(z.any())
+                .optional()
+                .describe("Arguments object for the tool (default {}),"),
+            session_id: z
+                .string()
+                .optional()
+                .describe("Session ID for resolving cwd (code tools)"),
+            cwd: z
+                .string()
+                .optional()
+                .describe("Explicit working directory (code tools)"),
+        }),
+    }, async (params) => daemonCall("/gc/tool_call", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Templating
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_template", {
+        description: `Merge-field templating (GC-2774).
+- placeholders: list available {{ }} placeholders for a context
+- fill: render a template block with explicit values`,
+        inputSchema: z.object({
+            action: z
+                .enum(["placeholders", "fill"])
+                .describe("Action to perform"),
+            context: z
+                .enum(["reply", "template"])
+                .optional()
+                .describe("Template context (for placeholders)"),
+            message_id: z.string().optional().describe("Message ID (for placeholders)"),
+            record_type: z.string().optional().describe("Record type (for placeholders)"),
+            block_json: z
+                .record(z.any())
+                .optional()
+                .describe("Template block JSON object (for fill)"),
+            values: z
+                .record(z.any())
+                .optional()
+                .describe("Merge-field values (for fill)"),
+            email: zBoolean()
+                .optional()
+                .describe("Render email-compatible output (for fill)"),
+        }),
+    }, async (params) => daemonCall("/gc/template", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Deterministic Controls
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_control", {
+        description: `Deterministic dual-path controls (Story 3.1). Direct, LLM-free execution of approved operations.
+- manifest: list control-reachable operations and their risk metadata
+- execute: run one control; may return held: true if the gate requires approval`,
+        inputSchema: z.object({
+            action: z
+                .enum(["manifest", "execute"])
+                .describe("Action to perform"),
+            tool: z.string().optional().describe("Tool name (for execute)"),
+            op: z.string().optional().describe("Operation name (for execute)"),
+            args: z
+                .record(z.any())
+                .optional()
+                .describe("Operation arguments object (for execute)"),
+            idempotency_key: z
+                .string()
+                .optional()
+                .describe("Idempotency key (for execute)"),
+        }),
+    }, async (params) => daemonCall("/gc/control", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Onboarding DAG
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_onboarding", {
+        description: `Onboarding DAG orchestration and setup generation.
+Key actions:
+- setup_degree: current readiness state (ready | setup-required | degraded)
+- bootstrap_apex: minimal pre-apex bootstrap (credential one provider)
+- recommended_action: server-authoritative next step
+- begin/expand/advance: companion-driven guided flow
+- state/summary/show/list/ready/next/node: inspect DAG state
+- launch_node/update_node/submit_answers: drive the DAG
+- create/create_template/template: build onboarding DAGs
+- catalog/admin_overview/readiness: administration views`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "create",
+                "create_template",
+                "template",
+                "list_templates",
+                "catalog",
+                "admin_overview",
+                "readiness",
+                "setup_degree",
+                "bootstrap_apex",
+                "recommended_action",
+                "list",
+                "show",
+                "summary",
+                "state",
+                "focus",
+                "node",
+                "ready",
+                "blocked",
+                "next",
+                "update_node",
+                "bind_execution",
+                "reset_node",
+                "launch_node",
+                "submit_answers",
+                "advance",
+                "reset",
+                "resume_node",
+                "begin",
+                "expand",
+                "provider_setup",
+                "assistant_agent_setup",
+                "optional_schedule_setup",
+                "writer_agent_setup",
+                "optional_content_schedule_setup",
+                "project_discovery_or_registration",
+                "developer_agent_setup",
+                "work_dag_alignment",
+                "project_lane_binding",
+                "project_directive_seed",
+                "mail_endpoint_setup",
+                "optional_mail_digest_setup",
+                "memory_bank_setup",
+                "optional_memory_capture_workflow_setup",
+                "content_piece_setup",
+                "distribution_post_setup",
+                "optional_distribution_workflow_setup",
+            ])
+                .describe("Action to perform"),
+            id: z.string().optional().describe("DAG instance ID"),
+            node_key: z.string().optional().describe("Node key within a DAG"),
+            template: z.string().optional().describe("Template ID (for create_template/template)"),
+            templates: z
+                .array(z.string())
+                .optional()
+                .describe("Multiple template IDs"),
+            status: z.string().optional().describe("New node status (for update_node)"),
+            execution_id: z.string().optional().describe("Workflow execution ID (for bind_execution)"),
+            answers: z
+                .record(z.any())
+                .optional()
+                .describe("Answers object (for submit_answers)"),
+            params: z
+                .record(z.any())
+                .optional()
+                .describe("Override params (for launch_node)"),
+            scope: z
+                .string()
+                .optional()
+                .describe("Reset scope: branch | downstream | all (default branch)"),
+            context: z
+                .record(z.any())
+                .optional()
+                .describe("Resume context object (for resume_node)"),
+            input_payload: z.any().optional().describe("Node input payload"),
+            output_summary: z.string().optional().describe("Node output summary"),
+            resume_execution_id: z.string().optional().describe("Resume execution ID"),
+            metadata: z.record(z.any()).optional().describe("Node metadata"),
+            capability: z.string().optional().describe("Capability scope (for recommended_action)"),
+        }),
+    }, async (params) => daemonCall("/gc/onboarding", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Capability State
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_capability", {
+        description: `Reflected capability-state snapshot (features-light-up). Returns the current capability snapshot the front-end uses to decide which features are available.`,
+        inputSchema: z.object({
+            action: z.literal("state").describe("Action to perform"),
+        }),
+    }, async (params) => daemonCall("/gc/capability", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Beat Accumulation
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_beat", {
+        description: `Beat accumulation: ingest turns, check status, flush buffers, report durability.
+Actions: ingest, status, flush, report.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["ingest", "status", "flush", "report"])
+                .describe("Action to perform"),
+            session_id: z.string().optional().describe("Session ID"),
+            role: z.string().optional().describe("Turn role (for ingest)"),
+            text: z.string().optional().describe("Turn text (for ingest)"),
+            tool_calls: z
+                .array(z.any())
+                .optional()
+                .describe("Tool calls in this turn (for ingest)"),
+            files_read: z
+                .array(z.string())
+                .optional()
+                .describe("Files read (for ingest)"),
+            files_modified: z
+                .array(z.string())
+                .optional()
+                .describe("Files modified (for ingest)"),
+            agent: z.string().optional().describe("Agent name (for ingest)"),
+            hostname: z.string().optional().describe("Hostname (for ingest)"),
+            cwd: z.string().optional().describe("Working directory (for ingest)"),
+            bank: z.string().optional().describe("Bank filter (for report)"),
+        }),
+    }, async (params) => daemonCall("/gc/beat", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Cost Guard
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_cost", {
+        description: `Provider cost ceilings and circuit-breaker (Story 3.3, AD-26).
+Actions: set_ceiling, get_ceilings, status, spend, check, reset, estimate.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "set_ceiling",
+                "get_ceilings",
+                "status",
+                "spend",
+                "check",
+                "reset",
+                "estimate",
+            ])
+                .describe("Action to perform"),
+            scope: z
+                .enum(["run", "tree"])
+                .optional()
+                .describe("Cost scope (run or tree)"),
+            scope_id: z.string().optional().describe("Scope ID"),
+            ceiling_cents: zNumber().optional().describe("Ceiling in cents (for set_ceiling)"),
+            cents: zNumber().optional().describe("Spend amount in cents (for spend)"),
+            provider: z.string().optional().describe("Provider name (for spend)"),
+            action_name: z.string().optional().describe("Action name (for spend)"),
+            estimated_cents: zNumber().optional().describe("Estimated cents (for check)"),
+            provider_id: z.string().optional().describe("Provider ID (for estimate)"),
+            input_tokens: zNumber().optional().describe("Input tokens (for estimate)"),
+            output_tokens: zNumber().optional().describe("Output tokens (for estimate)"),
+        }),
+    }, async (params) => daemonCall("/gc/cost", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Trust Posture
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_posture", {
+        description: `Operator-tunable trust posture (Story 3.6, FR-6).
+Actions: get, set_global, set_tool_trust, clear_tool_trust.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["get", "set_global", "set_tool_trust", "clear_tool_trust"])
+                .describe("Action to perform"),
+            level: z
+                .enum(["cautious", "normal", "trusting"])
+                .optional()
+                .describe("Global posture level (for set_global)"),
+            tool: z.string().optional().describe("Tool name (for set_tool_trust/clear_tool_trust)"),
+            loosen_reasons: z
+                .array(z.string())
+                .optional()
+                .describe("Reasons to loosen for this tool (for set_tool_trust)"),
+        }),
+    }, async (params) => daemonCall("/gc/posture", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Orchestration Trees
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_orchestration", {
+        description: `Orchestration trees: create + seat-switch for agent hierarchies (Story 2.11, FR-21).
+Actions: plant, launch, seat, tree, node, list.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["plant", "launch", "seat", "tree", "node", "list"])
+                .describe("Action to perform"),
+            agent: z.string().optional().describe("Agent name (for plant)"),
+            tree_id: z.string().optional().describe("Tree ID (for plant/tree)"),
+            session_id: z.string().optional().describe("Session ID (for plant)"),
+            label: z.string().optional().describe("Label (for plant/launch)"),
+            parent_node_id: z.string().optional().describe("Parent node ID (for launch)"),
+            child_agent: z.string().optional().describe("Child agent name (for launch)"),
+            message: z.string().optional().describe("Dispatch message (for launch)"),
+            node_id: z.string().optional().describe("Node ID (for seat/node)"),
+        }),
+    }, async (params) => daemonCall("/gc/orchestration", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Local Model / Offline Operation
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_local_model", {
+        description: `Local MLX model provisioning and offline operation status (Story 2.10, AD-34).
+Actions: provision, status, offline, connectivity.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["provision", "status", "offline", "connectivity"])
+                .describe("Action to perform"),
+            endpoint: z.string().optional().describe("Local model endpoint (for provision)"),
+            model: z.string().optional().describe("Model name (for provision)"),
+        }),
+    }, async (params) => daemonCall("/gc/local_model", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Hindsight Deep Memory
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_hindsight", {
+        description: `Direct Hindsight deep-memory proxy.
+Actions: health, recall, reflect, retain.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["health", "recall", "reflect", "retain"])
+                .describe("Action to perform"),
+            query: z.string().optional().describe("Query string (for recall/reflect)"),
+            bank_id: z.string().optional().describe("Hindsight bank ID (default: default)"),
+            bank: z.string().optional().describe("Alias for bank_id"),
+            limit: zNumber().optional().describe("Max results (for recall, default 10)"),
+            content: z.string().optional().describe("Content to retain (for retain)"),
+            metadata: z
+                .record(z.any())
+                .optional()
+                .describe("Metadata for retained content (for retain)"),
+        }),
+    }, async (params) => daemonCall("/gc/hindsight", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Telegram
+    // ════════════════════════════════════════════════════════════════
+    server.registerTool("gc_telegram", {
+        description: `Telegram bot poller status. Returns whether the poller is running and connected.`,
+        inputSchema: z.object({
+            action: z.literal("status").describe("Action to perform"),
+        }),
+    }, async (params) => {
+        // GET endpoint; use gcGet for the simple status query.
+        try {
+            const result = await gcGet("/gc/telegram/status");
+            return text(JSON.stringify(result, null, 2));
+        }
+        catch (e) {
+            return err(`ERROR: ${e.message}`);
+        }
+    });
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Directives
     // ════════════════════════════════════════════════════════════════
