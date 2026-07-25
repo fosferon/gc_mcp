@@ -433,8 +433,8 @@ Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statis
                 .describe("Force delete a non-empty bank (for delete)"),
         }),
     }, async (params) => daemonCall("/gc/banks", params));
-    server.registerTool("gc_vault", {
-        description: `Vault knowledge base indexing.
+    server.registerTool("gc_obsidian_vault", {
+        description: `Obsidian vault knowledge-base indexing.
 Indexes Obsidian vault .md files into the memory bank for fast retrieval via gc_recall.
 Actions: "reindex" = enqueue a full reindex now, "status" = show vault config and indexed chunk count.`,
         inputSchema: z.object({
@@ -442,7 +442,7 @@ Actions: "reindex" = enqueue a full reindex now, "status" = show vault config an
                 .enum(["reindex", "status"])
                 .describe("Action to perform"),
         }),
-    }, async (params) => daemonCall("/gc/vault", params));
+    }, async (params) => daemonCall("/gc/obsidian_vault", params));
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Documentation
     // ════════════════════════════════════════════════════════════════
@@ -1464,6 +1464,10 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
             limit: zNumber()
                 .optional()
                 .describe("Max results. list: default 50, cap 500 (newest-first; also returns `total` = full pre-limit count). search: default 10, cap 50. ready: opt-in, no default. stale/focus/backfill_projects: max rows or sample size."),
+            include: z
+                .array(z.enum(["comments"]))
+                .optional()
+                .describe("For action=show: request optional relations. Pass [\"comments\"] to load issue comments in ascending created_at order; omitted relations return as :not_loaded."),
         }),
     }, async (params) => daemonCall("/gc/work", params));
     // ════════════════════════════════════════════════════════════════

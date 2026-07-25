@@ -537,9 +537,9 @@ Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statis
 );
 
 server.registerTool(
-  "gc_vault",
+  "gc_obsidian_vault",
   {
-    description: `Vault knowledge base indexing.
+    description: `Obsidian vault knowledge-base indexing.
 Indexes Obsidian vault .md files into the memory bank for fast retrieval via gc_recall.
 Actions: "reindex" = enqueue a full reindex now, "status" = show vault config and indexed chunk count.`,
     inputSchema: z.object({
@@ -548,7 +548,7 @@ Actions: "reindex" = enqueue a full reindex now, "status" = show vault config an
         .describe("Action to perform"),
     }),
   },
-  async (params) => daemonCall("/gc/vault", params),
+  async (params) => daemonCall("/gc/obsidian_vault", params),
 );
 
 // ════════════════════════════════════════════════════════════════
