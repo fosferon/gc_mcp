@@ -1788,6 +1788,12 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
         .describe(
           "Max results. list: default 50, cap 500 (newest-first; also returns `total` = full pre-limit count). search: default 10, cap 50. ready: opt-in, no default. stale/focus/backfill_projects: max rows or sample size.",
         ),
+      include: z
+        .array(z.enum(["comments"]))
+        .optional()
+        .describe(
+          "For action=show: request optional relations. Pass [\"comments\"] to load issue comments in ascending created_at order; omitted relations return as :not_loaded.",
+        ),
     }),
   },
   async (params) => daemonCall("/gc/work", params),
