@@ -2237,6 +2237,19 @@ Actions: spawn, turn, get, list, destroy.`,
                 .describe("Optional project name or 'all' for overview"),
         }),
     }, async (params) => daemonCall("/gc/ticker", { action: "get", ...params }));
+    server.registerTool("gc_find", {
+        description: `Find documents by metadata — domain, type, project, or title.`,
+        inputSchema: z.object({
+            domain: z.string().optional().describe("Domain filter"),
+            type: z.string().optional().describe("Type filter"),
+            project: z.string().optional().describe("Project name filter"),
+            title: z.string().optional().describe("Title substring (LIKE search)"),
+            limit: z
+                .number()
+                .optional()
+                .describe("Max results (default 25)"),
+        }),
+    }, async (params) => daemonCall("/gc/tool_call", { name: "gc_find", arguments: params }));
     server.registerTool("gc_dispatch", {
         description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
 Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
