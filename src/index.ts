@@ -2679,6 +2679,24 @@ server.registerTool(
 );
 
 server.registerTool(
+  "gc_find",
+  {
+    description: `Find documents by metadata — domain, type, project, or title.`,
+    inputSchema: z.object({
+      domain: z.string().optional().describe("Domain filter"),
+      type: z.string().optional().describe("Type filter"),
+      project: z.string().optional().describe("Project name filter"),
+      title: z.string().optional().describe("Title substring (LIKE search)"),
+      limit: z
+        .number()
+        .optional()
+        .describe("Max results (default 25)"),
+    }),
+  },
+  async (params) => daemonCall("/gc/tool_call", { name: "gc_find", arguments: params }),
+);
+
+server.registerTool(
   "gc_dispatch",
   {
     description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
