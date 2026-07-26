@@ -2219,6 +2219,43 @@ Actions: create (piece), post (distribution), snapshot (manual metrics), ingest 
 );
 
 // ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Runtime Records
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_records",
+  {
+    description: `Runtime record definitions and instances.
+Actions: types, get_type, define_type, create, get, list, update, delete, transition.
+Use definition for define_type and data for create/update.
+Use params for Records query filters, sort, temporal constraints, and pagination.`,
+    inputSchema: z.object({
+      action: z
+        .enum([
+          "types",
+          "get_type",
+          "define_type",
+          "create",
+          "get",
+          "list",
+          "update",
+          "delete",
+          "transition",
+        ])
+        .describe("Action to perform"),
+      handle: z.string().optional().describe("Record type handle for get_type"),
+      type: z.string().optional().describe("Record type handle for create or list"),
+      definition: z.record(z.any()).optional().describe("Record type definition for define_type"),
+      data: z.record(z.any()).optional().describe("Record data for create or update"),
+      pub_id: z.string().optional().describe("Public record ID for get, update, delete, or transition"),
+      event: z.string().optional().describe("Lifecycle event for transition"),
+      params: z.record(z.any()).optional().describe("List filters, sort, temporal constraints, and pagination"),
+    }),
+  },
+  async (params) => daemonCall("/gc/records", params),
+);
+
+// ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Planner
 // ════════════════════════════════════════════════════════════════
 
