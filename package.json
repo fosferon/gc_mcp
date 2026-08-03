@@ -16,7 +16,7 @@
     "type": "git",
     "url": "git+https://github.com/fosferon/gc_mcp.git"
   },
-  "license": "UNLICENSED",
+  "license": "MIT",
   "author": "fosferon",
   "type": "module",
   "main": "dist/index.js",
@@ -27,7 +27,8 @@
   "files": [
     "dist",
     "src",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "engines": {
     "node": ">=18"
