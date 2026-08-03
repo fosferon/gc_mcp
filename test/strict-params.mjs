@@ -214,6 +214,37 @@ try {
   );
   assert.notEqual(zeroArgResult.isError, true, "zero-argument tool must accept {}");
 
+  const workPaginationResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_work",
+        arguments: {
+          action: "list",
+          offset: 25,
+          order: "priority:desc,created_at:asc",
+          mode: "tree",
+          tree: true,
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    workPaginationResult.isError,
+    true,
+    "gc_work must accept daemon-supported pagination and tree fields",
+  );
+  assert.equal(daemonRequests, 1, "valid gc_work pagination reaches gc_daemon");
+  assert.deepEqual(daemonBody, {
+    action: "list",
+    offset: 25,
+    order: "priority:desc,created_at:asc",
+    mode: "tree",
+    tree: true,
+  });
+
   const nestedResult = await callToolHandler(
     {
       method: "tools/call",
@@ -229,7 +260,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 1, "valid call reaches gc_daemon once");
+  assert.equal(daemonRequests, 2, "valid calls reach gc_daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },

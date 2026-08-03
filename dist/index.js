@@ -1549,6 +1549,20 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
             limit: zNumber()
                 .optional()
                 .describe("Max results. list: default 50, cap 500 (newest-first; also returns `total` = full pre-limit count). search: default 10, cap 50. ready: opt-in, no default. stale/focus/backfill_projects: max rows or sample size."),
+            offset: zNumber()
+                .optional()
+                .describe("For action=list: zero-based page offset (default 0). In tree mode this offsets root issues, not individual descendants."),
+            order: z
+                .string()
+                .optional()
+                .describe("For action=list: comma-separated sort terms using created_at, updated_at, priority, or id, each optionally :asc or :desc (for example `priority:desc,created_at:asc`). Invalid terms use the daemon default."),
+            mode: z
+                .enum(["flat", "tree"])
+                .optional()
+                .describe("For action=list: `flat` (default) pages individual issues; `tree` pages root issues while retaining each root's complete dependency subtree."),
+            tree: zBoolean()
+                .optional()
+                .describe("For action=list: legacy alias for `mode: tree` when true."),
             include: z
                 .array(z.enum(["comments"]))
                 .optional()
