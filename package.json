@@ -1,5 +1,5 @@
 {
-  "name": "gc-mcp",
+  "name": "@fosferon/gc-mcp",
   "version": "1.0.0",
   "description": "Universal MCP server for Grand Central — exposes gc_daemon API as MCP tools",
   "keywords": [
@@ -18,6 +18,9 @@
   },
   "license": "MIT",
   "author": "fosferon",
+  "publishConfig": {
+    "access": "public"
+  },
   "type": "module",
   "main": "dist/index.js",
   "types": "dist/index.d.ts",
