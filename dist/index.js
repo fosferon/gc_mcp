@@ -18,6 +18,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
+import * as z4 from "zod/v4";
 import { execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
@@ -305,6 +306,77 @@ const zBoolean = () => z.union([
     z.literal("true").transform(() => true),
     z.literal("false").transform(() => false),
 ]);
+function isSchema(value) {
+    return (!!value &&
+        typeof value === "object" &&
+        typeof value.safeParse === "function");
+}
+function isRawShape(inputSchema) {
+    return (!!inputSchema &&
+        typeof inputSchema === "object" &&
+        Object.values(inputSchema).every(isSchema));
+}
+function isZodV4Schema(schema) {
+    // `ZodType` is the v3 public base class. Zod v4 Classic and Mini schemas
+    // are not instances of it, even though both versions implement Standard
+    // Schema (so `~standard` is not a version discriminator).
+    return !(schema instanceof z.ZodType);
+}
+function unsupportedRootParameterMessage(shape) {
+    return `Unsupported top-level MCP parameter(s). Accepted parameters: ${Object.keys(shape).sort().join(", ") || "(none)"}.`;
+}
+function hasRootRefinement(inputSchema) {
+    const definition = inputSchema.def;
+    return Array.isArray(definition?.checks) && definition.checks.length > 0;
+}
+function unsupportedRootSchema() {
+    throw new TypeError("MCP tool inputSchema must be a direct Zod object or raw shape; wrapped or refined root schemas cannot be made strict without changing their behavior.");
+}
+/**
+ * Normalize the SDK's accepted Zod v3/v4 object and raw-shape forms to an
+ * actual strict Zod object. This keeps the schema SDK-normalizable for
+ * tools/list and leaves declared nested-map schemas unchanged.
+ */
+function strictRootInputSchema(inputSchema) {
+    if (inputSchema === undefined) {
+        return z.object({}).strict(unsupportedRootParameterMessage({}));
+    }
+    const rawShape = isRawShape(inputSchema);
+    const objectSchema = inputSchema;
+    if (!rawShape && hasRootRefinement(inputSchema))
+        unsupportedRootSchema();
+    const candidateShape = rawShape ? inputSchema : objectSchema.shape;
+    const shape = typeof candidateShape === "function" ? candidateShape() : candidateShape;
+    if (!shape || typeof shape !== "object" || !Object.values(shape).every(isSchema)) {
+        unsupportedRootSchema();
+    }
+    const rootShape = shape;
+    const fields = Object.values(rootShape);
+    const usesZodV4 = rawShape
+        ? fields.some(isZodV4Schema)
+        : isZodV4Schema(inputSchema);
+    if (usesZodV4 && !fields.every(isZodV4Schema)) {
+        throw new TypeError("MCP tool inputSchema cannot mix Zod v3 and v4 fields.");
+    }
+    const message = unsupportedRootParameterMessage(rootShape);
+    // Zod v3 exposes a public strict(message) overload, so retain the original
+    // object (and any object-level behavior) when one was registered.
+    if (!usesZodV4 && !rawShape && typeof objectSchema.strict === "function") {
+        return objectSchema.strict(message);
+    }
+    if (!usesZodV4) {
+        return z.object(rootShape).strict(message);
+    }
+    // Zod v4's strict() has no per-schema error argument. Recreate only its
+    // public object shape with a public error callback so the recovery message
+    // includes this tool's accepted root parameters. This also adapts v4-mini
+    // raw shapes to the SDK's normalizable v4 Classic object form.
+    return z4
+        .object(rootShape, {
+        error: (issue) => issue.code === "unrecognized_keys" ? message : undefined,
+    })
+        .strict();
+}
 // ════════════════════════════════════════════════════════════════
 // MCP Server
 // ════════════════════════════════════════════════════════════════
@@ -332,6 +404,13 @@ function buildMcpServer() {
             "gc_peer_conversation is the chat-style lane for ongoing dialogue with external A2A peers; use it instead of gc_dispatch when you want a conversation rather than a job.",
         ].join(" "),
     });
+    // Keep strict root validation registration-level so every current and future
+    // tool receives the same boundary guarantee without per-tool boilerplate.
+    const registerTool = server.registerTool.bind(server);
+    server.registerTool = ((name, config, callback) => registerTool(name, {
+        ...config,
+        inputSchema: strictRootInputSchema(config.inputSchema),
+    }, callback));
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Memory
     // ════════════════════════════════════════════════════════════════
