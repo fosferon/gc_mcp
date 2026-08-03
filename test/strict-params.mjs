@@ -245,6 +245,52 @@ try {
     tree: true,
   });
 
+  const skillExamplesResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_skill",
+        arguments: {
+          action: "update",
+          slug: "directory-testing",
+          examples: ["test a directory"],
+          counterexamples: ["deploy the production database"],
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    skillExamplesResult.isError,
+    true,
+    "gc_skill must accept curated examples and counterexamples",
+  );
+  assert.deepEqual(daemonBody, {
+    action: "update",
+    slug: "directory-testing",
+    examples: ["test a directory"],
+    counterexamples: ["deploy the production database"],
+  });
+
+  const skillBackfillResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_skill",
+        arguments: { action: "backfill_embeddings" },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    skillBackfillResult.isError,
+    true,
+    "gc_skill must expose the embedding backfill action",
+  );
+  assert.deepEqual(daemonBody, { action: "backfill_embeddings" });
+
   const nestedResult = await callToolHandler(
     {
       method: "tools/call",
@@ -260,7 +306,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 2, "valid calls reach gc_daemon");
+  assert.equal(daemonRequests, 4, "valid calls reach gc_daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },

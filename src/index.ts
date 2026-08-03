@@ -1725,6 +1725,7 @@ Key actions:
 - resolve: like suggest, but only sets resolved when one skill clearly dominates; use this when you need a safe yes/no pick.
 - list/show: inspect existing skills and their metadata.
 - create/update/deprecate: maintain the skill registry itself.
+- backfill_embeddings: compute vectors for skills that are missing them.
 
 Matching behavior:
 - task text is scored against aliases, skill name, slug, and intent tags
@@ -1740,6 +1741,7 @@ Matching behavior:
           "suggest",
           "resolve",
           "deprecate",
+          "backfill_embeddings",
         ])
         .describe("Skill action to perform"),
       task: z
@@ -1808,6 +1810,18 @@ Matching behavior:
         .array(z.string())
         .optional()
         .describe("Backward-compatible alias for intent_tags."),
+      examples: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Positive natural-language task examples that should select this skill.",
+        ),
+      counterexamples: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Natural-language tasks that must not select this skill.",
+        ),
       supports_baseline: zBoolean()
         .optional()
         .describe(
