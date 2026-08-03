@@ -497,7 +497,7 @@ function buildMcpServer() {
       "gc_capability reports which features are currently lit up.",
       "gc_cost checks cost ceilings, spend, and breaker state.",
       "gc_posture tunes operator trust levels for autonomous actions.",
-      "gc_hindsight queries the deep-memory Hindsight cache.",
+      "gc_hindsight queries the deep-memory backend (Hindsight today; Foresight is expected to succeed it — the tool name is the stable contract, not the implementation).",
       "gc_conversation / gc_agent_conversation / gc_aden manage interactive chat sessions.",
       "gc_run watches and controls observable workflow/execution runs.",
       "gc_checkpoint fetches and resolves approval checkpoints.",
@@ -533,7 +533,7 @@ server.registerTool(
   "gc_recall",
   {
     description: `Search the memory bank for facts matching a query. Uses FTS5/BM25 — instant, zero cost.
-Falls back to hindsight (expensive, deep) only if no local results and hindsight is available.
+Falls back to the deep-memory backend (expensive, deep) only if no local results and that backend is available.
 Returns ranked facts with bank attribution and match scores.
 
 Superseded facts (those replaced via gc_retain supersedes) are EXCLUDED by default — you get current truth only.
@@ -556,7 +556,7 @@ Use include_superseded: true for historical audits.`,
         .enum(["never", "fallback", "always"])
         .optional()
         .describe(
-          '"never" = local only, "fallback" = use if no local results, "always" = always call hindsight too',
+          '"never" = local only, "fallback" = use if no local results, "always" = always query the deep-memory backend too',
         ),
       include_superseded: zBoolean()
         .optional()
@@ -614,7 +614,7 @@ Use recall with include_superseded: true to see historical versions.`,
         .describe("Origin: 'local' (default), 'hs-import', 'hs-echo'"),
       hindsight: zBoolean()
         .optional()
-        .describe("Also push to Hindsight for deep memory"),
+        .describe("Also push to the deep-memory backend"),
     }),
   },
   async (params) => daemonCall("/gc/retain", params),
@@ -1105,20 +1105,26 @@ Actions: provision, status, offline, connectivity.`,
 );
 
 // ════════════════════════════════════════════════════════════════
-// DAEMON TOOLS — Hindsight Deep Memory
+// DAEMON TOOLS — Deep Memory
 // ════════════════════════════════════════════════════════════════
+//
+// The tool name, the /gc/hindsight route and the `hindsight` parameters on
+// gc_recall/gc_retain are the contract and do not move. The backend behind
+// them does: Hindsight today, Foresight expected to succeed it. Descriptions
+// below name the capability rather than the implementation so they stay true
+// across that swap.
 
 server.registerTool(
   "gc_hindsight",
   {
-    description: `Direct Hindsight deep-memory proxy.
+    description: `Direct proxy to the deep-memory backend (Hindsight today; Foresight expected to succeed it).
 Actions: health, recall, reflect, retain.`,
     inputSchema: z.object({
       action: z
         .enum(["health", "recall", "reflect", "retain"])
         .describe("Action to perform"),
       query: z.string().optional().describe("Query string (for recall/reflect)"),
-      bank_id: z.string().optional().describe("Hindsight bank ID (default: default)"),
+      bank_id: z.string().optional().describe("Deep-memory bank ID (default: default)"),
       bank: z.string().optional().describe("Alias for bank_id"),
       limit: zNumber().optional().describe("Max results (for recall, default 10)"),
       content: z.string().optional().describe("Content to retain (for retain)"),
@@ -2505,7 +2511,7 @@ invest, update_investment, investments, causal_chain, project, projections, expe
       handle: z
         .string()
         .optional()
-        .describe("Vector handle (e.g. revenue:atrapos)"),
+        .describe("Vector handle (e.g. revenue:mobus)"),
       vector: z.string().optional().describe("Vector handle for linking"),
       name: z.string().optional().describe("Vector name"),
       category: z
@@ -2515,7 +2521,7 @@ invest, update_investment, investments, causal_chain, project, projections, expe
       domain: z
         .string()
         .optional()
-        .describe("Domain: mobus, atrapos, fosferon, gc, etc."),
+        .describe("Domain: mobus, fosferon, gc, etc."),
       status: z.string().optional().describe("active|dormant|emerged"),
       notes: z.string().optional().describe("Notes"),
       type: z
@@ -4373,7 +4379,13 @@ end tell`;
 // STANDALONE TOOL — GitHub Issues (gh CLI)
 // ════════════════════════════════════════════════════════════════
 
-const GH_DEFAULT_REPO = "owner/repo";
+// Read-only convenience default, supplied by the environment. Deliberately no
+// baked-in fallback: a shipped repository name aims every installation's bare
+// calls at whatever tracker the author happened to be working on.
+//
+// This default is honoured by the READ tools only. The write tools require an
+// explicit `repo` — see the note on gh_issue_create. (GC-3726)
+const GH_DEFAULT_REPO = process.env.GH_DEFAULT_REPO ?? "";
 const GH_TOKEN_PATH = resolve(homedir(), ".config", "gh-token");
 
 function getGhToken(): string {
@@ -4387,6 +4399,11 @@ function getGhToken(): string {
 
 function gh(args: string, repo?: string): string {
   const r = repo || GH_DEFAULT_REPO;
+  if (!r) {
+    throw new Error(
+      "No repository. Pass `repo` as owner/repo, or set GH_DEFAULT_REPO in the environment for read-only defaults.",
+    );
+  }
   const token = getGhToken();
   return execSync(`gh ${args} -R ${r}`, {
     encoding: "utf-8",
@@ -4398,12 +4415,12 @@ function gh(args: string, repo?: string): string {
 server.registerTool(
   "gh_issues",
   {
-    description: `List GitHub issues. Defaults to owner/repo. Filter by state, assignee, labels.`,
+    description: `List GitHub issues. Filter by state, assignee, labels. Repo falls back to $GH_DEFAULT_REPO when omitted.`,
     inputSchema: z.object({
       repo: z
         .string()
         .optional()
-        .describe("owner/repo (default: owner/repo)"),
+        .describe("owner/repo — defaults to $GH_DEFAULT_REPO when omitted"),
       state: z.string().optional().describe("open|closed|all (default: open)"),
       assignee: z.string().optional().describe("GitHub username filter"),
       labels: z.string().optional().describe("Comma-separated labels"),
@@ -4436,10 +4453,12 @@ server.registerTool(
     inputSchema: z.object({
       title: z.string().describe("Issue title"),
       body: z.string().describe("Issue body (markdown)"),
+      // Required, unlike the read tools. A write that infers its target from
+      // ambient config will eventually file into the wrong tracker, and the
+      // caller who omitted it gets no signal that it happened. (GC-3726)
       repo: z
         .string()
-        .optional()
-        .describe("owner/repo (default: owner/repo)"),
+        .describe("owner/repo — required; a write never infers its target"),
       assignee: z.string().optional().describe("GitHub username to assign"),
       labels: z.string().optional().describe("Comma-separated labels"),
     }),
@@ -4470,7 +4489,7 @@ server.registerTool(
       repo: z
         .string()
         .optional()
-        .describe("owner/repo (default: owner/repo)"),
+        .describe("owner/repo — defaults to $GH_DEFAULT_REPO when omitted"),
     }),
   },
   async (params) => {
@@ -4492,10 +4511,12 @@ server.registerTool(
     description: `Edit a GitHub issue — change assignee, labels, title, or state.`,
     inputSchema: z.object({
       number: zNumber().describe("Issue number"),
+      // Required — see gh_issue_create. This tool also closes and reopens, so
+      // an inferred target could change the state of someone else's issue.
+      // (GC-3726)
       repo: z
         .string()
-        .optional()
-        .describe("owner/repo (default: owner/repo)"),
+        .describe("owner/repo — required; a write never infers its target"),
       title: z.string().optional().describe("New title"),
       assignee: z.string().optional().describe("Set assignee"),
       add_labels: z
@@ -4557,10 +4578,10 @@ server.registerTool(
     inputSchema: z.object({
       number: zNumber().describe("Issue number"),
       body: z.string().describe("Comment body (markdown)"),
+      // Required — see gh_issue_create. (GC-3726)
       repo: z
         .string()
-        .optional()
-        .describe("owner/repo (default: owner/repo)"),
+        .describe("owner/repo — required; a write never infers its target"),
     }),
   },
   async (params) => {
