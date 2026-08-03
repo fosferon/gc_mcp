@@ -16,7 +16,7 @@ Point your MCP client at it — no clone or build required:
   "mcpServers": {
     "gc": {
       "command": "npx",
-      "args": ["-y", "gc-mcp"]
+      "args": ["-y", "@fosferon/gc-mcp"]
     }
   }
 }
@@ -25,8 +25,8 @@ Point your MCP client at it — no clone or build required:
 Or install it and use the binary directly:
 
 ```sh
-npm install -g gc-mcp
-gc-mcp                     # stdio (default)
+npm install -g @fosferon/gc-mcp
+gc-mcp                     # stdio (default) — the binary is unscoped
 GC_MCP_TRANSPORT=streamable-http gc-mcp
 ```
 
