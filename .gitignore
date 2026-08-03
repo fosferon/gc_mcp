@@ -2,6 +2,12 @@ node_modules/
 .logs/
 .DS_Store
 *.log
+*.tgz
+
+# Worktrees live here. Without this, `git add -A` records the worktree as a
+# 160000 gitlink — a submodule pointer to a commit no clone can resolve.
+# That happened once (fd34954) and was reverted in the following commit.
+.worktrees/
 
 # dist/ is intentionally NOT ignored. The bundle is committed because harnesses
 # launch `node dist/index.js` directly, with no install or build step. That
