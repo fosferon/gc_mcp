@@ -2,11 +2,40 @@
   "name": "gc-mcp",
   "version": "1.0.0",
   "description": "Universal MCP server for Grand Central — exposes gc_daemon API as MCP tools",
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "grand-central",
+    "gc-daemon",
+    "agent",
+    "ai"
+  ],
+  "homepage": "https://github.com/fosferon/gc_mcp#readme",
+  "bugs": "https://github.com/fosferon/gc_mcp/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/fosferon/gc_mcp.git"
+  },
+  "license": "UNLICENSED",
+  "author": "fosferon",
   "type": "module",
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "gc-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "src",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsc",
     "test": "npm run build && node test/tools-list-no-refs.mjs && node test/strict-params.mjs",
+    "prepublishOnly": "npm test",
     "start": "node dist/index.js",
     "start:http": "GC_MCP_TRANSPORT=streamable-http node dist/index.js",
     "start:all": "GC_MCP_TRANSPORT=all node dist/index.js",
