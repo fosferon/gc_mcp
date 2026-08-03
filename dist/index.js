@@ -2664,6 +2664,7 @@ Actions:
   - list — alias for list_executions (backward compat)
   - show (alias: get_execution) — one execution with full runtime
   - report — reliability summary, stale-running detection, recent failures
+  - overview — bounded operational state for active runs, recent failures, and attention signals
   - detail — per-step breakdown for an execution
   - context — inspect runtime context/keys for an execution
   - resume — re-run from a checkpoint
@@ -2708,6 +2709,15 @@ Response shaping:
     - return: "full" — includes 'runtime' JSON for every row (can be large)
     - select: "id,status" — return only the named fields per row
 
+  detail / show:
+    - return: "lean" — compact status, current step, last error, and liveness without runtime, trace, or results
+
+  overview:
+    - Default: active runs plus failures from the last 24 hours
+    - window_hours: 1-168 (default 24), limit: 1-50 (default 20)
+    - health.active_total and health.active_truncated distinguish all active runs from the bounded active list.
+    - Designed for “How are our workflows coming along?” in one call, rather than client-side aggregation.
+
 Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         inputSchema: z.object({
             action: z
@@ -2719,6 +2729,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 "show",
                 "get_execution",
                 "report",
+                "overview",
                 "detail",
                 "context",
                 "wait",
@@ -2748,15 +2759,18 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 .describe("Filter list_executions by status (running/completed/failed/halted)"),
             limit: zNumber()
                 .optional()
-                .describe("Max rows for list_executions (default 20)"),
+                .describe("Max rows for list_executions or overview (default 20; overview max 50)"),
+            window_hours: zNumber()
+                .optional()
+                .describe("Recent failure window for overview, 1-168 hours (default 24)"),
             select: z
                 .string()
                 .optional()
                 .describe('Cherry-pick fields/steps. run: step IDs ("step_a,step_b"). list_workflows: workflow names (returns full body). list_executions: execution field names. Takes priority over return.'),
             return: z
-                .enum(["result", "full", "steps", "trace", "summary"])
+                .enum(["result", "full", "steps", "trace", "summary", "lean"])
                 .optional()
-                .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full".'),
+                .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full". detail + show: "lean" for compact execution state.'),
             id: z
                 .string()
                 .optional()
