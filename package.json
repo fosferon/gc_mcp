@@ -6,7 +6,7 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node test/tools-list-no-refs.mjs",
+    "test": "npm run build && node test/tools-list-no-refs.mjs && node test/strict-params.mjs",
     "start": "node dist/index.js",
     "start:http": "GC_MCP_TRANSPORT=streamable-http node dist/index.js",
     "start:all": "GC_MCP_TRANSPORT=all node dist/index.js",
