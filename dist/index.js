@@ -98,6 +98,41 @@ function clean(params) {
     }
     return out;
 }
+// ════════════════════════════════════════════════════════════════
+// Response truncation
+// ════════════════════════════════════════════════════════════════
+//
+// Several daemon tools (gc_ticker, gc_convergence report, gc_work list) can
+// return responses that exceed what the host context window can hold. When an
+// agent fires multiple such tools in parallel the combined result easily
+// breaks the harness (tool_results_required). Cap each tool response at a
+// safe ceiling and append a clear truncation notice so the agent knows what
+// happened and can request a narrower query.
+const MAX_RESPONSE_CHARS = 16_000;
+/**
+ * Truncate a tool-result string when it exceeds `maxChars`.
+ *
+ * Returns the original string unchanged when within budget. When truncation
+ * fires: cuts at the last newline before the limit (so JSON keys/values are
+ * not split mid-token), then appends a diagnostic block with the original
+ * size, the amount retained, and a hint to narrow the query.
+ */
+function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS) {
+    if (body.length <= maxChars)
+        return body;
+    // Reserve room for the truncation notice itself (~300 chars).
+    const cutBudget = maxChars - 350;
+    let cutPoint = body.lastIndexOf("\n", cutBudget);
+    if (cutPoint < cutBudget * 0.5)
+        cutPoint = cutBudget; // no good newline; hard cut
+    const kept = body.slice(0, cutPoint);
+    const droppedChars = body.length - cutPoint;
+    const pct = Math.round((cutPoint / body.length) * 100);
+    return (kept +
+        `\n\n[TRUNCATED — showing ${pct}% (${cutPoint.toLocaleString()} of ${body.length.toLocaleString()} chars). ` +
+        `${droppedChars.toLocaleString()} chars omitted. ` +
+        `Use narrower filters, a smaller limit, or a more specific action to get full results.]`);
+}
 /** Standard MCP text result */
 function text(t) {
     return { content: [{ type: "text", text: t }] };
@@ -260,11 +295,18 @@ function inlineLocalRefs(schema) {
     };
     return visit(root);
 }
-/** Call daemon and return formatted JSON */
-async function daemonCall(endpoint, params, timeoutMs = 15_000) {
+/**
+ * Call daemon and return formatted JSON, truncated when the serialized
+ * response exceeds MAX_RESPONSE_CHARS.
+ *
+ * Pass `maxResponseChars: null` from individual tool handlers that need
+ * the full payload (rare — most tools benefit from the safety cap).
+ */
+async function daemonCall(endpoint, params, timeoutMs = 15_000, maxResponseChars = MAX_RESPONSE_CHARS) {
     try {
         const result = await gcPost(endpoint, clean(params), timeoutMs);
-        return text(JSON.stringify(result, null, 2));
+        const body = JSON.stringify(result, null, 2);
+        return text(maxResponseChars !== null ? truncateResponse(body, maxResponseChars) : body);
     }
     catch (e) {
         return err(`ERROR: ${e.message}`);
