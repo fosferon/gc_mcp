@@ -314,6 +314,61 @@ try {
   process.stdout.write(
     `Verified strict root MCP parameter rejection across ${registeredTools.length} tools.\n`,
   );
+
+  // ════════════════════════════════════════════════════════════
+  // Response truncation tests
+  // ════════════════════════════════════════════════════════════
+
+  // Small responses pass through unchanged.
+  const smallPayload = { ok: true, data: "small" };
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify(smallPayload), { status: 200 });
+
+  const smallResult = await callToolHandler(
+    { method: "tools/call", params: { name: "gc_recall", arguments: { query: "x" } } },
+    {},
+  );
+  const smallText = smallResult.content?.[0]?.text || "";
+  assert.ok(!smallText.includes("[TRUNCATED"), "small response must not be truncated");
+  assert.deepEqual(
+    JSON.parse(smallText),
+    smallPayload,
+    "small response must be verbatim JSON",
+  );
+
+  // Large responses get truncated with a diagnostic marker.
+  const bigData = "x".repeat(20_000);
+  const bigPayload = { ok: true, data: bigData };
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify(bigPayload), { status: 200 });
+
+  const bigResult = await callToolHandler(
+    { method: "tools/call", params: { name: "gc_recall", arguments: { query: "y" } } },
+    {},
+  );
+  const bigText = bigResult.content?.[0]?.text || "";
+  assert.ok(bigText.includes("[TRUNCATED"), "large response must carry truncation marker");
+  assert.ok(
+    bigText.length < 20_000,
+    `truncated response must be under 20k chars (got ${bigText.length})`,
+  );
+  assert.ok(
+    bigText.includes("narrower filters"),
+    "truncation marker must include remediation hint",
+  );
+  assert.ok(
+    bigText.includes("chars omitted"),
+    "truncation marker must report omitted size",
+  );
+
+  // Restore the simple mock for any future additions.
+  globalThis.fetch = async (_url, init) => {
+    daemonRequests += 1;
+    daemonBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  process.stdout.write("Verified response truncation for oversized daemon payloads.\n");
 } finally {
   McpServer.prototype.connect = originalConnect;
   McpServer.prototype.registerTool = originalRegisterTool;
