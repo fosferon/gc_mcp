@@ -273,7 +273,7 @@ try {
         ok: true,
         notifications: [],
         next_checkpoint: "2026-08-14T19:00:00Z",
-        next_cursor_id: "notification-2",
+        next_cursor_id: "cursor-2",
       }),
       { status: 200 },
     );
@@ -289,7 +289,7 @@ try {
           status: "all",
           source: "workflow.lifecycle",
           since: "2026-08-14T18:59:00Z",
-          cursor_id: "notification-1",
+          cursor_id: "cursor-1",
           limit: 25,
         },
       },
@@ -303,13 +303,13 @@ try {
     status: "all",
     source: "workflow.lifecycle",
     since: "2026-08-14T18:59:00Z",
-    cursor_id: "notification-1",
+    cursor_id: "cursor-1",
     limit: 25,
   });
 
   const notifyResponse = JSON.parse(notifyCursorResult.content?.[0]?.text || "{}");
   assert.equal(notifyResponse.next_checkpoint, "2026-08-14T19:00:00Z");
-  assert.equal(notifyResponse.next_cursor_id, "notification-2");
+  assert.equal(notifyResponse.next_cursor_id, "cursor-2");
 
   globalThis.fetch = async (_url, init) => {
     daemonRequests += 1;

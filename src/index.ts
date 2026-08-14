@@ -3789,7 +3789,7 @@ Actions: "push" = append a mailbox event, "drain" = fetch unread items and mark 
 
 Recommended integration pattern:
   - Persist a per-consumer checkpoint
-  - Poll gc_notify with action: "list", source: <event-source>, status: "all", since: <checkpoint>, cursor_id: <last-id>
+  - Poll gc_notify with action: "list", source: <event-source>, status: "all", since: <checkpoint>, cursor_id: <opaque-cursor>
   - Handle returned events
   - Advance the checkpoint to the newest handled created_at
 
@@ -3823,7 +3823,7 @@ Use list rather than drain for multi-harness bridges: drain marks matching event
       cursor_id: z
         .string()
         .optional()
-        .describe("Optional tie-breaker notification ID paired with since for lossless pagination."),
+        .describe("Optional opaque cursor returned by the daemon and paired with since for lossless pagination."),
     }),
   },
   async (params) => daemonCall("/gc/notify", params),
