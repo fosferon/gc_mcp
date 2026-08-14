@@ -3789,14 +3789,17 @@ Actions: "push" = append a mailbox event, "drain" = fetch unread items and mark 
 
 Recommended integration pattern:
   - Persist a per-consumer checkpoint
-  - Poll gc_notify with action: "drain", since: <checkpoint>
+  - Poll gc_notify with action: "list", source: <event-source>, status: "all", since: <checkpoint>, cursor_id: <last-id>
   - Handle returned events
   - Advance the checkpoint to the newest handled created_at
 
-Daemon guarantees durable mailbox creation plus unread/read semantics. Harnesses decide how to surface drained events.`,
+Use list rather than drain for multi-harness bridges: drain marks matching events read globally. Daemon guarantees durable mailbox creation plus unread/read semantics. Harnesses decide how to surface events.`,
     inputSchema: z.object({
       action: z.enum(["push", "drain", "list"]).describe("Action to perform"),
-      source: z.string().optional().describe("Notification source (for push)"),
+      source: z
+        .string()
+        .optional()
+        .describe("Notification source (required for push; optional exact filter for drain/list)"),
       content: z
         .string()
         .optional()
@@ -3807,13 +3810,20 @@ Daemon guarantees durable mailbox creation plus unread/read semantics. Harnesses
       limit: zNumber()
         .optional()
         .describe("Max rows to drain/list (default 10 for drain, 50 for list)"),
-      status: z.string().optional().describe("For list: unread, read, all"),
+      status: z
+        .enum(["unread", "read", "all"])
+        .optional()
+        .describe("For list: unread, read, all"),
       since: z
         .string()
         .optional()
         .describe(
           "Optional ISO timestamp checkpoint. For drain/list, only return notifications newer than this.",
         ),
+      cursor_id: z
+        .string()
+        .optional()
+        .describe("Optional tie-breaker notification ID paired with since for lossless pagination."),
     }),
   },
   async (params) => daemonCall("/gc/notify", params),
