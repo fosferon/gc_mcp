@@ -245,6 +245,78 @@ try {
     tree: true,
   });
 
+  const requestsBeforeInvalidNotify = daemonRequests;
+  const invalidNotifyStatus = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_notify",
+        arguments: { action: "list", status: "invalid" },
+      },
+    },
+    {},
+  );
+
+  assert.equal(invalidNotifyStatus.isError, true, "gc_notify must reject an invalid status");
+  assert.equal(
+    daemonRequests,
+    requestsBeforeInvalidNotify,
+    "an invalid gc_notify status must fail before daemon transport",
+  );
+
+  globalThis.fetch = async (_url, init) => {
+    daemonRequests += 1;
+    daemonBody = JSON.parse(init.body);
+
+    return new Response(
+      JSON.stringify({
+        ok: true,
+        notifications: [],
+        next_checkpoint: "2026-08-14T19:00:00Z",
+        next_cursor_id: "notification-2",
+      }),
+      { status: 200 },
+    );
+  };
+
+  const notifyCursorResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_notify",
+        arguments: {
+          action: "list",
+          status: "all",
+          source: "workflow.lifecycle",
+          since: "2026-08-14T18:59:00Z",
+          cursor_id: "notification-1",
+          limit: 25,
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(notifyCursorResult.isError, true, "valid gc_notify cursor polling must pass");
+  assert.deepEqual(daemonBody, {
+    action: "list",
+    status: "all",
+    source: "workflow.lifecycle",
+    since: "2026-08-14T18:59:00Z",
+    cursor_id: "notification-1",
+    limit: 25,
+  });
+
+  const notifyResponse = JSON.parse(notifyCursorResult.content?.[0]?.text || "{}");
+  assert.equal(notifyResponse.next_checkpoint, "2026-08-14T19:00:00Z");
+  assert.equal(notifyResponse.next_cursor_id, "notification-2");
+
+  globalThis.fetch = async (_url, init) => {
+    daemonRequests += 1;
+    daemonBody = JSON.parse(init.body);
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
   const skillExamplesResult = await callToolHandler(
     {
       method: "tools/call",
@@ -306,7 +378,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 4, "valid calls reach gc_daemon");
+  assert.equal(daemonRequests, 5, "valid calls reach gc_daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },
