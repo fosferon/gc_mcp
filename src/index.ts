@@ -1903,17 +1903,42 @@ Matching behavior:
 server.registerTool(
   "gc_work",
   {
-    description: `Work coordination with dependency DAG.
-Actions: create, list, search, ready, show, update, done, cancel, block, unblock, claim, release, comment, plan, tree, stale, focus, backfill_projects, rebuild_search_index.
-Use action=search to check if an issue about a topic already exists (FTS, ranked, matches title+description regardless of project_id tagging) instead of listing the whole DAG. Issues have dependencies (DAG), assignments, locks, labels. Use 'ready' to see what's unblocked. 'plan' for critical path.`,
+    description: `Bee work coordination: scoped issue queries, dependency-DAG analysis, reusable intents, measurements, projects, agents, assignments, and locks.
+
+Choose the narrow action that answers the question; do not read bee.db directly and do not fetch the whole backlog to filter it yourself.
+- Latest work in one project: query {project, status:"all", order:"updated_at:desc", limit}.
+- A track/topic across projects, newest first: query {text, projects:[...], status:"all", order:"updated_at:desc", detail:"minimal"}.
+- Duplicate/topic lookup ranked by relevance with snippets: search {q, project?, status?}.
+- Unblocked work: ready with project/assigned/labels/limit, or ask {intent:"what_next", agent?, project?, limit?}.
+- Blocking chain: critical_path {root? or project?, status?, dependency_types?, depth?}. Recursive neighborhood: traverse {id, direction, depth, dependency_types}.
+- Discover reusable capabilities before inventing policy: list_intents and list_measures.
+
+Read actions: query, count, list, search, ready, show, ask, list_intents, list_measures, projects, agents, critical_path, traverse, candidates, tree, rollup, who_blocks_whom, bottlenecks, agent_load, stale, focus.
+Write actions: create, update, done, cancel, comment, block, unblock, claim, release, register_intent, remove_intent, register_measure, measure, register_project, register_agent, assign, join_project, import_jsonl, backfill_projects.
+plan is a deprecated compatibility alias for critical_path; it is not the gc_plan scheduler.`,
     inputSchema: z.object({
       action: z
         .enum([
           "create",
+          "query",
+          "count",
           "list",
           "search",
           "ready",
           "show",
+          "ask",
+          "list_intents",
+          "register_intent",
+          "remove_intent",
+          "list_measures",
+          "register_measure",
+          "measure",
+          "projects",
+          "agents",
+          "register_project",
+          "register_agent",
+          "assign",
+          "join_project",
           "update",
           "done",
           "cancel",
@@ -1922,14 +1947,21 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
           "claim",
           "release",
           "comment",
+          "critical_path",
           "plan",
+          "traverse",
+          "candidates",
           "tree",
+          "rollup",
+          "who_blocks_whom",
+          "bottlenecks",
+          "agent_load",
           "stale",
           "focus",
+          "import_jsonl",
           "backfill_projects",
-          "rebuild_search_index",
         ])
-        .describe("Action to perform"),
+        .describe("Bee operation; see the tool description for task-to-action recipes."),
       title: z.string().optional().describe("Issue title"),
       description: z.string().optional().describe("Issue description"),
       priority: zNumber()
@@ -1940,12 +1972,32 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
         .optional()
         .describe("Issue type: task, bug, epic, objective"),
       project: z.string().optional().describe("Project name"),
+      projects: z
+        .array(z.string())
+        .optional()
+        .describe("For query/count/register_intent: match any of these project IDs."),
       parent: z.string().optional().describe("Parent issue ID (for sub-tasks)"),
       labels: z.array(z.string()).optional().describe("Labels"),
       id: z.string().optional().describe("Issue ID (number or full ID)"),
       depends_on: z.string().optional().describe("Issue ID this depends on"),
       agent: z.string().optional().describe("Agent name for claim/assign"),
+      assigned_to: z
+        .string()
+        .optional()
+        .describe("Explicit assignment filter/value; assigned remains a compatibility alias."),
+      actor: z.string().optional().describe("Actor recorded on create/comment operations."),
+      metadata: z
+        .record(z.any())
+        .optional()
+        .describe(
+          "Issue metadata for create/update. Artifact references use metadata.artifacts = [{path, role, ...}]; update replaces the metadata map, so preserve existing keys from show.",
+        ),
       note: z.string().optional().describe("Comment text or close reason"),
+      close_reason: z.string().optional().describe("Explicit close reason for update."),
+      text: z
+        .string()
+        .optional()
+        .describe("Plain-text filter for query/count/register_intent; q is also accepted."),
       q: z
         .string()
         .optional()
@@ -1959,6 +2011,87 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
           "Filter by status: open, in_progress, closed, all. list defaults to open; search defaults to all statuses.",
         ),
       assigned: z.string().optional().describe("Filter by assigned agent"),
+      ready: zBoolean()
+        .optional()
+        .describe("For query/count/register_intent: retain only dependency-ready issues."),
+      detail: z
+        .enum(["minimal", "compact", "standard", "full"])
+        .optional()
+        .describe(
+          "Projection for query/list/search/ready/show/tree/critical_path. minimal = id/title/status/priority/labels/blocked_by; compact omits description; full returns the complete issue. Defaults to compact except show, which defaults to full for compatibility.",
+        ),
+      intent: z
+        .string()
+        .optional()
+        .describe("For ask: core intent what_next or a registered intent name."),
+      name: z.string().optional().describe("Intent or measurement name."),
+      unit: z.string().optional().describe("Unit for register_measure."),
+      domain: z
+        .enum(["any", "non_negative"])
+        .optional()
+        .describe("Measurement value domain; defaults to any."),
+      measure: z.string().optional().describe("Registered measurement name."),
+      measurement: z
+        .record(z.any())
+        .optional()
+        .describe("Measurement payload attached during update."),
+      value: zNumber().optional().describe("Numeric value for action=measure."),
+      dims: z.record(z.any()).optional().describe("Dimensions for action=measure."),
+      source: z.string().optional().describe("Source attribution for action=measure."),
+      root: z
+        .string()
+        .optional()
+        .describe("Goal/root issue for a rooted critical path (path is blocker to goal)."),
+      direction: z
+        .enum(["blockers", "dependents"])
+        .optional()
+        .describe("Traversal direction; defaults to blockers."),
+      depth: zNumber()
+        .optional()
+        .describe("Maximum graph depth (traverse defaults 3, max 10; critical_path max 100)."),
+      dependency_type: z
+        .enum([
+          "blocks",
+          "waits_for",
+          "conditional_blocks",
+          "related",
+          "discovered_from",
+          "replies_to",
+        ])
+        .optional()
+        .describe("Dependency type for block/unblock; defaults to blocks."),
+      dependency_types: z
+        .array(
+          z.enum([
+            "blocks",
+            "waits_for",
+            "conditional_blocks",
+            "related",
+            "discovered_from",
+            "replies_to",
+          ]),
+        )
+        .optional()
+        .describe("Dependency types followed by traverse/critical_path."),
+      scope: z
+        .enum(["tree", "closure", "critical_path"])
+        .optional()
+        .describe("Graph scope for rollup."),
+      kind: z
+        .enum(["estimate", "actual"])
+        .optional()
+        .describe("Measurement aggregation kind for rollup."),
+      meaning: z
+        .enum(["spent", "to_complete"])
+        .optional()
+        .describe("Semantic interpretation for rollup."),
+      attributes: z
+        .record(z.any())
+        .optional()
+        .describe("Project/agent attributes for registration."),
+      path: z.string().optional().describe("JSONL file path for import_jsonl."),
+      ttl: zNumber().optional().describe("Claim lock TTL in minutes."),
+      force: zBoolean().optional().describe("Force claim when supported."),
       days: zNumber()
         .optional()
         .describe(
@@ -1978,18 +2111,18 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
       limit: zNumber()
         .optional()
         .describe(
-          "Max results. list: default 50, cap 500 (newest-first; also returns `total` = full pre-limit count). search: default 10, cap 50. ready: opt-in, no default. stale/focus/backfill_projects: max rows or sample size.",
+          "Max results. query is bounded by the requested limit; list defaults to 50/caps at 500; search defaults to 10/caps at 50; ready/stale/focus/ask use it as their result or sample bound.",
         ),
       offset: zNumber()
         .optional()
         .describe(
-          "For action=list: zero-based page offset (default 0). In tree mode this offsets root issues, not individual descendants.",
+          "Zero-based query/list page offset. In list tree mode this offsets roots, not descendants.",
         ),
       order: z
         .string()
         .optional()
         .describe(
-          "For action=list: comma-separated sort terms using created_at, updated_at, priority, or id, each optionally :asc or :desc (for example `priority:desc,created_at:asc`). Invalid terms use the daemon default.",
+          "For query/list/register_intent: comma-separated created_at, updated_at, priority, or id terms with optional :asc/:desc. Example: updated_at:desc.",
         ),
       mode: z
         .enum(["flat", "tree"])
@@ -2004,7 +2137,7 @@ Use action=search to check if an issue about a topic already exists (FTS, ranked
         .array(z.enum(["comments"]))
         .optional()
         .describe(
-          "For action=show: request optional relations. Pass [\"comments\"] to load issue comments in ascending created_at order; omitted relations return as :not_loaded.",
+          "For query/list/search/ready/show/tree: load comments in ascending created_at order.",
         ),
     }),
   },
