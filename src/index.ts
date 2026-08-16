@@ -2109,6 +2109,8 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
           "For action=backfill_projects: fallback project id for GC-* issues (default gc_daemon)",
         ),
       limit: zNumber()
+        .int()
+        .positive()
         .optional()
         .describe(
           "Max results. query defaults to 50 and caps at 500; list defaults to 50/caps at 500; search defaults to 10/caps at 50; ready/stale/focus/ask use it as their result or sample bound.",
