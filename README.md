@@ -56,7 +56,7 @@ bounded server-side query over fetching a backlog and filtering it in the client
   "projects": ["REDACTED_umbrella", "REDACTED"],
   "status": "all",
   "order": "updated_at:desc",
-  "detail": "minimal",
+  "detail": "compact",
   "limit": 10
 }
 ```
