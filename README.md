@@ -44,6 +44,33 @@ silently ignoring it.
 This boundary does not alter nested payload contracts: a declared map or object
 parameter continues to accept the nested values its existing schema allows.
 
+## Bee work queries
+
+`gc_work` exposes Bee's query and dependency-analysis engine directly. Prefer a
+bounded server-side query over fetching a backlog and filtering it in the client:
+
+```json
+{
+  "action": "query",
+  "text": "FameLine",
+  "projects": ["mobus_umbrella", "lt_umbrella"],
+  "status": "all",
+  "order": "updated_at:desc",
+  "detail": "minimal",
+  "limit": 10
+}
+```
+
+Use `search` for relevance-ranked duplicate lookup, `ready` or the `what_next`
+intent for actionable work, `traverse` for a bounded dependency neighborhood,
+and `critical_path` for a blocker-to-goal or project-scoped path. The legacy
+`plan` action is only a compatibility alias for `critical_path`; scheduling is
+provided separately by `gc_plan`.
+
+The tool also exposes discoverable registered intents and measures, project and
+agent allocation, assignments, locks, measurements, rollups, and bottleneck
+analysis. Call the relevant list action before guessing stored vocabulary.
+
 ## Configuration
 
 | Variable | Default | Purpose |

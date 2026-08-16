@@ -245,6 +245,67 @@ try {
     tree: true,
   });
 
+  const workPowerResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_work",
+        arguments: {
+          action: "critical_path",
+          root: "GC-42",
+          project: "gc_daemon",
+          dependency_types: ["blocks", "waits_for"],
+          depth: 12,
+          detail: "minimal",
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    workPowerResult.isError,
+    true,
+    "gc_work must expose scoped Bee graph analysis parameters",
+  );
+  assert.equal(daemonRequests, 2, "valid graph analysis reaches gc_daemon");
+  assert.deepEqual(daemonBody, {
+    action: "critical_path",
+    root: "GC-42",
+    project: "gc_daemon",
+    dependency_types: ["blocks", "waits_for"],
+    depth: 12,
+    detail: "minimal",
+  });
+
+  const workQueryResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_work",
+        arguments: {
+          action: "query",
+          text: "FameLine",
+          projects: ["mobus_umbrella", "lt_umbrella"],
+          status: "all",
+          ready: true,
+          assigned_to: "pluto",
+          order: "updated_at:desc",
+          detail: "compact",
+          limit: 5,
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    workQueryResult.isError,
+    true,
+    "gc_work must expose composable multi-project Bee queries",
+  );
+  assert.equal(daemonRequests, 3, "valid composable query reaches gc_daemon");
+
   const requestsBeforeInvalidNotify = daemonRequests;
   const invalidNotifyStatus = await callToolHandler(
     {
@@ -378,7 +439,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 5, "valid calls reach gc_daemon");
+  assert.equal(daemonRequests, 7, "valid calls reach gc_daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },
