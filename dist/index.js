@@ -19,7 +19,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as z4 from "zod/v4";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
@@ -423,7 +423,8 @@ function strictRootInputSchema(inputSchema) {
 // MCP Server
 // ════════════════════════════════════════════════════════════════
 function buildMcpServer() {
-    const server = new McpServer({ name: "gc", version: "1.0.0" }, {
+    const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
+    const server = new McpServer({ name: "gc", version: packageVersion }, {
         instructions: [
             "Grand Central operations hub. All tools route to gc_daemon (localhost:4242).",
             "Use gc_recall for memory search (FTS5, instant). gc_retain to store facts.",
@@ -3939,7 +3940,7 @@ end tell`;
             throw new Error("No repository. Pass `repo` as owner/repo, or set GH_DEFAULT_REPO in the environment for read-only defaults.");
         }
         const token = getGhToken();
-        return execSync(`gh ${args} -R ${r}`, {
+        return execFileSync("gh", [...args, "-R", r], {
             encoding: "utf-8",
             timeout: 15000,
             env: { ...process.env, GH_TOKEN: token },
@@ -3958,17 +3959,16 @@ end tell`;
             limit: zNumber().optional().describe("Max results (default: 30)"),
         }),
     }, async (params) => {
-        const parts = ["issue list"];
-        parts.push(`--state ${params.state || "open"}`);
-        parts.push(`--limit ${params.limit || 30}`);
+        const parts = ["issue", "list", "--state", params.state || "open"];
+        parts.push("--limit", String(params.limit || 30));
         if (params.assignee)
-            parts.push(`--assignee ${params.assignee}`);
+            parts.push("--assignee", params.assignee);
         if (params.labels)
-            parts.push(`--label "${params.labels}"`);
-        parts.push("--json number,title,state,assignees,labels,createdAt");
-        parts.push(`--jq '.[] | "#\\(.number) [\\(.assignees | map(.login) | join(","))] \\(.title) (\\(.labels | map(.name) | join(",")))"'`);
+            parts.push("--label", params.labels);
+        parts.push("--json", "number,title,state,assignees,labels,createdAt");
+        parts.push("--jq", '.[] | "#\\(.number) [\\(.assignees | map(.login) | join(\",\"))] \\(.title) (\\(.labels | map(.name) | join(\",\")))"');
         try {
-            const result = gh(parts.join(" "), params.repo);
+            const result = gh(parts, params.repo);
             return text(result || "No issues found.");
         }
         catch (e) {
@@ -3990,15 +3990,13 @@ end tell`;
             labels: z.string().optional().describe("Comma-separated labels"),
         }),
     }, async (params) => {
-        const parts = ["issue create"];
-        parts.push(`--title "${params.title.replace(/"/g, '\\"')}"`);
-        parts.push(`--body "${params.body.replace(/"/g, '\\"').replace(/\n/g, "\\n")}"`);
+        const parts = ["issue", "create", "--title", params.title, "--body", params.body];
         if (params.assignee)
-            parts.push(`--assignee ${params.assignee}`);
+            parts.push("--assignee", params.assignee);
         if (params.labels)
-            parts.push(`--label "${params.labels}"`);
+            parts.push("--label", params.labels);
         try {
-            const result = gh(parts.join(" "), params.repo);
+            const result = gh(parts, params.repo);
             return text(result);
         }
         catch (e) {
@@ -4016,7 +4014,15 @@ end tell`;
         }),
     }, async (params) => {
         try {
-            const result = gh(`issue view ${params.number} --json number,title,state,body,assignees,labels,comments --jq '"#\\(.number) [\\(.state)] \\(.title)\\nAssigned: \\(.assignees | map(.login) | join(", "))\\nLabels: \\(.labels | map(.name) | join(", "))\\n\\n\\(.body)\\n\\n--- Comments (\\(.comments | length)) ---\\n\\(.comments | map("\\(.author.login): \\(.body)") | join("\\n\\n"))"'`, params.repo);
+            const result = gh([
+                "issue",
+                "view",
+                String(params.number),
+                "--json",
+                "number,title,state,body,assignees,labels,comments",
+                "--jq",
+                '"#\\(.number) [\\(.state)] \\(.title)\\nAssigned: \\(.assignees | map(.login) | join(\", \"))\\nLabels: \\(.labels | map(.name) | join(\", \"))\\n\\n\\(.body)\\n\\n--- Comments (\\(.comments | length)) ---\\n\\(.comments | map("\\(.author.login): \\(.body)") | join("\\n\\n"))"',
+            ], params.repo);
             return text(result);
         }
         catch (e) {
@@ -4050,33 +4056,33 @@ end tell`;
         if (params.state) {
             try {
                 const cmd = params.state === "closed" ? "close" : "reopen";
-                results.push(gh(`issue ${cmd} ${params.number}`, params.repo));
+                results.push(gh(["issue", cmd, String(params.number)], params.repo));
             }
             catch (e) {
                 results.push(`State change error: ${e.message}`);
             }
         }
-        const editParts = [`issue edit ${params.number}`];
+        const editParts = ["issue", "edit", String(params.number)];
         let hasEdit = false;
         if (params.title) {
-            editParts.push(`--title "${params.title.replace(/"/g, '\\"')}"`);
+            editParts.push("--title", params.title);
             hasEdit = true;
         }
         if (params.assignee !== undefined) {
-            editParts.push(`--add-assignee ${params.assignee}`);
+            editParts.push("--add-assignee", params.assignee);
             hasEdit = true;
         }
         if (params.add_labels) {
-            editParts.push(`--add-label "${params.add_labels}"`);
+            editParts.push("--add-label", params.add_labels);
             hasEdit = true;
         }
         if (params.remove_labels) {
-            editParts.push(`--remove-label "${params.remove_labels}"`);
+            editParts.push("--remove-label", params.remove_labels);
             hasEdit = true;
         }
         if (hasEdit) {
             try {
-                results.push(gh(editParts.join(" "), params.repo));
+                results.push(gh(editParts, params.repo));
             }
             catch (e) {
                 results.push(`Edit error: ${e.message}`);
@@ -4095,21 +4101,12 @@ end tell`;
                 .describe("owner/repo — required; a write never infers its target"),
         }),
     }, async (params) => {
-        const { writeFileSync, unlinkSync } = await import("node:fs");
-        const tmpFile = `/tmp/gh-comment-${Date.now()}.md`;
         try {
-            writeFileSync(tmpFile, params.body);
-            const result = gh(`issue comment ${params.number} -F ${tmpFile}`, params.repo);
+            const result = gh(["issue", "comment", String(params.number), "--body", params.body], params.repo);
             return text(result || `Commented on #${params.number}.`);
         }
         catch (e) {
             return err(`Error: ${e.message}`);
-        }
-        finally {
-            try {
-                unlinkSync(tmpFile);
-            }
-            catch { }
         }
     });
     const rawListToolsHandler = server.server._requestHandlers.get("tools/list");

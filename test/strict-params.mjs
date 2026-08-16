@@ -1,4 +1,14 @@
 import assert from "node:assert/strict";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { delimiter, join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -19,6 +29,25 @@ const originalConnect = McpServer.prototype.connect;
 const originalRegisterTool = McpServer.prototype.registerTool;
 const originalSetRequestHandler = Server.prototype.setRequestHandler;
 const originalFetch = globalThis.fetch;
+const originalPath = process.env.PATH;
+const originalGhToken = process.env.GH_TOKEN;
+const originalGhCaptureFile = process.env.GH_CAPTURE_FILE;
+const ghFixtureDir = mkdtempSync(join(tmpdir(), "gc-mcp-gh-test-"));
+const ghCaptureFile = join(ghFixtureDir, "args.jsonl");
+const injectionSentinel = join(ghFixtureDir, "shell-expanded");
+const fakeGh = join(ghFixtureDir, "gh");
+
+writeFileSync(
+  fakeGh,
+  "#!/usr/bin/env node\n" +
+    "const fs = require('node:fs');\n" +
+    "fs.appendFileSync(process.env.GH_CAPTURE_FILE, JSON.stringify(process.argv.slice(2)) + '\\n');\n" +
+    "process.stdout.write('ok');\n",
+);
+chmodSync(fakeGh, 0o755);
+process.env.PATH = `${ghFixtureDir}${delimiter}${originalPath || ""}`;
+process.env.GH_TOKEN = "test-token";
+process.env.GH_CAPTURE_FILE = ghCaptureFile;
 
 try {
   McpServer.prototype.connect = async function () {
@@ -199,6 +228,45 @@ try {
     0,
     "no registered tool may fetch when its root arguments are invalid",
   );
+
+  const hostileTitle = `title $(touch ${injectionSentinel})`;
+  const hostileBody = `body \`touch ${injectionSentinel}\`\nnext`;
+  const hostileAssignee = `alice; touch ${injectionSentinel}`;
+  const hostileLabels = `bug,$(touch ${injectionSentinel})`;
+  const hostileRepo = `owner/repo; touch ${injectionSentinel}`;
+  const ghCreateResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gh_issue_create",
+        arguments: {
+          title: hostileTitle,
+          body: hostileBody,
+          repo: hostileRepo,
+          assignee: hostileAssignee,
+          labels: hostileLabels,
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(ghCreateResult.isError, true, "hostile text remains valid issue data");
+  assert.equal(existsSync(injectionSentinel), false, "GitHub arguments must never reach a shell");
+  assert.deepEqual(JSON.parse(readFileSync(ghCaptureFile, "utf-8").trim()), [
+    "issue",
+    "create",
+    "--title",
+    hostileTitle,
+    "--body",
+    hostileBody,
+    "--assignee",
+    hostileAssignee,
+    "--label",
+    hostileLabels,
+    "-R",
+    hostileRepo,
+  ]);
 
   for (const [name, _inputSchema, arguments_] of compatibilityTools) {
     const validResult = await callToolHandler(
@@ -507,4 +575,8 @@ try {
   McpServer.prototype.registerTool = originalRegisterTool;
   Server.prototype.setRequestHandler = originalSetRequestHandler;
   globalThis.fetch = originalFetch;
+  process.env.PATH = originalPath;
+  process.env.GH_TOKEN = originalGhToken;
+  process.env.GH_CAPTURE_FILE = originalGhCaptureFile;
+  rmSync(ghFixtureDir, { recursive: true, force: true });
 }
