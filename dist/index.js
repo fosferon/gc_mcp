@@ -1539,8 +1539,8 @@ Matching behavior:
         description: `Bee work coordination: scoped issue queries, dependency-DAG analysis, reusable intents, measurements, projects, agents, assignments, and locks.
 
 Choose the narrow action that answers the question; do not read bee.db directly and do not fetch the whole backlog to filter it yourself.
-- Latest work in one project: query {project, status:"all", order:"updated_at:desc", limit}.
-- A track/topic across projects, newest first: query {text, projects:[...], status:"all", order:"updated_at:desc", detail:"minimal"}.
+- Latest issue activity in one project: query {project, status:"all", order:"updated_at:desc", limit}; updated_at includes coordination/bookkeeping mutations.
+- A track/topic across projects, newest first: query {text, projects:[...], status:"all", order:"updated_at:desc", detail:"compact"}; compact retains project and timestamps without descriptions.
 - Duplicate/topic lookup ranked by relevance with snippets: search {q, project?, status?}.
 - Unblocked work: ready with project/assigned/labels/limit, or ask {intent:"what_next", agent?, project?, limit?}.
 - Blocking chain: critical_path {root? or project?, status?, dependency_types?, depth?}. Recursive neighborhood: traverse {id, direction, depth, dependency_types}.
@@ -1628,7 +1628,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             text: z
                 .string()
                 .optional()
-                .describe("Plain-text filter for query/count/register_intent; q is also accepted."),
+                .describe("Title + description filter for query/count/register_intent. All non-punctuation tokens must match; q is also accepted."),
             q: z
                 .string()
                 .optional()
@@ -1644,7 +1644,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             detail: z
                 .enum(["minimal", "compact", "standard", "full"])
                 .optional()
-                .describe("Projection for query/list/search/ready/show/tree/critical_path. minimal = id/title/status/priority/labels/blocked_by; compact omits description; full returns the complete issue. Defaults to compact except show, which defaults to full for compatibility."),
+                .describe("Projection for query/list/search/ready/show/tree/critical_path/traverse. minimal = exactly id/title/status/priority/labels/blocked_by and omits project/timestamps; compact adds coordination fields and timestamps but omits description; full returns the complete issue. Defaults to compact except show, which defaults to full for compatibility."),
             intent: z
                 .string()
                 .optional()
@@ -1727,7 +1727,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
                 .describe("For action=backfill_projects: fallback project id for GC-* issues (default gc_daemon)"),
             limit: zNumber()
                 .optional()
-                .describe("Max results. query is bounded by the requested limit; list defaults to 50/caps at 500; search defaults to 10/caps at 50; ready/stale/focus/ask use it as their result or sample bound."),
+                .describe("Max results. query defaults to 50 and caps at 500; list defaults to 50/caps at 500; search defaults to 10/caps at 50; ready/stale/focus/ask use it as their result or sample bound."),
             offset: zNumber()
                 .optional()
                 .describe("Zero-based query/list page offset. In list tree mode this offsets roots, not descendants."),
