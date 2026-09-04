@@ -2556,8 +2556,7 @@ Actions: spawn, turn, get, list, destroy.`,
             type: z.string().optional().describe("Type filter"),
             project: z.string().optional().describe("Project name filter"),
             title: z.string().optional().describe("Title substring (LIKE search)"),
-            limit: z
-                .number()
+            limit: zNumber()
                 .optional()
                 .describe("Max results (default 25)"),
         }),
@@ -3557,8 +3556,7 @@ are still accepted via the section parameter for backward compatibility.`,
                 .array(z.string())
                 .optional()
                 .describe("Multiple reload targets. Use all_safe=true or omit targets to apply all safe targets."),
-            all_safe: z
-                .boolean()
+            all_safe: zBoolean()
                 .optional()
                 .describe("Expand to all live-safe targets (excludes dangerous-sync and restart-required targets)."),
             section: z
