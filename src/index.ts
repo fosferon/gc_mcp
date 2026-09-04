@@ -689,13 +689,13 @@ Shows: which banks have relevant facts, tag distribution, coverage gaps, stale f
 server.registerTool(
   "gc_banks",
   {
-    description: `Manage memory banks: list all banks with stats, or create new banks.
-Actions: "list" = show all banks, "create" = new bank, "stats" = detailed statistics.`,
+    description: `Manage memory banks: list, create, delete, or restore.
+Actions: "list" = all banks with fact_count (descending), "create" = new bank, "delete" = remove (use force for a non-empty bank), "restore" = undelete a soft-deleted bank.`,
     inputSchema: z.object({
       action: z
-        .enum(["list", "create", "delete", "stats"])
+        .enum(["list", "create", "delete", "restore"])
         .describe("Action to perform"),
-      name: z.string().optional().describe("Bank name (for create/delete)"),
+      name: z.string().optional().describe("Bank name (for create/delete/restore)"),
       description: z
         .string()
         .optional()
