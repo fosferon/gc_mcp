@@ -3879,7 +3879,12 @@ Start with 'coverage' to see how far back mail has actually been collected befor
       autonomy: z
         .string()
         .optional()
-        .describe("Autonomy level: observe, classify, act"),
+        .describe(
+          "Outbound autonomy gate: 'observe' (default, no outbound at all), " +
+            "'draft' (may compose drafts; live send refused, approve_draft is the gate), " +
+            "'respond' (may send directly). These three are what Outbound.validate_endpoint/2 " +
+            "actually enforces.",
+        ),
 
       // Outbound
       to: z
