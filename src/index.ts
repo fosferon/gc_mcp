@@ -2577,7 +2577,8 @@ server.registerTool(
   "gc_records",
   {
     description: `Runtime record definitions and instances.
-Actions: types, get_type, define_type, create, get, list, update, delete, transition.
+Actions: types, get_type, define_type, install_starter_types, create, get, list, update, delete, transition.
+install_starter_types defines the shipped contact and company types; it skips any handle that already exists.
 Use definition for define_type and data for create/update.
 Use params for Records query filters, sort, temporal constraints, and pagination.`,
     inputSchema: z.object({
@@ -2586,6 +2587,7 @@ Use params for Records query filters, sort, temporal constraints, and pagination
           "types",
           "get_type",
           "define_type",
+          "install_starter_types",
           "create",
           "get",
           "list",
