@@ -3660,26 +3660,53 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
 server.registerTool(
   "gc_mail",
   {
-    description: `Query email state, financial data, and inbox summary from the mail transceiver.
-Actions: summary, burn_rate, financial, messages, endpoints, scan, extract_financials, ocr,
-add_endpoint, remove_endpoint, enable_endpoint, disable_endpoint, update_endpoint,
-seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfill_senders.`,
+    description: `Mail transceiver — read, classify, derive, and SEND. Each endpoint has its own
+identity and a draft->approve autonomy level; every outbound message lands in the outbound ledger.
+Read:      summary, coverage, messages, search, get_message, thread, summarize_thread, attachments, financial, burn_rate, outbound
+Send:      draft, send, reply, approve_draft
+Ingest:    scan, ocr, extract_financials, extract_attachments
+Endpoints: endpoints, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
+Derive:    create_issue_from_message, create_reminder_from_message, create_event_from_message, create_cash_entry_from_financial
+Senders:   seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfill_senders
+Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.`,
     inputSchema: z.object({
       action: z
         .enum([
+          // Read
           "summary",
-          "burn_rate",
-          "financial",
+          "coverage",
           "messages",
-          "endpoints",
+          "search",
+          "get_message",
+          "thread",
+          "summarize_thread",
+          "attachments",
+          "financial",
+          "burn_rate",
+          "outbound",
+          // Send
+          "draft",
+          "send",
+          "reply",
+          "approve_draft",
+          // Ingest
           "scan",
-          "extract_financials",
           "ocr",
+          "extract_financials",
+          "extract_attachments",
+          // Endpoints
+          "endpoints",
           "add_endpoint",
+          "update_endpoint",
           "remove_endpoint",
           "enable_endpoint",
           "disable_endpoint",
-          "update_endpoint",
+          // Derive
+          "create_issue_from_message",
+          "create_reminder_from_message",
+          "create_event_from_message",
+          "create_cash_entry_from_financial",
+          // Senders
           "seed_rules",
           "sender_queue",
           "classify_sender",
@@ -3688,41 +3715,219 @@ seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfi
           "backfill_senders",
         ])
         .describe("Action to perform"),
-      months: zNumber()
+
+      // Identifiers
+      id: z
+        .string()
         .optional()
-        .describe("Burn rate lookback months (default 3)"),
-      category: z.string().optional().describe("Filter messages by category"),
+        .describe(
+          "Target ID — endpoint (endpoint actions), message (get_message/thread/summarize_thread), outbound draft (approve_draft), or sender (classify/dismiss/ignore_sender)",
+        ),
+      message_id: z
+        .string()
+        .optional()
+        .describe(
+          "Source message ID for reply and the create_*_from_message actions; also filters attachments",
+        ),
+      financial_entry_id: z
+        .string()
+        .optional()
+        .describe("Financial entry ID (create_cash_entry_from_financial)"),
+      endpoint_id: z
+        .string()
+        .optional()
+        .describe(
+          "Endpoint to act on: scan, coverage, extract_attachments, outbound, and the sending identity for draft/send/reply",
+        ),
+
+      // Message queries
+      category: z
+        .string()
+        .optional()
+        .describe(
+          "Filter messages by category; also the category on a derived cash entry",
+        ),
+      subject: z
+        .string()
+        .optional()
+        .describe("Filter messages by subject (substring)"),
       from: z
         .string()
         .optional()
         .describe("Filter messages by sender (substring)"),
-      since: z.string().optional().describe("Filter messages since date (ISO)"),
+      since: z
+        .string()
+        .optional()
+        .describe(
+          "Messages: filter since date (ISO). Scan: collect back to this date (backfill cutoff).",
+        ),
+      has_attachments: zBoolean()
+        .optional()
+        .describe("Filter messages to those with attachments"),
+      limit: zNumber().optional().describe("Max results"),
+      fetch_body: zBoolean()
+        .optional()
+        .describe(
+          "get_message: fetch the full body over IMAP instead of the stored preview",
+        ),
+
+      // Search
+      q: z.string().optional().describe("Full-text query (required for search)"),
+      include_attachment_text: zBoolean()
+        .optional()
+        .describe("Search extracted attachment text too (default true)"),
+
+      // Attachments
+      filename: z
+        .string()
+        .optional()
+        .describe("Filter attachments by filename (substring)"),
+      text_extraction: z
+        .string()
+        .optional()
+        .describe("Filter attachments by extraction state"),
+
+      // Coverage and scanning
+      probe: zBoolean()
+        .optional()
+        .describe(
+          "coverage: probe the server for remaining history (network round trip). Default false = instant DB-only read.",
+        ),
+      mode: z
+        .string()
+        .optional()
+        .describe("Scan mode: incremental (default) or backfill"),
+      folders: z
+        .array(z.string())
+        .optional()
+        .describe("Scan: limit this run to these folders"),
+      batch_size: zNumber()
+        .optional()
+        .describe("Scan: messages per batch (default 200)"),
+      max_batches: zNumber()
+        .optional()
+        .describe("Scan: batch ceiling per run (default 25, max 200)"),
+
+      // Financial
       direction: z
         .string()
         .optional()
         .describe("Financial direction: expense or income"),
       vat_period: z.string().optional().describe("VAT period filter"),
-      limit: zNumber().optional().describe("Max results"),
+      months: zNumber()
+        .optional()
+        .describe("Burn rate lookback months (default 3)"),
+
       // Endpoint management
-      id: z.string().optional().describe("Endpoint or sender ID"),
       email: z.string().optional().describe("Email address (for add_endpoint)"),
       name: z.string().optional().describe("Endpoint name"),
+      provider: z.string().optional().describe("Provider (default: imap)"),
+      labels: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "Endpoint labels; also the labels applied by the create_*_from_message actions",
+        ),
       imap_host: z
         .string()
         .optional()
         .describe("IMAP host (default: imap.zoho.com)"),
       imap_port: zNumber().optional().describe("IMAP port (default: 993)"),
       username: z.string().optional().describe("IMAP username"),
-      app_key: z.string().optional().describe("IMAP app-specific password"),
+      app_key: z
+        .string()
+        .optional()
+        .describe(
+          "IMAP app-specific password. Stored in plaintext today — prefer imap_secret_ref where a vault entry exists.",
+        ),
+      imap_secret_ref: z
+        .string()
+        .optional()
+        .describe("Vault reference for the IMAP password (preferred over app_key)"),
+      from_name: z
+        .string()
+        .optional()
+        .describe("Display name on outbound mail from this endpoint"),
+      smtp_host: z.string().optional().describe("SMTP host (for sending)"),
+      smtp_port: zNumber().optional().describe("SMTP port (default: 587)"),
+      smtp_username: z
+        .string()
+        .optional()
+        .describe("SMTP username (defaults to the IMAP username)"),
+      smtp_password: z
+        .string()
+        .optional()
+        .describe("SMTP password — prefer smtp_secret_ref"),
+      smtp_secret_ref: z
+        .string()
+        .optional()
+        .describe("Vault reference for the SMTP password"),
+      oauth_secret_ref: z
+        .string()
+        .optional()
+        .describe("Vault reference for an OAuth credential"),
+      smtp_tls: z
+        .string()
+        .optional()
+        .describe("SMTP TLS mode (default: if_available)"),
       scan_folders: z
         .array(z.string())
         .optional()
-        .describe("Folders to scan (default: [INBOX])"),
+        .describe(
+          "Folders to scan (default: [INBOX]). Include 'Sent' — outbound mail is the highest-signal record.",
+        ),
       autonomy: z
         .string()
         .optional()
         .describe("Autonomy level: observe, classify, act"),
-      endpoint_id: z.string().optional().describe("Endpoint ID (for scan)"),
+
+      // Outbound
+      to: z
+        .union([z.string(), z.array(z.string())])
+        .optional()
+        .describe("Recipients (send/draft; defaults to the sender on reply)"),
+      cc: z.union([z.string(), z.array(z.string())]).optional().describe("CC recipients"),
+      bcc: z.union([z.string(), z.array(z.string())]).optional().describe("BCC recipients"),
+      text: z
+        .string()
+        .optional()
+        .describe("Message body (send/draft/reply); also the reminder text on create_reminder_from_message"),
+      in_reply_to: z
+        .string()
+        .optional()
+        .describe("In-Reply-To header (set automatically by reply)"),
+      references_header: z.string().optional().describe("References header"),
+      attachments: z
+        .array(z.record(z.any()))
+        .optional()
+        .describe(
+          "Outbound attachments: [{mail_attachment_id}] to forward a stored attachment, or [{path, filename?}] for a local file",
+        ),
+      status: z
+        .string()
+        .optional()
+        .describe("outbound: filter the ledger by status; create_cash_entry_from_financial: entry status"),
+
+      // Derived records
+      title: z
+        .string()
+        .optional()
+        .describe("Title for a derived issue, event, or cash entry (defaults to the subject)"),
+      description: z.string().optional().describe("Description for a derived issue"),
+      project: z.string().optional().describe("Project for a derived issue"),
+      priority: z.string().optional().describe("Priority for a derived issue"),
+      due: z.string().optional().describe("Due time for a derived reminder"),
+      starts_at: z
+        .string()
+        .optional()
+        .describe("Event start (defaults to the message's own timestamp, not now)"),
+      ends_at: z.string().optional().describe("Event end"),
+      type: z
+        .string()
+        .optional()
+        .describe("Event type (default deadline) or cash entry type"),
+      notes: z.string().optional().describe("Notes on the derived record"),
+
       // Sender classification
       view: z
         .string()
