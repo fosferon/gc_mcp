@@ -3251,7 +3251,12 @@ Start with 'coverage' to see how far back mail has actually been collected befor
             smtp_tls: z
                 .string()
                 .optional()
-                .describe("SMTP TLS mode (default: if_available)"),
+                .describe("STARTTLS mode: always, never, if_available (default)"),
+            smtp_ssl: zBoolean()
+                .optional()
+                .describe("Implicit TLS (SMTPS). Defaults from smtp_port on add_endpoint — 465 is true, " +
+                "anything else false — so you rarely set it. On update_endpoint only an explicit " +
+                "value changes it; moving the port alone leaves it as it was."),
             scan_folders: z
                 .array(z.string())
                 .optional()
