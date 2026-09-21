@@ -73,6 +73,24 @@ try {
     "gc_workflow resume must pass an undici Agent as dispatcher",
   );
   const dispatcher = lastInit().dispatcher;
+
+  // The limits themselves. undici keeps an Agent's options under a private
+  // symbol; reading it is what lets the fast suite tell `new Agent({})` — which
+  // fails at 300 s exactly as before — from the real fix. If undici ever drops
+  // the symbol this fails loudly rather than passing blind; the slow half is
+  // then the only proof, and this block has to be rewritten, not deleted.
+  const optionsKey = Object.getOwnPropertySymbols(dispatcher).find(
+    (symbol) => symbol.description === "options",
+  );
+  assert.ok(optionsKey, "undici Agent no longer exposes Symbol(options); rewrite this check");
+  assert.deepEqual(
+    {
+      headersTimeout: dispatcher[optionsKey].headersTimeout,
+      bodyTimeout: dispatcher[optionsKey].bodyTimeout,
+    },
+    { headersTimeout: 0, bodyTimeout: 0 },
+    "the daemon dispatcher must disable undici's 300 s headers and body limits",
+  );
   assert.equal(
     lastInit().signal,
     undefined,

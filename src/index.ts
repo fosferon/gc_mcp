@@ -3309,8 +3309,10 @@ Claude-specific permission controls:
     // Compute the client-side HTTP abort deadline from the user's timeout.
     // - Non-dispatch actions (status/output) → short default, they return fast.
     // - wait: false → short default, daemon returns job_id immediately.
-    // - wait: true + "infinite" → no client abort at all.
+    // - wait: true + "none" / "infinity" / "infinite" → no client abort at all.
     // - wait: true + integer → (seconds * 1000) + 10s buffer past daemon deadline.
+    //   (The buffer differs by tool for no recorded reason: +10s here, +5s on
+    //   the run and capability watch streams, none on gc_workflow.)
     // - wait: true + undefined → 30 min default + 10s buffer.
     let clientTimeoutMs: number | null | undefined = 15_000;
     if (params.action === "dispatch" && params.wait === true) {
