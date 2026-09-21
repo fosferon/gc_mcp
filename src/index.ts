@@ -34,12 +34,75 @@ import { homedir } from "node:os";
 const GC_BASE = process.env.GC_DAEMON_URL || "http://localhost:4242";
 
 /**
+ * Node's global fetch is undici, and undici enforces its own 300 s
+ * `headersTimeout` and 300 s `bodyTimeout` whatever AbortSignal the caller
+ * passes (or omits). A daemon call that blocks longer than that before
+ * answering — a synchronous workflow resume, a wait-mode dispatch — was cut by
+ * the HTTP client at exactly 300 s with a bare "fetch failed", while the work
+ * carried on in the daemon (GC-5374). The same limit applied to SSE streams
+ * that stay quiet for five minutes.
+ *
+ * Every daemon request therefore goes through this dispatcher, which has
+ * neither limit; the per-call AbortSignal is the only client-side deadline.
+ *
+ * undici is loaded dynamically on purpose. Harnesses launch the committed
+ * `dist/index.js` straight from a checkout with no install step, so a static
+ * import would stop every MCP server from starting on a tree whose
+ * node_modules predates the dependency. Without it the server still runs,
+ * with the old 300 s limit, and says so here and in the error it produces.
+ */
+const daemonDispatcher: unknown = await import("undici")
+  .then(({ Agent }) => new Agent({ headersTimeout: 0, bodyTimeout: 0 }))
+  .catch((e: any) => {
+    process.stderr.write(
+      `gc_mcp: undici is not installed (${e?.code ?? e?.message}); daemon calls longer than 300 s will fail. Run \`npm install\` in the gc_mcp checkout.\n`,
+    );
+    return undefined;
+  });
+
+function daemonFetch(url: string, init: RequestInit = {}): Promise<Response> {
+  if (daemonDispatcher === undefined) return fetch(url, init);
+  return fetch(url, { ...init, dispatcher: daemonDispatcher } as RequestInit);
+}
+
+/** The three spellings of "no deadline" that zTimeout() accepts. */
+function isNoDeadline(timeout: unknown): boolean {
+  return timeout === "none" || timeout === "infinity" || timeout === "infinite";
+}
+
+/**
+ * Render an error for the agent. undici reports the actual reason
+ * (ECONNREFUSED, UND_ERR_SOCKET, ...) on `cause` and leaves `message` as
+ * "fetch failed", so the cause has to be spelled out. A client-side deadline
+ * says nothing about the daemon-side work, and the text says so.
+ */
+function describeError(e: any): string {
+  const message = e?.message ?? String(e);
+  if (e?.name === "TimeoutError") {
+    return `${message} — this is the MCP client's own deadline; the daemon may still be working, so check the job or execution status before retrying`;
+  }
+  const cause = e?.cause;
+  if (!cause) return message;
+  const label = cause.code ?? cause.name;
+  const detail = cause.message ?? String(cause);
+  const described = label ? `${message} (${label}: ${detail})` : `${message} (${detail})`;
+  if (
+    daemonDispatcher === undefined &&
+    (label === "UND_ERR_HEADERS_TIMEOUT" || label === "UND_ERR_BODY_TIMEOUT")
+  ) {
+    return `${described} — the HTTP client's 300 s limit, not a daemon failure: the daemon may still be working. Run \`npm install\` in the gc_mcp checkout to lift the limit`;
+  }
+  return described;
+}
+
+/**
  * POST to gc_daemon.
  *
  * timeoutMs controls the client-side abort:
  *   - undefined (default) → 15s, suitable for fire-and-forget tools
  *   - positive number     → explicit client-side deadline in ms
- *   - null                → no client-side abort at all (fetch waits forever)
+ *   - null                → no client-side abort at all; daemonDispatcher is
+ *                           what makes that true
  *
  * Long-running tools (wait-mode dispatch, workflow wait) must override the
  * default — the 15s default exists only because most tools are interactive.
@@ -58,7 +121,7 @@ async function gcPost(
   if (timeoutMs !== null && timeoutMs !== undefined) {
     init.signal = AbortSignal.timeout(timeoutMs);
   }
-  const resp = await fetch(url, init);
+  const resp = await daemonFetch(url, init);
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
     throw new Error(`gc_daemon ${path} failed (${resp.status}): ${text}`);
@@ -68,7 +131,7 @@ async function gcPost(
 
 async function gcGet(path: string): Promise<any> {
   const url = `${GC_BASE}${path}`;
-  const resp = await fetch(url, { signal: AbortSignal.timeout(5_000) });
+  const resp = await daemonFetch(url, { signal: AbortSignal.timeout(5_000) });
   if (!resp.ok) throw new Error(`gc_daemon ${path} failed (${resp.status})`);
   return resp.json();
 }
@@ -83,7 +146,7 @@ async function gcGetResponse(
     init.signal = AbortSignal.timeout(timeoutMs);
   }
 
-  const resp = await fetch(url, init);
+  const resp = await daemonFetch(url, init);
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
     throw new Error(`gc_daemon ${path} failed (${resp.status}): ${text}`);
@@ -93,7 +156,7 @@ async function gcGetResponse(
 
 async function gcDelete(path: string): Promise<any> {
   const url = `${GC_BASE}${path}`;
-  const resp = await fetch(url, {
+  const resp = await daemonFetch(url, {
     method: "DELETE",
     signal: AbortSignal.timeout(5_000),
   });
@@ -373,7 +436,7 @@ async function daemonCall(
     const body = JSON.stringify(result, null, 2);
     return text(maxResponseChars !== null ? truncateResponse(body, maxResponseChars) : body);
   } catch (e: any) {
-    return err(`ERROR: ${e.message}`);
+    return err(`ERROR: ${describeError(e)}`);
   }
 }
 
@@ -1208,7 +1271,7 @@ server.registerTool(
       const result = await gcGet("/gc/telegram/status");
       return text(JSON.stringify(result, null, 2));
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1312,7 +1375,7 @@ Actions:
       }
       return err(`unsupported gc_conversation action: ${action}`);
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1368,7 +1431,7 @@ Actions: spawn, turn, get, list, delete.`,
       }
       return err(`unsupported gc_agent_conversation action: ${action}`);
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1424,7 +1487,7 @@ Actions: spawn, turn, get, list, delete.`,
       }
       return err(`unsupported gc_aden action: ${action}`);
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1480,13 +1543,13 @@ Actions:
       }
       if (action === "watch") {
         const timeoutMs =
-          params.timeout === "infinite" || params.timeout === "infinity"
+          isNoDeadline(params.timeout)
             ? null
             : typeof params.timeout === "number"
               ? params.timeout * 1000
               : 30_000;
         const url = `${GC_BASE}/gc/run/${encodeURIComponent(executionId)}/watch?since=${encodeURIComponent(params.since ?? 0)}`;
-        const resp = await fetch(url, {
+        const resp = await daemonFetch(url, {
           signal:
             timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
         });
@@ -1521,7 +1584,7 @@ Actions:
       }
       return err(`unsupported gc_run action: ${action}`);
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1572,7 +1635,7 @@ server.registerTool(
       }
       return err(`unsupported gc_checkpoint action: ${action}`);
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1620,7 +1683,7 @@ server.registerTool(
 
     try {
       const timeoutMs =
-        params.timeout === "infinite" || params.timeout === "infinity"
+        isNoDeadline(params.timeout)
           ? null
           : typeof params.timeout === "number"
             ? params.timeout * 1000
@@ -1653,7 +1716,7 @@ server.registerTool(
         ) + summary,
       );
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -1674,13 +1737,13 @@ server.registerTool(
   async (params) => {
     try {
       const timeoutMs =
-        params.timeout === "infinite" || params.timeout === "infinity"
+        isNoDeadline(params.timeout)
           ? null
           : typeof params.timeout === "number"
             ? params.timeout * 1000
             : 30_000;
       const url = `${GC_BASE}/gc/capability/watch`;
-      const resp = await fetch(url, {
+      const resp = await daemonFetch(url, {
         signal:
           timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
       });
@@ -1712,7 +1775,7 @@ server.registerTool(
         ) + summary,
       );
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -2974,7 +3037,7 @@ Typical flow:
       const result = await gcGet("/gc/peer_conversation");
       return text(JSON.stringify(result, null, 2));
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -3049,7 +3112,7 @@ Actions: spawn, turn, get, list, destroy.`,
       const result = await gcGet("/gc/peer_conversation");
       return text(JSON.stringify(result, null, 2));
     } catch (e: any) {
-      return err(`ERROR: ${e.message}`);
+      return err(`ERROR: ${describeError(e)}`);
     }
   },
 );
@@ -3252,7 +3315,7 @@ Claude-specific permission controls:
     let clientTimeoutMs: number | null | undefined = 15_000;
     if (params.action === "dispatch" && params.wait === true) {
       const t = params.timeout;
-      if (t === "infinite" || t === "infinity") {
+      if (isNoDeadline(t)) {
         clientTimeoutMs = null; // wait forever
       } else if (typeof t === "number" && t > 0) {
         clientTimeoutMs = t * 1000 + 10_000;
@@ -3542,7 +3605,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
       timeout: zTimeout()
         .optional()
         .describe(
-          'Client-side HTTP timeout in seconds. Default: 300 (5 min) for run/resume, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. Accepts string-of-int ("600") so LLM stringification is safe.',
+          'Client-side HTTP timeout in seconds. Default: none for resume (it answers only at the next checkpoint), 300 (5 min) for run/wait/watch, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. A client timeout never stops the daemon-side run. Accepts string-of-int ("600") so LLM stringification is safe.',
         ),
       run_timeout: zTimeout()
         .optional()
@@ -3583,7 +3646,12 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
     // - async: true → 15s (daemon returns immediately)
     // - timeout: none/infinity/infinite → null (no abort)
     // - timeout: N → N * 1000
-    // - run/resume/wait (no explicit timeout) → 300s default (workflows can take minutes)
+    // - resume (no explicit timeout) → null: the daemon answers a resume only
+    //   when the run reaches its next checkpoint, and a stage routinely takes
+    //   7-20 minutes, so any fixed default reports a failure that did not
+    //   happen (GC-5374)
+    // - run/wait/watch (no explicit timeout) → 300s default (a sync run is
+    //   promoted to async by the daemon at its own 5 min cap)
     // - everything else → 15s default
     let clientTimeoutMs: number | null | undefined = 15_000;
     const isLongAction =
@@ -3594,16 +3662,14 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
 
     if (params.async) {
       clientTimeoutMs = 15_000; // async returns immediately
-    } else if (
-      params.timeout === "none" ||
-      params.timeout === "infinity" ||
-      params.timeout === "infinite"
-    ) {
+    } else if (isNoDeadline(params.timeout)) {
       clientTimeoutMs = null;
     } else if (typeof params.timeout === "number" && params.timeout > 0) {
       clientTimeoutMs = params.timeout * 1000;
+    } else if (params.action === "resume") {
+      clientTimeoutMs = null;
     } else if (isLongAction) {
-      clientTimeoutMs = 300_000; // 5 min default for sync run/resume
+      clientTimeoutMs = 300_000; // 5 min default for sync run/wait/watch
     }
 
     if (params.action === "watch") {
@@ -3645,7 +3711,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
           ? err(toJsonText(payload))
           : text(toJsonText(payload));
       } catch (e: any) {
-        return err(`ERROR: ${e.message}`);
+        return err(`ERROR: ${describeError(e)}`);
       }
     }
 
@@ -4129,7 +4195,7 @@ Actions: "get" (default) = latest snapshot, "tick" = force a fresh tick.`,
       const result = await gcGet("/gc/ticker");
       return text(JSON.stringify(result, null, 2));
     } catch (e: any) {
-      return err(`Ticker error: ${e.message}`);
+      return err(`Ticker error: ${describeError(e)}`);
     }
   },
 );
@@ -4230,7 +4296,7 @@ function getResolveBridgePath(): string {
     const id = Date.now();
     const body = { jsonrpc: "2.0", id, method, params };
 
-    const resp = await fetch(url, {
+    const resp = await daemonFetch(url, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(body),
@@ -4405,7 +4471,7 @@ Task states: submitted → working → completed | failed | canceled | rejected.
             return err(`Unknown A2A action: ${params.action}`);
         }
       } catch (e: any) {
-        return err(`gc_a2a error: ${e.message}`);
+        return err(`gc_a2a error: ${describeError(e)}`);
       }
     },
   );
