@@ -2812,7 +2812,7 @@ Claude-specific permission controls:
             reason: z.string().optional().describe("Dismiss reason (for dismiss)"),
             force: zBoolean()
                 .optional()
-                .describe("Force deletion of running job (for delete)"),
+                .describe("delete: also allowed on a RUNNING job — the daemon first aborts it (process group torn down, job marked killed, response carries torn_down), then removes the record. To stop a job and KEEP its record, use gc_run action:control control_action:abort instead."),
             older_than_hours: zNumber()
                 .optional()
                 .describe("Minimum age in hours for prune (default 24)"),
