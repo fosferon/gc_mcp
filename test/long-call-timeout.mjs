@@ -66,8 +66,19 @@ try {
   };
 
   const lastInit = () => seen.at(-1).init;
+  const lastBody = () => JSON.parse(lastInit().body);
 
-  await callTool("gc_workflow", { action: "resume", id: "wf-1" });
+  // GC-5452: resume is async unless told otherwise, and from_step travels.
+  await callTool("gc_workflow", { action: "resume", id: "wf-1", from_step: "audit" });
+  assert.equal(lastBody().async, true, "resume defaults to async: true");
+  assert.equal(lastBody().from_step, "audit", "from_step must reach the daemon");
+  assert.ok(
+    lastInit().signal instanceof AbortSignal,
+    "an async resume answers at once and keeps the short client deadline",
+  );
+
+  await callTool("gc_workflow", { action: "resume", id: "wf-1", async: false });
+  assert.equal(lastBody().async, false, "async: false is forwarded as given");
   assert.ok(
     lastInit().dispatcher instanceof Agent,
     "gc_workflow resume must pass an undici Agent as dispatcher",
@@ -94,10 +105,10 @@ try {
   assert.equal(
     lastInit().signal,
     undefined,
-    "gc_workflow resume with no timeout must carry no client-side deadline",
+    "a sync gc_workflow resume with no timeout must carry no client-side deadline",
   );
 
-  await callTool("gc_workflow", { action: "resume", id: "wf-1", timeout: 60 });
+  await callTool("gc_workflow", { action: "resume", id: "wf-1", async: false, timeout: 60 });
   assert.ok(
     lastInit().signal instanceof AbortSignal,
     "an explicit resume timeout must still set a client-side deadline",
@@ -150,7 +161,12 @@ try {
   globalThis.fetch = async () => {
     throw new DOMException("The operation was aborted due to timeout", "TimeoutError");
   };
-  const timedOut = await callTool("gc_workflow", { action: "resume", id: "wf-1", timeout: 1 });
+  const timedOut = await callTool("gc_workflow", {
+    action: "resume",
+    id: "wf-1",
+    async: false,
+    timeout: 1,
+  });
   assert.match(
     textOf(timedOut),
     /MCP client's own deadline; the daemon may still be working/,
@@ -163,7 +179,7 @@ try {
   if (SLOW) {
     globalThis.fetch = originalFetch;
     const started = Date.now();
-    const result = await callTool("gc_workflow", { action: "resume", id: "wf-slow" });
+    const result = await callTool("gc_workflow", { action: "resume", id: "wf-slow", async: false });
     const elapsed = Math.round((Date.now() - started) / 1000);
     assert.notEqual(
       result.isError,
