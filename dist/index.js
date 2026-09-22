@@ -174,11 +174,11 @@ const MAX_RESPONSE_CHARS = 16_000;
  * not split mid-token), then appends a diagnostic block with the original
  * size, the amount retained, and a hint to narrow the query.
  */
-function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS) {
+function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS, hint = "Use narrower filters, a smaller limit, or a more specific action to get full results.") {
     if (body.length <= maxChars)
         return body;
-    // Reserve room for the truncation notice itself (~300 chars).
-    const cutBudget = maxChars - 350;
+    // Reserve room for the truncation notice itself (~300 chars, plus the hint).
+    const cutBudget = maxChars - 350 - hint.length;
     let cutPoint = body.lastIndexOf("\n", cutBudget);
     if (cutPoint < cutBudget * 0.5)
         cutPoint = cutBudget; // no good newline; hard cut
@@ -188,8 +188,15 @@ function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS) {
     return (kept +
         `\n\n[TRUNCATED — showing ${pct}% (${cutPoint.toLocaleString()} of ${body.length.toLocaleString()} chars). ` +
         `${droppedChars.toLocaleString()} chars omitted. ` +
-        `Use narrower filters, a smaller limit, or a more specific action to get full results.]`);
+        `${hint}]`);
 }
+// GC-5424: a truncated workflow read used to end in the generic hint above,
+// and the agent reading a 60k-character run never learned that one step's
+// output can be fetched on its own and in pages.
+const WORKFLOW_TRUNCATION_HINT = "This is a workflow read. One step's output: action:context key:<step_id>, " +
+    "with offset/limit (characters) to page it — the response carries total_chars " +
+    "and next_offset. Narrow show/detail with select:\"step_a,step_b\", or use " +
+    "return:\"lean\" for status alone.";
 /** Standard MCP text result */
 function text(t) {
     return { content: [{ type: "text", text: t }] };
@@ -308,9 +315,39 @@ async function readSseStream(resp, onEvent) {
         }
     }
 }
+function isAbortError(e) {
+    const name = e?.name;
+    return name === "AbortError" || name === "TimeoutError";
+}
+// GC-5424: a watch whose own `timeout` elapsed used to come back as
+// "ERROR: The operation was aborted due to timeout", with every event it had
+// collected thrown away — the normal outcome of "watch for N seconds" was an
+// error. The events are kept as they arrive, and a client-side abort returns
+// them with timed_out: true. (The daemon streams also take `timeout`, so the
+// stream normally closes itself first; the abort is the fallback.)
+async function collectSseStream(resp, onEvent) {
+    const events = [];
+    try {
+        const result = await readSseStream(resp, async (event, index) => {
+            events.push(event);
+            await onEvent?.(event, index);
+        });
+        return { events: result.events, terminal: result.terminal, timed_out: false };
+    }
+    catch (e) {
+        if (isAbortError(e))
+            return { events, terminal: undefined, timed_out: true };
+        throw e;
+    }
+}
 async function readWorkflowWatchStream(executionId, timeoutMs, onEvent) {
-    const resp = await gcGetResponse(`/gc/workflow/${encodeURIComponent(executionId)}/watch`, timeoutMs);
-    return readSseStream(resp, onEvent);
+    // The daemon's workflow watch takes `timeout` in seconds and closes the
+    // stream itself at the deadline.
+    const query = typeof timeoutMs === "number" && timeoutMs > 0
+        ? `?timeout=${encodeURIComponent(Math.ceil(timeoutMs / 1000))}`
+        : "";
+    const resp = await gcGetResponse(`/gc/workflow/${encodeURIComponent(executionId)}/watch${query}`, timeoutMs === null || timeoutMs === undefined ? timeoutMs : timeoutMs + 5_000);
+    return collectSseStream(resp, onEvent);
 }
 function resolveJsonPointer(root, ref) {
     if (!ref.startsWith("#/"))
@@ -359,11 +396,13 @@ function inlineLocalRefs(schema) {
  * Pass `maxResponseChars: null` from individual tool handlers that need
  * the full payload (rare — most tools benefit from the safety cap).
  */
-async function daemonCall(endpoint, params, timeoutMs = 15_000, maxResponseChars = MAX_RESPONSE_CHARS) {
+async function daemonCall(endpoint, params, timeoutMs = 15_000, maxResponseChars = MAX_RESPONSE_CHARS, truncationHint) {
     try {
         const result = await gcPost(endpoint, clean(params), timeoutMs);
         const body = JSON.stringify(result, null, 2);
-        return text(maxResponseChars !== null ? truncateResponse(body, maxResponseChars) : body);
+        return text(maxResponseChars !== null
+            ? truncateResponse(body, maxResponseChars, truncationHint)
+            : body);
     }
     catch (e) {
         return err(`ERROR: ${describeError(e)}`);
@@ -1264,7 +1303,14 @@ Actions:
                     : typeof params.timeout === "number"
                         ? params.timeout * 1000
                         : 30_000;
-                const url = `${GC_BASE}/gc/run/${encodeURIComponent(executionId)}/watch?since=${encodeURIComponent(params.since ?? 0)}`;
+                // The daemon's run watch takes `timeout` and `heartbeat` in ms and
+                // closes the stream itself at the deadline (GC-5424).
+                const query = [`since=${encodeURIComponent(params.since ?? 0)}`];
+                if (timeoutMs !== null)
+                    query.push(`timeout=${timeoutMs}`);
+                if (typeof params.heartbeat === "number")
+                    query.push(`heartbeat=${params.heartbeat}`);
+                const url = `${GC_BASE}/gc/run/${encodeURIComponent(executionId)}/watch?${query.join("&")}`;
                 const resp = await daemonFetch(url, {
                     signal: timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
                 });
@@ -1272,13 +1318,16 @@ Actions:
                     const textBody = await resp.text().catch(() => "");
                     throw new Error(`gc_daemon run watch failed (${resp.status}): ${textBody}`);
                 }
-                const { events, terminal } = await readSseStream(resp);
+                const { events, terminal, timed_out } = await collectSseStream(resp);
                 const summary = terminal
                     ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
-                    : `\nStream ended without terminal event (${events.length} events)`;
+                    : timed_out
+                        ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                        : `\nStream ended without terminal event (${events.length} events)`;
                 return text(JSON.stringify({
                     execution_id: executionId,
                     event_count: events.length,
+                    timed_out,
                     terminal_event: terminal
                         ? {
                             event: terminal.event,
@@ -1378,13 +1427,16 @@ Actions:
                 : typeof params.timeout === "number"
                     ? params.timeout * 1000
                     : 30_000;
-            const { events, terminal } = await readWorkflowWatchStream(executionId, timeoutMs);
+            const { events, terminal, timed_out } = await readWorkflowWatchStream(executionId, timeoutMs);
             const summary = terminal
                 ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
-                : `\nStream ended without terminal event (${events.length} events)`;
+                : timed_out
+                    ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                    : `\nStream ended without terminal event (${events.length} events)`;
             return text(JSON.stringify({
                 execution_id: executionId,
                 event_count: events.length,
+                timed_out,
                 terminal_event: terminal
                     ? {
                         event: terminal.event,
@@ -1417,7 +1469,14 @@ Actions:
                 : typeof params.timeout === "number"
                     ? params.timeout * 1000
                     : 30_000;
-            const url = `${GC_BASE}/gc/capability/watch`;
+            // The daemon's capability watch takes `timeout` and `heartbeat` in ms
+            // and closes the stream itself at the deadline (GC-5424).
+            const query = [];
+            if (timeoutMs !== null)
+                query.push(`timeout=${timeoutMs}`);
+            if (typeof params.heartbeat === "number")
+                query.push(`heartbeat=${params.heartbeat}`);
+            const url = `${GC_BASE}/gc/capability/watch${query.length ? `?${query.join("&")}` : ""}`;
             const resp = await daemonFetch(url, {
                 signal: timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
             });
@@ -1425,12 +1484,15 @@ Actions:
                 const textBody = await resp.text().catch(() => "");
                 throw new Error(`gc_daemon capability watch failed (${resp.status}): ${textBody}`);
             }
-            const { events, terminal } = await readSseStream(resp);
+            const { events, terminal, timed_out } = await collectSseStream(resp);
             const summary = terminal
                 ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
-                : `\nStream ended without terminal event (${events.length} events)`;
+                : timed_out
+                    ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                    : `\nStream ended without terminal event (${events.length} events)`;
             return text(JSON.stringify({
                 event_count: events.length,
+                timed_out,
                 terminal_event: terminal
                     ? {
                         event: terminal.event,
@@ -2904,11 +2966,11 @@ Actions:
   - list_workflows — list YAML definitions (defaults to summary: name/file/description/size)
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
-  - show (alias: get_execution) — one execution with full runtime
+  - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime)
   - report — reliability summary, stale-running detection, recent failures
   - overview — bounded operational state for active runs, recent failures, and attention signals
-  - detail — per-step breakdown for an execution
-  - context — inspect runtime context/keys for an execution
+  - detail — per-step breakdown for an execution, each step with its result
+  - context — one step's stored output (key = step id), pageable
   - resume — re-run from a checkpoint
   - wait — bounded poll until terminal state or timeout
   - watch — stream daemon SSE continuity through MCP progress notifications, then return the terminal event
@@ -2951,8 +3013,31 @@ Response shaping:
     - return: "full" — includes 'runtime' JSON for every row (can be large)
     - select: "id,status" — return only the named fields per row
 
-  detail / show:
-    - return: "lean" — compact status, current step, last error, and liveness without runtime, trace, or results
+  show:
+    - Default: step inventory — one row per step (step_id, status, timing,
+      result_bytes), never a step's result; plus \`halt\` {step_id, message}
+      when the run is halted. Sized to fit any response cap.
+    - return: "lean" — status, current_step, last_error, halted_step,
+      halt_message (capped), liveness
+    - return: "full" — the whole stored runtime (results, trace, meta)
+    - select: "step_a,step_b" — only those steps
+
+  detail:
+    - Default: one row per step WITH its result, in the order the steps
+      first ran; \`halt\` as in show. No repeated top-level results map.
+    - return: "full" — adds the raw results and meta maps
+    - select: "step_a,step_b" — only those steps
+
+  context:
+    - key: "<step_id>" — that step's stored output and its meta (status,
+      timing, audit). This is how to read one step's report in full.
+    - offset / limit (characters) — page one key's output; the response
+      carries total_chars, truncated, next_offset (and encoded: true when
+      a non-string value was paged over its JSON text).
+    - select: "step_a,step_b" — several steps' outputs in one call
+
+  A parameter the action does not read is named in the response's
+  \`warnings\` (with the actions that read it) — never silently ignored.
 
   overview:
     - Default: active runs plus failures from the last 24 hours
@@ -3008,11 +3093,17 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             select: z
                 .string()
                 .optional()
-                .describe('Cherry-pick fields/steps. run: step IDs ("step_a,step_b"). list_workflows: workflow names (returns full body). list_executions: execution field names. Takes priority over return.'),
+                .describe('Cherry-pick fields/steps. run: step IDs ("step_a,step_b"). show/detail: keep only those steps. context: read those step ids in one call. list_workflows: workflow names (returns full body). list_executions: execution field names. Takes priority over return.'),
             return: z
                 .enum(["result", "full", "steps", "trace", "summary", "lean"])
                 .optional()
-                .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full". detail + show: "lean" for compact execution state.'),
+                .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full". show: inventory (default)/"lean"/"full" (whole runtime). detail: step rows (default)/"lean"/"full" (adds results + meta maps).'),
+            offset: zNumber()
+                .optional()
+                .describe("context with key: start of the page in characters (default 0). Pairs with limit_chars."),
+            limit_chars: zNumber()
+                .optional()
+                .describe("context with key: page size in characters (sent to the daemon as `limit`). The response carries total_chars and next_offset."),
             id: z
                 .string()
                 .optional()
@@ -3024,7 +3115,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             key: z
                 .string()
                 .optional()
-                .describe("Context key to inspect (for context action)"),
+                .describe("context: a STEP ID — returns that step's stored output and meta. Page a long output with offset + limit_chars."),
             interval: zPositiveNumber()
                 .optional()
                 .describe("Poll interval in seconds for wait (default: 5). Accepts string-of-int."),
@@ -3097,7 +3188,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 return err("ERROR: execution id is required for action=watch");
             }
             try {
-                const { events, terminal } = await readWorkflowWatchStream(executionId, clientTimeoutMs, async (event, index) => {
+                const { events, terminal, timed_out } = await readWorkflowWatchStream(executionId, clientTimeoutMs, async (event, index) => {
                     if (extra._meta?.progressToken === undefined)
                         return;
                     await extra.sendNotification({
@@ -3114,11 +3205,12 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                     ok: true,
                     id: executionId,
                     event_count: events.length,
+                    timed_out,
                     final_event: finalEvent?.event ?? null,
                     terminal: finalEvent?.data ?? null,
                     events,
                 };
-                return isFailedWatchEvent(finalEvent)
+                return finalEvent && isFailedWatchEvent(finalEvent)
                     ? err(toJsonText(payload))
                     : text(toJsonText(payload));
             }
@@ -3126,7 +3218,13 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 return err(`ERROR: ${describeError(e)}`);
             }
         }
-        return daemonCall("/gc/workflow", normalized, clientTimeoutMs);
+        // `limit` already means "max rows" for the list actions; the context
+        // page size travels as limit_chars here and as `limit` to the daemon.
+        if (params.action === "context" && normalized.limit_chars !== undefined) {
+            normalized.limit = normalized.limit_chars;
+            delete normalized.limit_chars;
+        }
+        return daemonCall("/gc/workflow", normalized, clientTimeoutMs, MAX_RESPONSE_CHARS, WORKFLOW_TRUNCATION_HINT);
     });
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Mail
