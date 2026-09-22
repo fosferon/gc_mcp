@@ -3684,32 +3684,36 @@ Use list rather than drain for multi-harness bridges: drain marks matching event
             return piExtPath;
         // Fallback: check relative to this file
         const localPath = resolve(dirname(import.meta.url.replace("file://", "")), "..", "..", ".pi", "extensions", "davinci-resolve", "resolve-bridge.py");
-        // ════════════════════════════════════════════════════════════════
-        // DAEMON TOOL — A2A (Agent-to-Agent Protocol)
-        // ════════════════════════════════════════════════════════════════
-        const A2A_RPC_METHODS = new Set([
-            "message/send",
-            "tasks/get",
-            "tasks/cancel",
-        ]);
-        async function a2aRpc(method, params) {
-            const url = `${GC_BASE}/a2a`;
-            const id = Date.now();
-            const body = { jsonrpc: "2.0", id, method, params };
-            const resp = await daemonFetch(url, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify(body),
-                signal: AbortSignal.timeout(15_000),
-            });
-            const data = await resp.json();
-            if (data.error) {
-                throw new Error(`A2A ${method} error: ${data.error.message || JSON.stringify(data.error)}`);
-            }
-            return data.result;
+        if (existsSync(localPath))
+            return localPath;
+        throw new Error("resolve-bridge.py not found");
+    }
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOL — A2A (Agent-to-Agent Protocol)
+    // ════════════════════════════════════════════════════════════════
+    const A2A_RPC_METHODS = new Set([
+        "message/send",
+        "tasks/get",
+        "tasks/cancel",
+    ]);
+    async function a2aRpc(method, params) {
+        const url = `${GC_BASE}/a2a`;
+        const id = Date.now();
+        const body = { jsonrpc: "2.0", id, method, params };
+        const resp = await daemonFetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(15_000),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            throw new Error(`A2A ${method} error: ${data.error.message || JSON.stringify(data.error)}`);
         }
-        server.registerTool("gc_a2a", {
-            description: `Agent-to-Agent (A2A) protocol client. Interact with the A2A broker to create tasks, check status, cancel tasks, and discover agent capabilities.
+        return data.result;
+    }
+    server.registerTool("gc_a2a", {
+        description: `Agent-to-Agent (A2A) protocol client. Interact with the A2A broker to create tasks, check status, cancel tasks, and discover agent capabilities.
 
 Actions:
 - **send**: Create a new A2A task (message/send). Params: message (with role + parts), worker (optional target agent), idempotencyKey (optional dedup).
@@ -3723,149 +3727,145 @@ Actions:
 
 The A2A protocol follows the Google A2A specification (JSON-RPC 2.0 over HTTP).
 Task states: submitted → working → completed | failed | canceled | rejected.`,
-            inputSchema: z.object({
-                action: z
-                    .enum([
-                    "send",
-                    "get",
-                    "cancel",
-                    "card",
-                    "list",
-                    "register",
-                    "inbox",
-                    "respond",
-                ])
-                    .describe("A2A action to perform"),
-                // send / get / cancel
-                id: z.string().optional().describe("Task ID (for get/cancel)"),
-                message: z
-                    .object({
-                    role: z
-                        .string()
-                        .optional()
-                        .describe("Message role (default: user)"),
-                    parts: z
-                        .array(z.object({
-                        type: z.string().describe("Part type (e.g. 'text')"),
-                        text: z.string().optional().describe("Text content"),
-                    }))
-                        .optional()
-                        .describe("Message parts"),
-                    taskId: z
-                        .string()
-                        .optional()
-                        .describe("Explicit task ID (auto-generated if omitted)"),
-                    contextId: z
-                        .string()
-                        .optional()
-                        .describe("Context ID for conversation threading"),
-                    metadata: z
-                        .record(z.unknown())
-                        .optional()
-                        .describe("Message metadata"),
-                })
-                    .optional()
-                    .describe("Message payload (for send action)"),
-                worker: z
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "send",
+                "get",
+                "cancel",
+                "card",
+                "list",
+                "register",
+                "inbox",
+                "respond",
+            ])
+                .describe("A2A action to perform"),
+            // send / get / cancel
+            id: z.string().optional().describe("Task ID (for get/cancel)"),
+            message: z
+                .object({
+                role: z
                     .string()
                     .optional()
-                    .describe("Target worker agent name (for send action)"),
-                idempotencyKey: z
+                    .describe("Message role (default: user)"),
+                parts: z
+                    .array(z.object({
+                    type: z.string().describe("Part type (e.g. 'text')"),
+                    text: z.string().optional().describe("Text content"),
+                }))
+                    .optional()
+                    .describe("Message parts"),
+                taskId: z
                     .string()
                     .optional()
-                    .describe("Deduplication key (for send action)"),
-                // card
-                name: z.string().optional().describe("Agent name (for card action)"),
-                // list / inbox
-                state: z
+                    .describe("Explicit task ID (auto-generated if omitted)"),
+                contextId: z
                     .string()
                     .optional()
-                    .describe("Filter by task state (for list)"),
-                worker_agent: z
-                    .string()
+                    .describe("Context ID for conversation threading"),
+                metadata: z
+                    .record(z.unknown())
                     .optional()
-                    .describe("Filter by worker agent (for list/inbox)"),
-                // register
-                agent_name: z
-                    .string()
-                    .optional()
-                    .describe("Agent name to register (for register action)"),
-                card_url: z
-                    .string()
-                    .optional()
-                    .describe("Agent card URL (for register action)"),
-                cascade_priority: z
-                    .array(z.string())
-                    .optional()
-                    .describe("Cascade priority list (for register action)"),
-                // respond
-                task_id: z
-                    .string()
-                    .optional()
-                    .describe("Task ID to respond to (for respond action)"),
-            }),
-        }, async (params) => {
-            try {
-                switch (params.action) {
-                    case "send": {
-                        const rpcParams = clean({
-                            message: params.message,
-                            worker: params.worker,
-                            idempotencyKey: params.idempotencyKey,
-                        });
-                        const result = await a2aRpc("message/send", rpcParams);
-                        return text(JSON.stringify(result, null, 2));
-                    }
-                    case "get": {
-                        const result = await a2aRpc("tasks/get", { id: params.id });
-                        return text(JSON.stringify(result, null, 2));
-                    }
-                    case "cancel": {
-                        const result = await a2aRpc("tasks/cancel", { id: params.id });
-                        return text(JSON.stringify(result, null, 2));
-                    }
-                    case "card": {
-                        const result = await gcGet(`/.well-known/agents/${params.name}.json`);
-                        return text(JSON.stringify(result, null, 2));
-                    }
-                    // Admin actions — route through /gc/a2a_admin
-                    case "register":
-                        return daemonCall("/gc/a2a_admin", {
-                            action: "register",
-                            agent_name: params.agent_name,
-                            card_url: params.card_url,
-                            cascade_priority: params.cascade_priority,
-                        });
-                    case "inbox":
-                        return daemonCall("/gc/a2a_admin", {
-                            action: "inbox",
-                            worker_agent: params.worker_agent,
-                        });
-                    case "respond":
-                        return daemonCall("/gc/a2a_admin", {
-                            action: "respond",
-                            task_id: params.task_id,
-                            state: params.state,
-                            message: params.message,
-                        });
-                    case "list":
-                        return daemonCall("/gc/a2a_admin", {
-                            action: "list",
-                            state: params.state,
-                            worker_agent: params.worker_agent,
-                        });
-                    default:
-                        return err(`Unknown A2A action: ${params.action}`);
+                    .describe("Message metadata"),
+            })
+                .optional()
+                .describe("Message payload (for send action)"),
+            worker: z
+                .string()
+                .optional()
+                .describe("Target worker agent name (for send action)"),
+            idempotencyKey: z
+                .string()
+                .optional()
+                .describe("Deduplication key (for send action)"),
+            // card
+            name: z.string().optional().describe("Agent name (for card action)"),
+            // list / inbox
+            state: z
+                .string()
+                .optional()
+                .describe("Filter by task state (for list)"),
+            worker_agent: z
+                .string()
+                .optional()
+                .describe("Filter by worker agent (for list/inbox)"),
+            // register
+            agent_name: z
+                .string()
+                .optional()
+                .describe("Agent name to register (for register action)"),
+            card_url: z
+                .string()
+                .optional()
+                .describe("Agent card URL (for register action)"),
+            cascade_priority: z
+                .array(z.string())
+                .optional()
+                .describe("Cascade priority list (for register action)"),
+            // respond
+            task_id: z
+                .string()
+                .optional()
+                .describe("Task ID to respond to (for respond action)"),
+        }),
+    }, async (params) => {
+        try {
+            switch (params.action) {
+                case "send": {
+                    const rpcParams = clean({
+                        message: params.message,
+                        worker: params.worker,
+                        idempotencyKey: params.idempotencyKey,
+                    });
+                    const result = await a2aRpc("message/send", rpcParams);
+                    return text(JSON.stringify(result, null, 2));
                 }
+                case "get": {
+                    const result = await a2aRpc("tasks/get", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "cancel": {
+                    const result = await a2aRpc("tasks/cancel", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "card": {
+                    const result = await gcGet(`/.well-known/agents/${params.name}.json`);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                // Admin actions — route through /gc/a2a_admin
+                case "register":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "register",
+                        agent_name: params.agent_name,
+                        card_url: params.card_url,
+                        cascade_priority: params.cascade_priority,
+                    });
+                case "inbox":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "inbox",
+                        worker_agent: params.worker_agent,
+                    });
+                case "respond":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "respond",
+                        task_id: params.task_id,
+                        state: params.state,
+                        message: params.message,
+                    });
+                case "list":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "list",
+                        state: params.state,
+                        worker_agent: params.worker_agent,
+                    });
+                default:
+                    return err(`Unknown A2A action: ${params.action}`);
             }
-            catch (e) {
-                return err(`gc_a2a error: ${describeError(e)}`);
-            }
-        });
-        if (existsSync(localPath))
-            return localPath;
-        throw new Error("resolve-bridge.py not found");
-    }
+        }
+        catch (e) {
+            return err(`gc_a2a error: ${describeError(e)}`);
+        }
+    });
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Hot Config Reload
     // ════════════════════════════════════════════════════════════════
