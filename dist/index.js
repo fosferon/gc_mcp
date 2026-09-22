@@ -2971,7 +2971,13 @@ Actions:
   - overview — bounded operational state for active runs, recent failures, and attention signals
   - detail — per-step breakdown for an execution, each step with its result
   - context — one step's stored output (key = step id), pageable
-  - resume — re-run from a checkpoint
+  - resume — continue a waiting/halted/failed run from its checkpoint. ASYNC BY
+    DEFAULT: answers { status: "resumed", execution_id } at once and the run
+    carries on server-side — follow with action:watch or action:wait. Pass
+    async: false to hold the call until the next checkpoint (a stage can take
+    7-20 minutes). from_step: "<step_id>" re-runs from an EARLIER step of the
+    run (it re-does work, it never skips a gate); a halt with on_resume goes
+    where the YAML says; a halt whose next step is another halt is refused.
   - wait — bounded poll until terminal state or timeout
   - watch — stream daemon SSE continuity through MCP progress notifications, then return the terminal event
   - cancel — stop one execution and cancel any backing Oban workflow job
@@ -3079,7 +3085,11 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 .describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["gc_daemon"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
             async: zBoolean()
                 .optional()
-                .describe("If true, run returns immediately with execution_id (run action only)"),
+                .describe("run: if true, return immediately with execution_id. resume: defaults to TRUE (answers 'resumed' at once); pass false to wait for the next checkpoint."),
+            from_step: z
+                .string()
+                .optional()
+                .describe("resume: the step id to run again — an earlier step of the run, never the one it stopped at or a later one (GC-5425). Omit to continue from the checkpoint (or the halt's on_resume target)."),
             status: z
                 .string()
                 .optional()
@@ -3151,14 +3161,20 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         if (normalized.execution_id && !normalized.id) {
             normalized.id = normalized.execution_id;
         }
+        // GC-5452: resume is async unless the caller says otherwise. The daemon
+        // has run resumes in a supervised task since GC-5439; holding an HTTP
+        // request for a whole 7-20 minute stage was the shim's habit, not a need.
+        if (params.action === "resume" && normalized.async === undefined) {
+            normalized.async = true;
+        }
         // Compute client-side HTTP timeout:
         // - async: true → 15s (daemon returns immediately)
         // - timeout: none/infinity/infinite → null (no abort)
         // - timeout: N → N * 1000
-        // - resume (no explicit timeout) → null: the daemon answers a resume only
-        //   when the run reaches its next checkpoint, and a stage routinely takes
-        //   7-20 minutes, so any fixed default reports a failure that did not
-        //   happen (GC-5374)
+        // - sync resume (async: false, no explicit timeout) → null: the daemon
+        //   answers a resume only when the run reaches its next checkpoint, and a
+        //   stage routinely takes 7-20 minutes, so any fixed default reports a
+        //   failure that did not happen (GC-5374)
         // - run/wait/watch (no explicit timeout) → 300s default (a sync run is
         //   promoted to async by the daemon at its own 5 min cap)
         // - everything else → 15s default
@@ -3167,7 +3183,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             params.action === "resume" ||
             params.action === "wait" ||
             params.action === "watch";
-        if (params.async) {
+        if (normalized.async) {
             clientTimeoutMs = 15_000; // async returns immediately
         }
         else if (isNoDeadline(params.timeout)) {
