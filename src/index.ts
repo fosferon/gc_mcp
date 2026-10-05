@@ -3880,10 +3880,11 @@ identity and a draft->approve autonomy level; every outbound message lands in th
 Read:      summary, coverage, messages, search, get_message, thread, summarize_thread, attachments, financial, burn_rate, outbound
 Send:      draft, send, reply, approve_draft
 Ingest:    scan, ocr, extract_financials, extract_attachments
-Endpoints: endpoints, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
+Endpoints: endpoints, folders, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
 Derive:    create_issue_from_message, create_reminder_from_message, create_event_from_message, create_cash_entry_from_financial
 Senders:   seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfill_senders
-Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.`,
+Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.
+Use 'folders' (needs endpoint_id) when a scan reports 0 new messages but the mailbox is not empty: it lists what the server actually has and names the configured scan_folders that are missing. Gmail's "[Gmail]/All Mail" is localised per account language and its IMAP visibility is a per-label toggle, so the same folder string can work for one account and not the next.`,
     inputSchema: z.object({
       action: z
         .enum([
@@ -3911,6 +3912,7 @@ Start with 'coverage' to see how far back mail has actually been collected befor
           "extract_attachments",
           // Endpoints
           "endpoints",
+          "folders",
           "add_endpoint",
           "update_endpoint",
           "remove_endpoint",
