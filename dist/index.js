@@ -3319,7 +3319,7 @@ Use 'folders' (needs endpoint_id) when a scan reports 0 new messages but the mai
             endpoint_id: z
                 .string()
                 .optional()
-                .describe("Endpoint to act on: scan, coverage, extract_attachments, outbound, and the sending identity for draft/send/reply"),
+                .describe("Endpoint to act on: scan, coverage, folders, extract_attachments, outbound, and the sending identity for draft/send/reply"),
             // Message queries
             category: z
                 .string()
