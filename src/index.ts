@@ -3733,10 +3733,11 @@ identity and a draft->approve autonomy level; every outbound message lands in th
 Read:      summary, coverage, messages, search, get_message, thread, summarize_thread, attachments, financial, burn_rate, outbound
 Send:      draft, send, reply, approve_draft
 Ingest:    scan, ocr, extract_financials, extract_attachments
-Endpoints: endpoints, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
+Endpoints: endpoints, folders, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
 Derive:    create_issue_from_message, create_reminder_from_message, create_event_from_message, create_cash_entry_from_financial
 Senders:   seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfill_senders
-Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.`,
+Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.
+Use 'folders' with endpoint_id to inspect the server's available and configured scan folders without scanning mail.`,
     inputSchema: z.object({
       action: z
         .enum([
@@ -3764,6 +3765,7 @@ Start with 'coverage' to see how far back mail has actually been collected befor
           "extract_attachments",
           // Endpoints
           "endpoints",
+          "folders",
           "add_endpoint",
           "update_endpoint",
           "remove_endpoint",
@@ -3805,7 +3807,7 @@ Start with 'coverage' to see how far back mail has actually been collected befor
         .string()
         .optional()
         .describe(
-          "Endpoint to act on: scan, coverage, extract_attachments, outbound, and the sending identity for draft/send/reply",
+          "Endpoint to act on: scan, coverage, folders, extract_attachments, outbound, and the sending identity for draft/send/reply",
         ),
 
       // Message queries
