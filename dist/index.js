@@ -460,8 +460,9 @@ function isZodV4Schema(schema) {
     // Schema (so `~standard` is not a version discriminator).
     return !(schema instanceof z.ZodType);
 }
-function unsupportedRootParameterMessage(shape) {
-    return `Unsupported top-level MCP parameter(s). Accepted parameters: ${Object.keys(shape).sort().join(", ") || "(none)"}.`;
+function unsupportedRootParameterMessage(shape, rejected = []) {
+    const named = rejected.length ? ` Rejected: ${rejected.join(", ")}.` : "";
+    return `Unsupported top-level MCP parameter(s).${named} Accepted parameters: ${Object.keys(shape).sort().join(", ") || "(none)"}.`;
 }
 function hasRootRefinement(inputSchema) {
     const definition = inputSchema.def;
@@ -477,7 +478,13 @@ function unsupportedRootSchema() {
  */
 function strictRootInputSchema(inputSchema) {
     if (inputSchema === undefined) {
-        return z.object({}).strict(unsupportedRootParameterMessage({}));
+        return z
+            .object({}, {
+            errorMap: (issue, ctx) => issue.code === "unrecognized_keys"
+                ? { message: unsupportedRootParameterMessage({}, issue.keys) }
+                : { message: ctx.defaultError },
+        })
+            .strict();
     }
     const rawShape = isRawShape(inputSchema);
     const objectSchema = inputSchema;
@@ -496,14 +503,22 @@ function strictRootInputSchema(inputSchema) {
     if (usesZodV4 && !fields.every(isZodV4Schema)) {
         throw new TypeError("MCP tool inputSchema cannot mix Zod v3 and v4 fields.");
     }
-    const message = unsupportedRootParameterMessage(rootShape);
-    // Zod v3 exposes a public strict(message) overload, so retain the original
-    // object (and any object-level behavior) when one was registered.
-    if (!usesZodV4 && !rawShape && typeof objectSchema.strict === "function") {
-        return objectSchema.strict(message);
+    // Newer SDKs surface only the issue message, not issue.keys, so the message
+    // is built per issue to keep naming the rejected parameter(s).
+    const v3ErrorMap = (issue, ctx) => issue.code === "unrecognized_keys"
+        ? { message: unsupportedRootParameterMessage(rootShape, issue.keys) }
+        : { message: ctx.defaultError };
+    if (!usesZodV4 && !rawShape && objectSchema instanceof z.ZodObject) {
+        return new z.ZodObject({
+            ...objectSchema._def,
+            unknownKeys: "strict",
+            errorMap: v3ErrorMap,
+        });
     }
     if (!usesZodV4) {
-        return z.object(rootShape).strict(message);
+        return z
+            .object(rootShape, { errorMap: v3ErrorMap })
+            .strict();
     }
     // Zod v4's strict() has no per-schema error argument. Recreate only its
     // public object shape with a public error callback so the recovery message
@@ -511,7 +526,9 @@ function strictRootInputSchema(inputSchema) {
     // raw shapes to the SDK's normalizable v4 Classic object form.
     return z4
         .object(rootShape, {
-        error: (issue) => issue.code === "unrecognized_keys" ? message : undefined,
+        error: (issue) => issue.code === "unrecognized_keys"
+            ? unsupportedRootParameterMessage(rootShape, issue.keys)
+            : undefined,
     })
         .strict();
 }
