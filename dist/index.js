@@ -3029,7 +3029,25 @@ Actions:
   - list_workflows — list YAML definitions (defaults to summary: name/file/description/size)
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
-  - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime)
+  - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime).
+    Takes an execution id, never a workflow name: to read a definition use get_workflow.
+  - get_workflow — one workflow definition: { workflow: { name, file, path, source
+    ("user" | "bundled"), protected, description, size_bytes, body } }. Takes name.
+  - define — propose a new workflow (refused if the name exists). update —
+    propose a replacement (refused if it does not exist). Both take name + yaml
+    (the full YAML body) and NEVER write by themselves:
+      * the body is validated with the workflow parser and compiler; an invalid
+        body is refused with the parser's error;
+      * a name with anything but lowercase letters, digits, _ and - is refused;
+      * the parity-protected workflows (development-*, support-*) are refused —
+        change those in gc_daemon priv/workflows and sync;
+      * a valid proposal is STAGED and answered with an error carrying
+        recovery { kind: "needs_confirmation", confirm_id, expires_at,
+        operator_prompt (with a diff), tool_result_for_model }. The operator
+        confirms or rejects it in the GUI. You cannot confirm it: do not retry,
+        and follow tool_result_for_model.
+    Once confirmed the write is atomic, audited, an update's old body is backed
+    up, and the next run reads the new body.
   - report — reliability summary, stale-running detection, recent failures
   - overview — bounded operational state for active runs, recent failures, and attention signals
   - detail — per-step breakdown for an execution, each step with its result
@@ -3136,12 +3154,27 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
                 "delete",
                 "prune",
                 "repair_stale",
+                "get_workflow",
+                "define",
+                "update",
             ])
                 .describe("Action to perform"),
             workflow: z
                 .string()
                 .optional()
-                .describe("Workflow name (for run/resume)"),
+                .describe("Workflow name for run/resume (also accepted as name for get_workflow/define/update). show/get_execution take an execution id, not this."),
+            name: z
+                .string()
+                .optional()
+                .describe("get_workflow/define/update: the workflow name (letters, digits, _ and -; define/update take lowercase only)"),
+            yaml: z
+                .string()
+                .optional()
+                .describe("define/update: the full workflow YAML body, validated before anything is written"),
+            actor: z
+                .string()
+                .optional()
+                .describe("define/update: who is writing, recorded in the write audit"),
             params: z
                 .string()
                 .optional()
@@ -3224,6 +3257,10 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         if (normalized.execution_id && !normalized.id) {
             normalized.id = normalized.execution_id;
         }
+        // GC-6365: a workflow write is confirmed by the operator in the GUI
+        // (confirm_write, which is not in this schema). Never forward an approval
+        // a model put in its arguments, whatever the schema let through.
+        delete normalized.approval;
         // GC-5452: resume is async unless the caller says otherwise. The daemon
         // has run resumes in a supervised task since GC-5439; holding an HTTP
         // request for a whole 7-20 minute stage was the shim's habit, not a need.
