@@ -221,6 +221,13 @@ function truncateResponse(
   );
 }
 
+// GC-6364: a dispatch report past the cap could not be read at all — the
+// daemon had no paging. It pages in bytes now; say so where the cut lands.
+const DISPATCH_OUTPUT_TRUNCATION_HINT =
+  "This is a dispatch report. Read it in pages: action:output job_id:<id> " +
+  "offset:<n> limit:10000 (bytes) — the response carries total_bytes and " +
+  "next_offset; pass next_offset back as offset until it is null.";
+
 // GC-5424: a truncated workflow read used to end in the generic hint above,
 // and the agent reading a 60k-character run never learned that one step's
 // output can be fetched on its own and in pages.
@@ -3300,8 +3307,10 @@ server.registerTool(
   "gc_dispatch",
   {
     description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
-Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result; page a long report with offset/limit in bytes), list (query jobs), dismiss (hide noisy job), delete (remove one), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
+
+Reading output: action=output returns the whole report by default, with total_bytes. A report longer than this tool's 16k-character response cap must be paged: offset/limit are BYTES of the UTF-8 report (a page never splits a character, and is never empty). Each page carries total_bytes, offset, returned_bytes, truncated and next_offset (null on the last page); pass next_offset back as offset. A limit of about 10000 keeps a page under the cap.
 
 Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
 Do not inspect past sessions to guess provider/model defaults. Use list_agents, list_providers, list_models, and especially resolve_dispatch instead.
@@ -3452,7 +3461,14 @@ Claude-specific permission controls:
         .describe("Preview repair_stale without mutating"),
       limit: zNumber()
         .optional()
-        .describe("Max rows to return/delete (list/prune)"),
+        .describe(
+          "list/prune: max rows to return/delete. output: page size in BYTES of the report (snapped back to a whole UTF-8 character; never empty). About 10000 keeps a page under this tool's 16k response cap.",
+        ),
+      offset: zNumber()
+        .optional()
+        .describe(
+          "output: byte offset to start the page at (default 0; moved back to the start of the character it falls in). Pass the previous page's next_offset. Without offset/limit the whole report is returned.",
+        ),
     }),
   },
   async (params) => {
@@ -3475,7 +3491,13 @@ Claude-specific permission controls:
         clientTimeoutMs = 1_800_000 + 10_000; // daemon default + buffer
       }
     }
-    return daemonCall("/gc/dispatch", params, clientTimeoutMs);
+    return daemonCall(
+      "/gc/dispatch",
+      params,
+      clientTimeoutMs,
+      MAX_RESPONSE_CHARS,
+      params.action === "output" ? DISPATCH_OUTPUT_TRUNCATION_HINT : undefined,
+    );
   },
 );
 
