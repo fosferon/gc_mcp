@@ -2145,7 +2145,51 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
         .array(z.string())
         .optional()
         .describe("For query/count/register_intent: match any of these project IDs."),
-      parent: z.string().optional().describe("Parent issue ID (for sub-tasks)"),
+      parent: z
+        .string()
+        .optional()
+        .describe(
+          "create/update: the parent issue ID to set. Flat list/query/count: a filter for that issue's direct children, an alias for under + depth:1 (not together with under; list mode:\"tree\" rejects it).",
+        ),
+      under: z
+        .string()
+        .optional()
+        .describe(
+          "For list/query/count/register_intent: only descendants of this issue over parent edges; the issue itself is excluded unless include_root. An unknown ID is an error, not an empty result.",
+        ),
+      include_root: zBoolean()
+        .optional()
+        .describe("For list/query/count with under: also return the under issue itself (depth 0)."),
+      after: z
+        .string()
+        .optional()
+        .describe(
+          "For query: the `next` cursor from the previous page (keyset paging, stable while issues change; not with offset).",
+        ),
+      fold: zBoolean()
+        .optional()
+        .describe("For query: roll each returned issue's subtree up into it (requires depth)."),
+      keep_ancestors: zBoolean()
+        .optional()
+        .describe("For query: keep the ancestors of matching issues as context rows."),
+      has_children: zBoolean()
+        .optional()
+        .describe("For query/count: only issues that have (true) or lack (false) children."),
+      blocked: zBoolean()
+        .optional()
+        .describe(
+          "For query/count: only open issues gated (true) or not gated (false) by an unresolved blocks/waits_for/conditional_blocks edge.",
+        ),
+      labels_any: z
+        .array(z.string())
+        .optional()
+        .describe("For query/count: match issues carrying any of these labels (labels matches all)."),
+      issue_types: z
+        .array(z.string())
+        .optional()
+        .describe("For query/count: match any of these issue types."),
+      priority_min: zNumber().optional().describe("For query/count: minimum priority, inclusive."),
+      priority_max: zNumber().optional().describe("For query/count: maximum priority, inclusive."),
       labels: z.array(z.string()).optional().describe("Labels"),
       id: z.string().optional().describe("Issue ID (number or full ID)"),
       depends_on: z.string().optional().describe("Issue ID this depends on"),
@@ -2217,7 +2261,9 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
         .describe("Traversal direction; defaults to blockers."),
       depth: zNumber()
         .optional()
-        .describe("Maximum graph depth (traverse defaults 3, max 10; critical_path max 100)."),
+        .describe(
+          "Maximum graph depth (traverse defaults 3, max 10; critical_path max 100). For list/query/count: the deepest parent level returned, 0..10 (1 = direct children of under).",
+        ),
       dependency_type: z
         .enum([
           "blocks",
