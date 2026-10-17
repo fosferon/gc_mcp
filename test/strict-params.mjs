@@ -374,6 +374,55 @@ try {
   );
   assert.equal(daemonRequests, 3, "valid composable query reaches gc_daemon");
 
+  // GC-6363: the parent-tree fields the daemon's query/list/count read must be
+  // reachable. The strict root schema rejects any key it does not declare, so an
+  // undeclared `under` was not stripped but refused before reaching gc_daemon.
+  const workTreeResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_work",
+        arguments: {
+          action: "query",
+          under: "GC-5128",
+          depth: 2,
+          include_root: true,
+          after: "cursor-token",
+          fold: true,
+          keep_ancestors: true,
+          has_children: false,
+          blocked: true,
+          labels_any: ["ui"],
+          issue_types: ["task"],
+          priority_min: 1,
+          priority_max: 9,
+        },
+      },
+    },
+    {},
+  );
+
+  assert.notEqual(
+    workTreeResult.isError,
+    true,
+    `gc_work must accept the parent-tree query fields: ${workTreeResult.content?.[0]?.text}`,
+  );
+  assert.equal(daemonRequests, 4, "valid tree query reaches gc_daemon");
+  assert.equal(daemonBody.under, "GC-5128");
+  assert.equal(daemonBody.include_root, true);
+  assert.equal(daemonBody.after, "cursor-token");
+
+  const workParentList = await callToolHandler(
+    {
+      method: "tools/call",
+      params: { name: "gc_work", arguments: { action: "list", parent: "5128" } },
+    },
+    {},
+  );
+  assert.notEqual(workParentList.isError, true, "list parent is forwarded to gc_daemon");
+  assert.equal(daemonRequests, 5, "list parent reaches gc_daemon");
+  assert.deepEqual(daemonBody, { action: "list", parent: "5128" });
+
   const requestsBeforeInvalidNotify = daemonRequests;
   const invalidNotifyStatus = await callToolHandler(
     {
@@ -507,7 +556,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 7, "valid calls reach gc_daemon");
+  assert.equal(daemonRequests, 9, "valid calls reach gc_daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },
