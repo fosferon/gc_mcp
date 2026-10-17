@@ -570,6 +570,44 @@ try {
   };
 
   process.stdout.write("Verified response truncation for oversized daemon payloads.\n");
+
+  // GC-6364: gc_dispatch output pages in bytes. offset/limit must reach the
+  // daemon (the strict schema rejected offset before), and a cut dispatch
+  // report must say how to read the rest.
+  daemonBody = null;
+  const pagedResult = await callToolHandler(
+    {
+      method: "tools/call",
+      params: {
+        name: "gc_dispatch",
+        arguments: { action: "output", job_id: "j1", offset: "12000", limit: 10000 },
+      },
+    },
+    {},
+  );
+  assert.notEqual(pagedResult.isError, true, "gc_dispatch output must accept offset/limit");
+  assert.deepEqual(daemonBody, { action: "output", job_id: "j1", offset: 12000, limit: 10000 });
+
+  globalThis.fetch = async () =>
+    new Response(JSON.stringify({ ok: true, data: { output: "r".repeat(20_000) } }), {
+      status: 200,
+    });
+
+  const bigDispatch = await callToolHandler(
+    {
+      method: "tools/call",
+      params: { name: "gc_dispatch", arguments: { action: "output", job_id: "j1" } },
+    },
+    {},
+  );
+  const bigDispatchText = bigDispatch.content?.[0]?.text || "";
+  assert.ok(bigDispatchText.includes("[TRUNCATED"), "a cut dispatch report is marked");
+  assert.ok(
+    bigDispatchText.includes("next_offset") && bigDispatchText.includes("offset:<n>"),
+    "a cut dispatch report names the paging parameters",
+  );
+
+  process.stdout.write("Verified gc_dispatch output paging parameters and hint.\n");
 } finally {
   McpServer.prototype.connect = originalConnect;
   McpServer.prototype.registerTool = originalRegisterTool;
