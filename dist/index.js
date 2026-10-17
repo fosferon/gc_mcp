@@ -2992,7 +2992,7 @@ Actions:
     (the full YAML body) and NEVER write by themselves:
       * the body is validated with the workflow parser and compiler; an invalid
         body is refused with the parser's error;
-      * a name with anything but letters, digits, _ and - is refused;
+      * a name with anything but lowercase letters, digits, _ and - is refused;
       * the parity-protected workflows (development-*, support-*) are refused —
         change those in gc_daemon priv/workflows and sync;
       * a valid proposal is STAGED and answered with an error carrying
@@ -3120,7 +3120,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             name: z
                 .string()
                 .optional()
-                .describe("get_workflow/define/update: the workflow name (letters, digits, _ and - only)"),
+                .describe("get_workflow/define/update: the workflow name (letters, digits, _ and -; define/update take lowercase only)"),
             yaml: z
                 .string()
                 .optional()
