@@ -1749,7 +1749,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             parent: z
                 .string()
                 .optional()
-                .describe("create/update: the parent issue ID to set. list/query/count: a filter for that issue's direct children, an alias for under + depth:1 (not together with under)."),
+                .describe("create/update: the parent issue ID to set. Flat list/query/count: a filter for that issue's direct children, an alias for under + depth:1 (not together with under; list mode:\"tree\" rejects it)."),
             under: z
                 .string()
                 .optional()
