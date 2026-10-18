@@ -1,6 +1,6 @@
 {
   "name": "@fosferon/gc-mcp",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "description": "Universal MCP server for Grand Central — exposes REDACTED API as MCP tools",
   "keywords": [
     "mcp",
