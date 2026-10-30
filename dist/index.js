@@ -3401,6 +3401,7 @@ Use 'folders' (needs endpoint_id) when a scan reports 0 new messages but the mai
                 "dismiss_sender",
                 "ignore_sender",
                 "backfill_senders",
+                "repair_sender_queue",
             ])
                 .describe("Action to perform"),
             // Identifiers
@@ -3441,6 +3442,9 @@ Use 'folders' (needs endpoint_id) when a scan reports 0 new messages but the mai
                 .optional()
                 .describe("Filter messages to those with attachments"),
             limit: zNumber().optional().describe("Max results"),
+            dry_run: zBoolean()
+                .optional()
+                .describe("repair_sender_queue: report invalid UTF-8 rows without rewriting them (default true; pass false to apply)"),
             fetch_body: zBoolean()
                 .optional()
                 .describe("get_message: fetch the full body over IMAP instead of the stored preview"),
