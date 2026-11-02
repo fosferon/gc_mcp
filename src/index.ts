@@ -2698,6 +2698,48 @@ Actions: add, update, delete, get, query, runway, monthly, forecast, drift.`,
 );
 
 // ════════════════════════════════════════════════════════════════
+// DAEMON TOOLS — Leases (GC-6722)
+// ════════════════════════════════════════════════════════════════
+
+server.registerTool(
+  "gc_lease",
+  {
+    description: `Leases on shared resources: counted host:heavy slots (full test suites, test DBs; default 2) and exclusive landing:<repo> (Gate → merge → deploy). FIFO waiting; liveness by heartbeat + TTL (a lapsed lease expires and the next waiter is admitted).
+Actions: acquire (returns state held | waiting+position | busy; poll by passing lease_id back), heartbeat, release (idempotent), list, show.
+For commands prefer the wrapper: gc-lease run <resource> --issue GC-N -- <cmd>.`,
+    inputSchema: z.object({
+      action: z
+        .enum(["acquire", "heartbeat", "release", "list", "show"])
+        .describe("Action to perform"),
+      resource: z
+        .string()
+        .optional()
+        .describe("Resource, e.g. host:heavy or landing:REDACTED_umbrella (acquire; optional filter for list)"),
+      holder: z
+        .string()
+        .optional()
+        .describe("Holder label: session/job/agent (acquire)"),
+      issue: z.string().optional().describe("Bee issue, e.g. GC-6722"),
+      cwd: z.string().optional().describe("Working directory of the holder"),
+      pid: zNumber().optional().describe("Holder pid, if any"),
+      ttl_s: zNumber()
+        .optional()
+        .describe("Liveness window in seconds, 5-3600 (default 90); heartbeat within it"),
+      wait: zBoolean()
+        .optional()
+        .describe("acquire: queue when no slot is free (default true); false returns state busy"),
+      lease_id: z
+        .string()
+        .optional()
+        .describe("Lease token (heartbeat/release/show; acquire to poll a queued request)"),
+      history: zBoolean().optional().describe("list: include recently ended leases"),
+      limit: zNumber().optional().describe("list: max history rows"),
+    }),
+  },
+  async (params) => daemonCall("/gc/lease", params),
+);
+
+// ════════════════════════════════════════════════════════════════
 // DAEMON TOOLS — Publishing
 // ════════════════════════════════════════════════════════════════
 
