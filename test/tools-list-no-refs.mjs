@@ -54,7 +54,7 @@ try {
   // must be in the list by name.
   const advertised = [
     "gc_a2a", "gc_capability", "gc_capability_watch", "gc_checkpoint", "gc_control",
-    "gc_convergence", "gc_cost", "gc_dispatch", "gc_docs", "gc_hindsight", "gc_onboarding",
+    "gc_convergence", "gc_cost", "gc_dispatch", "gc_docs", "gc_hindsight", "gc_lease", "gc_onboarding",
     "gc_peer_conversation", "gc_plan", "gc_posture", "gc_recall", "gc_reload", "gc_retain",
     "gc_run", "gc_ticker", "gc_work", "gc_workflow", "gc_workflow_watch", "davinci_resolve",
   ];
