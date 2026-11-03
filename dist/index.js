@@ -1092,7 +1092,7 @@ Actions: health, recall, reflect, retain.`,
     server.registerTool("gc_conversation", {
         description: `Interactive AI conversation sessions (backend-neutral).
 Actions:
-- spawn: create a new session (persona/agent_name, optional config, make_apex)
+- spawn: create a new session (persona/agent_name is required, optional config; make_apex:true takes the Apex seat, otherwise the session never does)
 - turn: send a message and get the assistant response
 - submit_tool_results: provide results for pending tool calls
 - cut_in: inject an operator message into a running session
@@ -1115,13 +1115,13 @@ Actions:
                 "activate_apex",
             ])
                 .describe("Action to perform"),
-            persona: z.string().optional().describe("Persona/agent name (for spawn)"),
+            persona: z.string().optional().describe("Persona/agent name (for spawn; one of persona/agent_name/agent is required, else the daemon returns 400 target_required)"),
             agent_name: z.string().optional().describe("Alias for persona (for spawn)"),
             agent: z.string().optional().describe("Alias for persona (for spawn)"),
             config: z.record(z.any()).optional().describe("Session config object (for spawn)"),
             make_apex: zBoolean()
                 .optional()
-                .describe("Activate as apex after spawn (default true)"),
+                .describe("Take the Apex seat on spawn. Default false: a spawned session never displaces the seat unless this is true. The response's apex_active says whether it did."),
             session_id: z.string().optional().describe("Session ID (for turn/get/delete/etc.)"),
             id: z.string().optional().describe("Alias for session_id"),
             message: z.string().optional().describe("User message (for turn/cut_in)"),
