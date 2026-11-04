@@ -3079,7 +3079,7 @@ Actions:
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
   - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime).
-    A parent run's show and detail responses carry children: [{ child_id, workflow, step, status }], the child-only runs it started.
+    A parent run's show and detail responses carry children: [{ child_id, workflow, step, status, created_at }], the child-only runs it started.
     Takes an execution id, never a workflow name: to read a definition use get_workflow.
   - get_workflow — one workflow definition: { workflow: { name, file, path, source
     ("user" | "bundled"), protected, description, size_bytes, body } }. Takes name.
