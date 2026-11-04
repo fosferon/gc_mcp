@@ -21,6 +21,8 @@ try {
   assert.match(tool.description, /no shell/);
   assert.match(tool.description, /:lease_run_commands/);
   assert.match(tool.description, /contained/);
+  assert.match(tool.description, /constrains the executable prefix only/);
+  assert.match(tool.description, /does not restrict reads/);
   assert.match(instructions, /allowlisted argv/);
   process.stdout.write("gc_lease run schema + instructions verified.\n");
 } finally {
