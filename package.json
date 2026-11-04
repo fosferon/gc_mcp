@@ -38,7 +38,7 @@
   },
   "scripts": {
     "build": "tsc",
-    "test": "npm run build && node test/tools-list-no-refs.mjs && node test/strict-params.mjs && node test/long-call-timeout.mjs && node test/missing-undici.mjs",
+    "test": "npm run build && node test/tools-list-no-refs.mjs && node test/strict-params.mjs && node test/long-call-timeout.mjs && node test/missing-undici.mjs && node test/lease-run-schema.mjs && node test/lease-run-forward.mjs",
     "test:slow": "npm run build && GC_MCP_SLOW_TESTS=1 node test/long-call-timeout.mjs",
     "prepublishOnly": "npm test",
     "start": "node dist/index.js",

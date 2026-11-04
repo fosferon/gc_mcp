@@ -706,6 +706,7 @@ function buildMcpServer() {
       "gc_hindsight queries the deep-memory backend (Hindsight today; Foresight is expected to succeed it — the tool name is the stable contract, not the implementation).",
       "gc_conversation / gc_agent_conversation / gc_aden manage interactive chat sessions.",
       "gc_run watches and controls observable workflow/execution runs.",
+      "Heavy work rule: run full test suites, test-database setup and landings (Gate → merge → deploy) through gc_lease action:run {command, cwd, issue} (an allowlisted argv such as `mix test`, run contained), never as a raw shell command — the daemon queues them on shared slots, tells you 'queued, position N', and starts them when a slot frees. gc_dispatch of a CLI agent queues by itself the same way (response status queued, with position and resource; it starts when a slot frees), and workflow dispatch steps simply wait for a slot while the run stays running; there is nothing to configure in your harness.",
       "gc_checkpoint fetches and resolves approval checkpoints.",
       "gc_workflow_watch follows a workflow execution live via SSE.",
       "gc_work manages the Bee DAG — issues, dependencies, assignments.",
@@ -2710,11 +2711,11 @@ server.registerTool(
   "gc_lease",
   {
     description: `Leases on shared resources: counted host:heavy slots (full test suites, test DBs; default 2) and exclusive landing:<repo> (Gate → merge → deploy). FIFO waiting; liveness by heartbeat + TTL (a lapsed lease expires and the next waiter is admitted).
-Actions: acquire (returns state held | waiting+position | busy; poll by passing lease_id back), heartbeat, release (idempotent), list, show.
-For commands prefer the wrapper: gc-lease run <resource> --issue GC-N -- <cmd>.`,
+Actions: acquire (returns state held | waiting+position | busy; poll by passing lease_id back), heartbeat, release (idempotent), list, show, run.
+run: the daemon runs a heavy command for you under a lease (default resource host:heavy): {command, cwd, issue}. The command is a plain argv (no shell: no pipes, &&, ;, redirects, quotes, globs or VAR=x) and must start with a permitted prefix (daemon config :lease_run_commands; default: mix test, mix ecto.create|migrate|reset, npm test, npm run test, pnpm test, yarn test, cargo test, pytest); anything else is refused. The allowlist constrains the executable prefix only (e.g. 'mix test <path>' or 'pytest <dir>' run the code they point at). It runs contained: writes are limited to the cwd tree plus a private scratch dir, and the call is refused if the daemon cannot contain it. The network is loopback-only (other destinations are denied; loopback ports and unix sockets stay open except container-runtime sockets, so a local service there can relay what the child sends it) and the child gets an allowlisted environment (no credentials). Children can still read files under the home directory except the containment credential deny list. It answers at once with {job_id, status: running} or {job_id, status: queued, position, resource} and starts by itself when a slot frees. Read the result with gc_dispatch action:status / output job_id=… , or pass wait:true to block until it ends (output tail returned). If a wait:true call errors with a timeout or transport error, the job is still running in the daemon: poll gc_dispatch status with its job_id (a transport may cut a call off after about 5 minutes). resource may be another host: capacity kind, never host:agent or landing:*. cwd must be a directory under ~/Sites. Use this for full test suites, test-DB setup and landings; it needs no hook or install in your harness.`,
     inputSchema: z.object({
       action: z
-        .enum(["acquire", "heartbeat", "release", "list", "show"])
+        .enum(["acquire", "heartbeat", "release", "list", "show", "run"])
         .describe("Action to perform"),
       resource: z
         .string()
@@ -2739,9 +2740,18 @@ For commands prefer the wrapper: gc-lease run <resource> --issue GC-N -- <cmd>.`
         .describe("Lease token (heartbeat/release/show; acquire to poll a queued request)"),
       history: zBoolean().optional().describe("list: include recently ended leases"),
       limit: zNumber().optional().describe("list: max history rows"),
+      command: z
+        .string()
+        .optional()
+        .describe("run: argv command, plain words only, no shell syntax; must start with a daemon-allowlisted prefix such as `mix test`"),
+      timeout_ms: zNumber()
+        .optional()
+        .describe("run: kill the command after this many ms (default 1h, max 4h)"),
     }),
   },
-  async (params) => daemonCall("/gc/lease", params),
+  // run + wait:true holds the request until the command ends, so no client-side timeout.
+  async (params) =>
+    daemonCall("/gc/lease", params, params.action === "run" && params.wait ? null : 15_000),
 );
 
 // ════════════════════════════════════════════════════════════════
