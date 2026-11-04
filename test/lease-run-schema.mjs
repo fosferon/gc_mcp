@@ -18,6 +18,10 @@ try {
   const parsed = tool.inputSchema.safeParse({ action: "run", command: "mix test", cwd: "/x", issue: "GC-1", wait: "true", timeout_ms: "5000" });
   assert.ok(parsed.success, JSON.stringify(parsed.error?.issues));
   assert.match(tool.description, /run: the daemon runs a heavy command/);
+  assert.match(tool.description, /no shell/);
+  assert.match(tool.description, /:lease_run_commands/);
+  assert.match(tool.description, /contained/);
+  assert.match(instructions, /allowlisted argv/);
   process.stdout.write("gc_lease run schema + instructions verified.\n");
 } finally {
   McpServer.prototype.connect = originalConnect;
