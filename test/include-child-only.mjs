@@ -24,7 +24,7 @@ try {
 
   assert.match(tool.description, /include_child_only/);
   assert.match(tool.description, /Child-only workflows/);
-  assert.match(tool.description, /show and detail responses carry children: \[\{ child_id, workflow, step, status \}\]/);
+  assert.match(tool.description, /show and detail responses carry children: \[\{ child_id, workflow, step, status, created_at \}\]/);
   assert.match(tool.description, /explicit select by name always returns a child-only workflow/);
   process.stdout.write("gc_workflow include_child_only schema verified.\n");
 } finally {
