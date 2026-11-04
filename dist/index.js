@@ -1688,7 +1688,7 @@ Choose the narrow action that answers the question; do not read bee.db directly 
 - Blocking chain: critical_path {root? or project?, status?, dependency_types?, depth?}. Recursive neighborhood: traverse {id, direction, depth, dependency_types}.
 - Discover reusable capabilities before inventing policy: list_intents and list_measures.
 
-Read actions: query, count, list, search, ready, show, ask, list_intents, list_measures, projects, agents, critical_path, traverse, candidates, tree, rollup, who_blocks_whom, bottlenecks, agent_load, stale, focus.
+Read actions: query, count, list, search, ready, show, ask, ancestors (the parent chain of one issue, root first), list_intents, list_measures, projects, agents, critical_path, traverse, candidates, tree, rollup, who_blocks_whom, bottlenecks, agent_load, stale, focus.
 Write actions: create, update, done, cancel, comment, block, unblock, claim, release, register_intent, remove_intent, register_measure, measure, register_project, register_agent, assign, join_project, import_jsonl, backfill_projects.
 plan is a deprecated compatibility alias for critical_path; it is not the gc_plan scheduler.`,
         inputSchema: z.object({
@@ -1722,6 +1722,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
                 "claim",
                 "release",
                 "comment",
+                "ancestors",
                 "critical_path",
                 "plan",
                 "traverse",
