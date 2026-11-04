@@ -23,6 +23,7 @@ try {
   assert.match(tool.description, /contained/);
   assert.match(tool.description, /constrains the executable prefix only/);
   assert.match(tool.description, /loopback-only/);
+  assert.match(tool.description, /container-runtime sockets/);
   assert.match(tool.description, /allowlisted environment/);
   assert.match(tool.description, /can still read files under the home directory/);
   assert.match(instructions, /allowlisted argv/);
