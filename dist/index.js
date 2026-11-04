@@ -1738,7 +1738,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             ])
                 .describe("Bee operation; see the tool description for task-to-action recipes."),
             title: z.string().optional().describe("Issue title"),
-            description: z.string().optional().describe("Issue description"),
+            description: z.string().optional().describe("Issue description (create/update). For register_project: the project description."),
             priority: zNumber()
                 .optional()
                 .describe("Priority (higher = more important)"),
@@ -1889,7 +1889,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             attributes: z
                 .record(z.any())
                 .optional()
-                .describe("Project/agent attributes for registration."),
+                .describe("Registration attributes. register_project accepts exactly: name, path, status, description, repo_url, domain, stack, canonical_path (strings) and metadata (object); register_agent accepts exactly: name, type, status, capabilities. Any other key is rejected with a validation error naming it."),
             path: z.string().optional().describe("JSONL file path for import_jsonl."),
             ttl: zNumber().optional().describe("Claim lock TTL in minutes."),
             force: zBoolean().optional().describe("Force claim when supported."),
