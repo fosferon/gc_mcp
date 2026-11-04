@@ -3692,10 +3692,13 @@ Workflows are YAML pipelines with step types: tool, prompt, dispatch, shell, eac
 
 Actions:
   - run (sync by default, or async: true)
-  - list_workflows — list YAML definitions (defaults to summary: name/file/description/size)
+  - list_workflows — list YAML definitions (defaults to summary: name/file/description/size).
+    Child-only workflows (started by a protected parent, never run directly) are hidden;
+    include_child_only: true lists them, flagged child_only.
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
   - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime).
+    A parent run's response carries children: [{ child_id, workflow, step, status }], the child-only runs it started.
     Takes an execution id, never a workflow name: to read a definition use get_workflow.
   - get_workflow — one workflow definition: { workflow: { name, file, path, source
     ("user" | "bundled"), protected, description, size_bytes, body } }. Takes name.
@@ -3936,6 +3939,11 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         .optional()
         .describe(
           "Include hidden rows in list/prune (default false for list, true for prune)",
+        ),
+      include_child_only: zBoolean()
+        .optional()
+        .describe(
+          "list_workflows: also list child-only workflows (hidden by default; a protected parent starts them, they are not run directly). Default false.",
         ),
       reason: z
         .string()
