@@ -3075,11 +3075,11 @@ Actions:
   - run (sync by default, or async: true)
   - list_workflows — list YAML definitions (defaults to summary: name/file/description/size).
     Child-only workflows (started by a protected parent, never run directly) are hidden;
-    include_child_only: true lists them, flagged child_only.
+    include_child_only: true lists them, flagged child_only. An explicit select by name always returns a child-only workflow.
   - list_executions — list past runs (defaults to summary: no runtime blob)
   - list — alias for list_executions (backward compat)
   - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime).
-    A parent run's response carries children: [{ child_id, workflow, step, status }], the child-only runs it started.
+    A parent run's show and detail responses carry children: [{ child_id, workflow, step, status }], the child-only runs it started.
     Takes an execution id, never a workflow name: to read a definition use get_workflow.
   - get_workflow — one workflow definition: { workflow: { name, file, path, source
     ("user" | "bundled"), protected, description, size_bytes, body } }. Takes name.
