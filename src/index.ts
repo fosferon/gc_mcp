@@ -3364,7 +3364,7 @@ server.registerTool(
   "gc_dispatch",
   {
     description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
-Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), explain_route (read-only routing decision for one agent: chosen provider/model, fallback, reason, candidates, and what the availability ledger skipped; the same function a dispatch uses), availability (the provider availability ledger: no argument lists it; clear:"<route>" forgets a route; set:"<route>" with retry_at enters a known reset time), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result; page a long report with offset/limit in bytes), list (query jobs), dismiss (hide noisy job), cancel (stop a job and KEEP its record and the output written so far: a running job is aborted, a queued one leaves the queue; the same teardown as gc_run control abort), delete (remove one; force also stops a running job but removes the record), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), explain_route (read-only routing decision for one agent (agent is required): chosen provider/model, fallback, reason, candidates, and what the availability ledger skipped; the decision is the one a dispatch makes, and the candidate list probes every configured route), availability (the provider availability ledger: no argument lists it; clear:"<route>" forgets a route; set:"<route>" with retry_at enters a known reset time), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result; page a long report with offset/limit in bytes), list (query jobs), dismiss (hide noisy job), cancel (stop a job and KEEP its record and the output written so far: a running job is aborted, a queued one leaves the queue; the same teardown as gc_run control abort), delete (remove one; force also stops a running job but removes the record), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
 Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
 
 Dispatch options: call_profile "worker" (default, a tool-using agent) or "completion" (one reply, no tools; refused for a route with no completion recipe, and also honoured by explain_route); idempotency_key (a repeated key with the same agent/task/profile returns the same job, a different one is a 409 idempotency_key_reused).
@@ -3428,6 +3428,7 @@ Claude-specific permission controls:
         ),
       idempotency_key: z
         .string()
+        .min(1)
         .optional()
         .describe(
           "dispatch: a repeated key returns the same job instead of a new one; reusing it for a different agent/task/profile is a 409.",
@@ -3436,7 +3437,7 @@ Claude-specific permission controls:
         .string()
         .optional()
         .describe(
-          'availability: forget this route ("provider" or "provider/model"; a bare provider also drops its model entries).',
+          'availability: forget this route ("provider" or "provider/model"). A bare provider also drops its model entries; a model also drops the provider-wide entry. If clear and set are both given, clear wins.',
         ),
       set: z
         .string()
@@ -3454,6 +3455,12 @@ Claude-specific permission controls:
         .enum(["quota", "auth_failed", "containment_denied", "unhealthy"])
         .optional()
         .describe("availability set: why the route is out (default quota)."),
+      metadata: z
+        .record(z.string(), z.any())
+        .optional()
+        .describe(
+          "dispatch: a JSON object (at most 16 KiB) recorded on the job.",
+        ),
       kind: z
         .enum(["all", "agent", "persona", "a2a"])
         .optional()
@@ -3461,7 +3468,9 @@ Claude-specific permission controls:
       agent: z
         .string()
         .optional()
-        .describe("Agent name to dispatch (required for dispatch)"),
+        .describe(
+          "Agent name to dispatch (required for dispatch and explain_route)",
+        ),
       task: z.string().optional().describe("Task text (required for dispatch)"),
       cwd: z
         .string()
@@ -3481,13 +3490,13 @@ Claude-specific permission controls:
         .string()
         .optional()
         .describe(
-          'Explicit GC dispatch route override, or route hint/filter for list_providers, list_models, or resolve_dispatch. This is not the upstream vendor and not the CLI binary name. Accepts dynamic CLI route labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".',
+          'Explicit GC dispatch route override, or route hint/filter for list_providers, list_models, resolve_dispatch, or explain_route. This is not the upstream vendor and not the CLI binary name. Accepts dynamic CLI route labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".',
         ),
       model: z
         .string()
         .optional()
         .describe(
-          'Explicit real model id override, or a model hint for list_providers/resolve_dispatch (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Do not pass CLI labels such as "kimi-cli" or "claude-code-cli". Default: agent-defined, GC default, or provider runtime default depending on resolve_dispatch.',
+          'Explicit real model id override, or a model hint for list_providers/resolve_dispatch/explain_route (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Do not pass CLI labels such as "kimi-cli" or "claude-code-cli". Default: agent-defined, GC default, or provider runtime default depending on resolve_dispatch.',
         ),
       permission_mode: z
         .enum([
@@ -3545,7 +3554,9 @@ Claude-specific permission controls:
       reason: z
         .string()
         .optional()
-        .describe("Dismiss reason (for dismiss); availability set: note recorded with the entry"),
+        .describe(
+          'Dismiss reason (for dismiss); availability set: note recorded with the entry (default "set by the operator")',
+        ),
       force: zBoolean()
         .optional()
         .describe(
