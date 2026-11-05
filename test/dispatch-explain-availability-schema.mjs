@@ -42,6 +42,15 @@ try {
   const args = { action: "availability", set: "kimi", retry_at: "2026-11-10 13:57", state: "quota", reason: "r" };
   await dispatch.handler(args, {});
   assert.deepEqual(sent, args);
+  for (const more of [
+    { action: "explain_route", agent: "auditor", provider: "kimi", model: "m", call_profile: "completion" },
+    { action: "availability", clear: "kimi/kimi-code" },
+    { action: "dispatch", agent: "a", task: "t", metadata: { run: "r-1" } },
+  ]) {
+    await dispatch.handler(more, {});
+    assert.deepEqual(sent, more);
+  }
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", idempotency_key: "" }).success, "empty idempotency_key refused");
   await dispatch.handler({ action: "dispatch", agent: "a", task: "t", call_profile: "completion", idempotency_key: "k" }, {});
   assert.equal(sent.call_profile, "completion");
   assert.equal(sent.idempotency_key, "k");
