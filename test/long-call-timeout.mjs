@@ -136,6 +136,26 @@ try {
     assert.equal(lastInit().dispatcher, dispatcher, "one shared dispatcher for every daemon call");
   }
 
+  // GC-6928: agent work has no default deadline, so wait:true with no timeout
+  // carries no client-side abort either; an explicit timeout still does.
+  await callTool("gc_dispatch", { action: "dispatch", agent: "auditor", task: "t", wait: true });
+  assert.equal(
+    lastInit().signal,
+    undefined,
+    "gc_dispatch wait:true with no timeout must carry no client-side deadline (GC-6928)",
+  );
+  await callTool("gc_dispatch", {
+    action: "dispatch",
+    agent: "auditor",
+    task: "t",
+    wait: true,
+    timeout: 600,
+  });
+  assert.ok(
+    lastInit().signal instanceof AbortSignal,
+    "gc_dispatch wait:true with an explicit timeout keeps its client-side deadline",
+  );
+
   await callTool("gc_recall", { query: "x" });
   assert.equal(lastInit().dispatcher, dispatcher, "short calls use the same dispatcher");
   assert.ok(lastInit().signal instanceof AbortSignal, "short calls keep their 15 s deadline");
