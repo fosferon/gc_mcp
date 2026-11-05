@@ -2877,11 +2877,13 @@ Claude-specific permission controls:
                     return Buffer.byteLength(JSON.stringify(value)) <= 16_384;
                 }
                 catch {
-                    return false; // not JSON-encodable (BigInt, cycle): the daemon could not take it either
+                    // not JSON-encodable (BigInt, cycle): fail validation here rather than
+                    // letting the transport's JSON.stringify throw later
+                    return false;
                 }
             }, "metadata exceeds 16 KiB or is not JSON-encodable")
-                .optional()
-                .describe("dispatch: a JSON object (at most 16 KiB) recorded on the job."),
+                .nullish()
+                .describe("dispatch: a JSON object (at most 16 KiB, JSON-encodable) recorded on the job; null is the same as omitting it. The size is measured here as the JSON.stringify byte length and by the daemon on its own re-encoding, so a payload within a byte or two of the limit that holds exponent-form numbers (1e+21, 1e-7) can be accepted here and still refused by the daemon (invalid_metadata, 400)."),
             kind: z
                 .enum(["all", "agent", "persona", "a2a"])
                 .optional()
