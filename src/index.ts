@@ -3457,10 +3457,13 @@ Claude-specific permission controls:
         .describe("availability set: why the route is out (default quota)."),
       metadata: z
         .record(z.string(), z.any())
-        .refine(
-          (value) => Buffer.byteLength(JSON.stringify(value)) <= 16_384,
-          "metadata exceeds 16 KiB",
-        )
+        .refine((value) => {
+          try {
+            return Buffer.byteLength(JSON.stringify(value)) <= 16_384;
+          } catch {
+            return false; // not JSON-encodable (BigInt, cycle): the daemon could not take it either
+          }
+        }, "metadata exceeds 16 KiB or is not JSON-encodable")
         .optional()
         .describe(
           "dispatch: a JSON object (at most 16 KiB) recorded on the job.",

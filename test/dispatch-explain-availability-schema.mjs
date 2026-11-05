@@ -30,6 +30,10 @@ try {
   assert.ok(!parse({ action: "availability", set: "kimi", state: "weird" }).success, "unknown state refused");
   assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: "nope" }).success, "non-object metadata refused");
   assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { big: "x".repeat(17000) } }).success, "metadata over 16 KiB refused");
+  // the exact boundary: {"k":"..."} is 8 bytes of JSON around the value
+  assert.ok(parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "x".repeat(16384 - 8) } }).success, "metadata at exactly 16 KiB accepted");
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "x".repeat(16384 - 7) } }).success, "metadata one byte over refused");
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { n: 10n } }).success, "a non-JSON-encodable metadata is a validation failure, not a throw");
   assert.ok(!parse({ action: "availabilty" }).success, "a misspelled action is still refused");
 
   assert.match(dispatch.description, /explain_route \(read-only routing decision/);
