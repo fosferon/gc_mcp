@@ -4051,8 +4051,8 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
     //   answers a resume only when the run reaches its next checkpoint, and a
     //   stage routinely takes 7-20 minutes, so any fixed default reports a
     //   failure that did not happen (GC-5374)
-    // - run/wait/watch (no explicit timeout) → 300s default (a sync run is
-    //   promoted to async by the daemon at its own 5 min cap)
+    // - run/wait/watch (no explicit timeout) → 300s default (this is the client's own
+    //   300 s abort; the daemon's sync wait budget is 15 min, :workflow_sync)
     // - everything else → 15s default
     let clientTimeoutMs: number | null | undefined = 15_000;
     const isLongAction =
