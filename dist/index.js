@@ -3013,9 +3013,18 @@ Claude-specific permission controls:
     // DAEMON TOOLS — Schedule
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_schedule", {
-        description: `Manage scheduled agent dispatches.
+        description: `Manage scheduled agent dispatches and scheduled workflows.
 Actions: list, create, enable, disable, delete, history, fire (manual trigger), tick (force check).
 Trigger types: cron, interval, session_start, once.
+
+ACTION TYPES: action_type "dispatch" (default) runs an agent. action_type "workflow" runs a
+workflow with no model in the path: pass 'workflow' (a name from ~/.config/gc/workflows/, it must
+load at create time) and optional 'params' (a JSON object). Each fire starts one async execution;
+history records its execution id in place of a job id (execution_id on the entry). A workflow that
+cannot be loaded at fire time is one failed fire (an error row with the reason) and the schedule
+moves on by its own cron/interval, it is not retried every tick. A workflow's shell steps find the
+workflow's own state directory in GC_WORKFLOW_STATE_DIR. fire runs the schedule now through the same
+path and writes a history row (note "manual"); it leaves next_fire_at, last_fired_at and fire_count alone.
 
 CRON: pass a standard 5-field expression via 'cron' (preferred):
   "min hour day-of-month month day-of-week"
@@ -3068,8 +3077,16 @@ day-of-month, month-of-year, or ranges — use 'cron' for those.`,
             action_type: z
                 .string()
                 .optional()
-                .describe("What to do: dispatch (default) or notify"),
+                .describe("What to do: dispatch (default, runs an agent), workflow (runs a workflow, no model), or notify"),
             agent: z.string().optional().describe("Agent to dispatch"),
+            workflow: z
+                .string()
+                .optional()
+                .describe("action_type workflow: the workflow name (must load at create time)"),
+            params: z
+                .union([z.record(z.string(), z.unknown()), z.string()])
+                .optional()
+                .describe("action_type workflow: the workflow's params, a JSON object (or its JSON string)"),
             task: z.string().optional().describe("Task text"),
             cwd: z.string().optional().describe("Working directory"),
             issue: z.string().optional().describe("Linked bee issue"),
