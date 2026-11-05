@@ -2267,7 +2267,7 @@ run: the daemon runs a heavy command for you under a lease (default resource hos
                 .describe("run: argv command, plain words only, no shell syntax; must start with a daemon-allowlisted prefix such as `mix test`"),
             timeout_ms: zNumber()
                 .optional()
-                .describe("run: kill the command after this many ms (default 1h, max 4h)"),
+                .describe("run: kill the command after this many ms (default: none, no kill deadline; an explicit value is honoured)"),
         }),
     }, 
     // run + wait:true holds the request until the command ends, so no client-side timeout.
@@ -2944,7 +2944,7 @@ Claude-specific permission controls:
                 .describe("Claude only: additional directory to allow tool access to"),
             timeout: zTimeout()
                 .optional()
-                .describe('Max lifetime of the dispatched CLI subprocess. Integer seconds (default: 1800 / 30 min), or "infinite"/"infinity"/"none" to disable the wrapper kill entirely. Accepts string-of-int ("600") so LLM stringification is safe.'),
+                .describe('Max lifetime of the dispatched CLI subprocess. Default: none (agent work has no kill deadline; a job that stops making progress is surfaced by /gc/health, never killed). Pass integer seconds only to request a hard kill; "infinite"/"infinity"/"none" mean the default. Accepts string-of-int ("600") so LLM stringification is safe.'),
             job_id: z
                 .string()
                 .optional()
@@ -2993,7 +2993,7 @@ Claude-specific permission controls:
         // - wait: true + integer → (seconds * 1000) + 10s buffer past daemon deadline.
         //   (The buffer differs by tool for no recorded reason: +10s here, +5s on
         //   the run and capability watch streams, none on gc_workflow.)
-        // - wait: true + undefined → 30 min default + 10s buffer.
+        // - wait: true + undefined → no client abort (GC-6928: no default deadline).
         let clientTimeoutMs = 15_000;
         if (params.action === "dispatch" && params.wait === true) {
             const t = params.timeout;
@@ -3004,7 +3004,7 @@ Claude-specific permission controls:
                 clientTimeoutMs = t * 1000 + 10_000;
             }
             else {
-                clientTimeoutMs = 1_800_000 + 10_000; // daemon default + buffer
+                clientTimeoutMs = null; // GC-6928: the daemon default is no deadline
             }
         }
         return daemonCall("/gc/dispatch", params, clientTimeoutMs, MAX_RESPONSE_CHARS, params.action === "output" ? DISPATCH_OUTPUT_TRUNCATION_HINT : undefined);
@@ -3377,8 +3377,8 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         //   answers a resume only when the run reaches its next checkpoint, and a
         //   stage routinely takes 7-20 minutes, so any fixed default reports a
         //   failure that did not happen (GC-5374)
-        // - run/wait/watch (no explicit timeout) → 300s default (a sync run is
-        //   promoted to async by the daemon at its own 5 min cap)
+        // - run/wait/watch (no explicit timeout) → 300s default (this is the client's own
+        //   300 s abort; the daemon's sync wait budget is 15 min, :workflow_sync)
         // - everything else → 15s default
         let clientTimeoutMs = 15_000;
         const isLongAction = params.action === "run" ||
