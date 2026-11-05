@@ -3457,6 +3457,10 @@ Claude-specific permission controls:
         .describe("availability set: why the route is out (default quota)."),
       metadata: z
         .record(z.string(), z.any())
+        .refine(
+          (value) => Buffer.byteLength(JSON.stringify(value)) <= 16_384,
+          "metadata exceeds 16 KiB",
+        )
         .optional()
         .describe(
           "dispatch: a JSON object (at most 16 KiB) recorded on the job.",
@@ -3469,7 +3473,7 @@ Claude-specific permission controls:
         .string()
         .optional()
         .describe(
-          "Agent name to dispatch (required for dispatch and explain_route)",
+          "Agent name to dispatch (required for dispatch, resolve_dispatch and explain_route)",
         ),
       task: z.string().optional().describe("Task text (required for dispatch)"),
       cwd: z
