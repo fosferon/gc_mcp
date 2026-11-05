@@ -34,6 +34,15 @@ try {
   assert.ok(parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "x".repeat(16384 - 8) } }).success, "metadata at exactly 16 KiB accepted");
   assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "x".repeat(16384 - 7) } }).success, "metadata one byte over refused");
   assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { n: 10n } }).success, "a non-JSON-encodable metadata is a validation failure, not a throw");
+  // multi-byte text counts bytes, not characters: "é" is 2 bytes, so 8190 of them + 8 overhead = 16388 > 16384
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "é".repeat(8190) } }).success, "multi-byte metadata over 16 KiB refused");
+  assert.ok(parse({ action: "dispatch", agent: "a", task: "t", metadata: { k: "é".repeat(8188) } }).success, "multi-byte metadata at 16 KiB accepted");
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: [] }).success, "an array is not a metadata object");
+  const cyclic = {};
+  cyclic.self = cyclic;
+  assert.ok(!parse({ action: "dispatch", agent: "a", task: "t", metadata: cyclic }).success, "a cyclic metadata is a validation failure, not a throw");
+  // null means absent, as it does for the daemon: accepted and passed through unchanged
+  assert.ok(parse({ action: "dispatch", agent: "a", task: "t", metadata: null }).success, "metadata null accepted");
   assert.ok(!parse({ action: "availabilty" }).success, "a misspelled action is still refused");
 
   assert.match(dispatch.description, /explain_route \(read-only routing decision/);
@@ -53,6 +62,7 @@ try {
     { action: "explain_route", agent: "auditor", provider: "kimi", model: "m", call_profile: "completion" },
     { action: "availability", clear: "kimi/kimi-code" },
     { action: "dispatch", agent: "a", task: "t", metadata: { run: "r-1" } },
+    { action: "dispatch", agent: "a", task: "t", metadata: null },
   ]) {
     await dispatch.handler(more, {});
     assert.deepEqual(sent, more);
