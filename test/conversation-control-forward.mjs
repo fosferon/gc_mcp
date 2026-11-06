@@ -57,12 +57,19 @@ try {
   assert.equal(seen.at(-1).body.mode, "interrupt");
   assert.equal(seen.at(-1).body.message, "change course");
 
+  // gc_agent_conversation stop (GC-6986 audit r1 F2)
+  await callToolHandler(
+    { method: "tools/call", params: { name: "gc_agent_conversation", arguments: { action: "stop", session_id: "a1" } } },
+    {},
+  );
+  assert.deepEqual(seen.at(-1), { url: "/gc/agent_conversation/a1/stop", method: "POST", body: {} });
+
   const before = seen.length;
   const missing = await call({ action: "stop" });
   assert.equal(seen.length, before, "no request without a session id");
   assert.match(missing.content[0].text, /session_id/);
 
-  process.stdout.write("gc_conversation stop / effect_fence / release_effect_fence / cut_in mode reach the daemon.\n");
+  process.stdout.write("gc_conversation stop / effect_fence / release_effect_fence / cut_in mode and gc_agent_conversation stop reach the daemon.\n");
 } finally {
   McpServer.prototype.connect = originalConnect;
   Server.prototype.setRequestHandler = originalSetRequestHandler;

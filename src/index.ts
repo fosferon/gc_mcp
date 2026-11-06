@@ -1502,10 +1502,11 @@ server.registerTool(
   "gc_agent_conversation",
   {
     description: `Chat-style sessions with local GC agents.
-Actions: spawn, turn, get, list, delete.`,
+Actions: spawn, turn, stop, get, list, delete.
+- stop: stop the session's running turn at once (same stop as gc_conversation stop, GC-6986)`,
     inputSchema: z.object({
       action: z
-        .enum(["spawn", "turn", "get", "list", "delete"])
+        .enum(["spawn", "turn", "stop", "get", "list", "delete"])
         .describe("Action to perform"),
       agent_name: z.string().optional().describe("Agent name (for spawn)"),
       agent: z.string().optional().describe("Alias for agent_name (for spawn)"),
@@ -1533,6 +1534,14 @@ Actions: spawn, turn, get, list, delete.`,
         const result = await gcPost(
           `/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`,
           params,
+        );
+        return text(JSON.stringify(result, null, 2));
+      }
+      if (action === "stop") {
+        if (!sessionId) return err("session_id (or id) is required");
+        const result = await gcPost(
+          `/gc/agent_conversation/${encodeURIComponent(sessionId)}/stop`,
+          {},
         );
         return text(JSON.stringify(result, null, 2));
       }
