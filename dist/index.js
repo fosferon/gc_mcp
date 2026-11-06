@@ -1096,7 +1096,10 @@ Actions:
 - spawn: create a new session (persona/agent_name is required, optional config; make_apex:true takes the Apex seat, otherwise the session never does)
 - turn: send a message and get the assistant response
 - submit_tool_results: provide results for pending tool calls
-- cut_in: inject an operator message into a running session
+- cut_in: an operator message into a session. mode "queue" (default): read before the agent's next model call. mode "interrupt": the running turn is stopped at once (what it did stays, marked cut; a running tool finishes and its result is recorded when it arrives, never re-run) and the message is sent now; the answer is the new turn's. mode "consult" is reserved (501, GC-6991)
+- stop: stop the running turn at once; recorded on the transcript as interrupted by the operator (GC-6986)
+- effect_fence: the session's effect fence: none | in_progress | orphaned (GC-6985)
+- release_effect_fence: operator recovery, release an orphaned fence (audited; refuses a running turn) (GC-6985)
 - get/list/delete: inspect or close sessions
 - diagnostics: persona/path resolution diagnostics
 - apex_status: show the active apex session
@@ -1108,6 +1111,9 @@ Actions:
                 "turn",
                 "submit_tool_results",
                 "cut_in",
+                "stop",
+                "effect_fence",
+                "release_effect_fence",
                 "get",
                 "list",
                 "delete",
@@ -1127,6 +1133,10 @@ Actions:
             id: z.string().optional().describe("Alias for session_id"),
             message: z.string().optional().describe("User message (for turn/cut_in)"),
             from: z.string().optional().describe("Cut-in sender label (for cut_in)"),
+            mode: z
+                .enum(["queue", "interrupt", "consult"])
+                .optional()
+                .describe("Cut-in mode (for cut_in): queue (default) | interrupt (stop the turn, send now) | consult (reserved, 501)"),
             tool_results: z
                 .array(z.any())
                 .optional()
@@ -1171,6 +1181,18 @@ Actions:
                 const result = await gcPost(path, params);
                 return text(JSON.stringify(result, null, 2));
             }
+            if (action === "stop" || action === "release_effect_fence") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcPost(`/gc/conversation/${encodeURIComponent(sessionId)}/${action}`, {});
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "effect_fence") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcGet(`/gc/conversation/${encodeURIComponent(sessionId)}/effect_fence`);
+                return text(JSON.stringify(result, null, 2));
+            }
             if (action === "get" || action === "delete") {
                 if (!sessionId)
                     return err("session_id (or id) is required");
@@ -1189,10 +1211,11 @@ Actions:
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_agent_conversation", {
         description: `Chat-style sessions with local GC agents.
-Actions: spawn, turn, get, list, delete.`,
+Actions: spawn, turn, stop, get, list, delete.
+- stop: stop the session's running turn at once (same stop as gc_conversation stop, GC-6986)`,
         inputSchema: z.object({
             action: z
-                .enum(["spawn", "turn", "get", "list", "delete"])
+                .enum(["spawn", "turn", "stop", "get", "list", "delete"])
                 .describe("Action to perform"),
             agent_name: z.string().optional().describe("Agent name (for spawn)"),
             agent: z.string().optional().describe("Alias for agent_name (for spawn)"),
@@ -1217,6 +1240,12 @@ Actions: spawn, turn, get, list, delete.`,
                 if (!sessionId)
                     return err("session_id (or id) is required");
                 const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "stop") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/stop`, {});
                 return text(JSON.stringify(result, null, 2));
             }
             if (action === "get" || action === "delete") {
