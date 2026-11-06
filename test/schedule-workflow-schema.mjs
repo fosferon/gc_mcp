@@ -25,10 +25,19 @@ try {
   const bad = schedule.inputSchema.safeParse({ action: "create", params: 5 });
   assert.ok(!bad.success, "params must be an object or a string");
 
-  assert.match(schedule.description, /action_type "workflow" runs a\s+workflow with no model in the path/);
+  assert.match(schedule.description, /action_type "workflow" runs a\s+workflow directly, with no agent or model dispatch added by the schedule/);
+  assert.match(schedule.description, /a workflow's own\s+prompt\/dispatch steps still call a model/);
+  assert.match(schedule.description, /child-only workflow is refused/);
+  assert.match(schedule.description, /a schedule that is due at that\s+moment counts as fired/);
+  assert.doesNotMatch(schedule.description, /notify/);
   assert.match(schedule.description, /execution id in place of a job id/);
   assert.match(schedule.description, /GC_WORKFLOW_STATE_DIR/);
-  assert.match(schedule.description, /fire runs the schedule now/);
+  assert.match(schedule.description, /fire runs the\s+schedule now/);
+
+  // The advertised params property is a union of an object and a string.
+  const props = schedule.inputSchema.shape ?? schedule.inputSchema._def?.shape?.();
+  assert.ok(props?.params, "params is a declared property");
+  assert.ok(props?.workflow, "workflow is a declared property");
 
   process.stdout.write("gc_schedule workflow action type verified.\n");
 } finally {
