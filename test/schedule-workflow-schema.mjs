@@ -28,7 +28,9 @@ try {
   assert.match(schedule.description, /action_type "workflow" runs a\s+workflow directly, with no agent or model dispatch added by the schedule/);
   assert.match(schedule.description, /a workflow's own\s+prompt\/dispatch steps still call a model/);
   assert.match(schedule.description, /child-only workflow is refused/);
-  assert.match(schedule.description, /a schedule that is due at that\s+moment counts as fired/);
+  assert.match(schedule.description, /a schedule that is due at that\s+moment counts as fired \(for an enabled schedule that also stops the next tick/);
+  assert.match(schedule.description, /e\.g\. a busy\s+workflow database, a draining daemon/);
+  assert.match(schedule.description, /'params' \(a JSON object or its JSON string\)/);
   assert.doesNotMatch(schedule.description, /notify/);
   assert.match(schedule.description, /execution id in place of a job id/);
   assert.match(schedule.description, /GC_WORKFLOW_STATE_DIR/);
