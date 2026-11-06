@@ -3018,13 +3018,17 @@ Actions: list, create, enable, disable, delete, history, fire (manual trigger), 
 Trigger types: cron, interval, session_start, once.
 
 ACTION TYPES: action_type "dispatch" (default) runs an agent. action_type "workflow" runs a
-workflow with no model in the path: pass 'workflow' (a name from ~/.config/gc/workflows/, it must
-load at create time) and optional 'params' (a JSON object). Each fire starts one async execution;
+workflow directly, with no agent or model dispatch added by the schedule (a workflow's own
+prompt/dispatch steps still call a model): pass 'workflow' (a name from ~/.config/gc/workflows/ or a
+bundled workflow; it must load at create time, and a child-only workflow is refused) and optional 'params' (a JSON object). Each fire starts one async execution;
 history records its execution id in place of a job id (execution_id on the entry). A workflow that
 cannot be loaded at fire time is one failed fire (an error row with the reason) and the schedule
-moves on by its own cron/interval, it is not retried every tick. A workflow's shell steps find the
-workflow's own state directory in GC_WORKFLOW_STATE_DIR. fire runs the schedule now through the same
-path and writes a history row (note "manual"); it leaves next_fire_at, last_fired_at and fire_count alone.
+moves on by its own cron/interval, it is not retried every tick; a transient start failure (busy
+workflow database, draining daemon) advances nothing and the next tick retries. Every workflow run
+gives its shell steps the workflow's own state directory in GC_WORKFLOW_STATE_DIR. fire runs the
+schedule now through the same path (a disabled schedule too) and writes a history row (note "manual");
+it leaves next_fire_at, last_fired_at and fire_count alone, except that a schedule that is due at that
+moment counts as fired so the next tick does not run it again.
 
 CRON: pass a standard 5-field expression via 'cron' (preferred):
   "min hour day-of-month month day-of-week"
@@ -3077,7 +3081,7 @@ day-of-month, month-of-year, or ranges — use 'cron' for those.`,
             action_type: z
                 .string()
                 .optional()
-                .describe("What to do: dispatch (default, runs an agent), workflow (runs a workflow, no model), or notify"),
+                .describe("What to do: dispatch (default, runs an agent) or workflow (runs a workflow directly)"),
             agent: z.string().optional().describe("Agent to dispatch"),
             workflow: z
                 .string()
