@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * gc_mcp — Universal MCP server for Grand Central
+ * gc_mcp — Universal MCP server for a local operations daemon
  *
- * Thin translation layer: MCP tool calls → HTTP POST to REDACTED (localhost:4242)
+ * Thin translation layer: MCP tool calls → HTTP POST to the daemon (localhost:4242)
  * Plus 3 standalone tools: davinci_resolve, devonthink, gh_issues
  *
  * Usage:
@@ -11,6 +11,6 @@
  *   GC_MCP_TRANSPORT=all node dist/index.js
  *
  * Config:
- *   { "mcpServers": { "gc": { "command": "node", "args": ["~/Sites/agents/gc_mcp/dist/index.js"] } } }
+ *   { "mcpServers": { "gc": { "command": "node", "args": ["/path/to/gc_mcp/dist/index.js"] } } }
  */
 export {};

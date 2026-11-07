@@ -1,8 +1,8 @@
 #!/usr/bin/env node
 /**
- * gc_mcp — Universal MCP server for Grand Central
+ * gc_mcp — Universal MCP server for a local operations daemon
  *
- * Thin translation layer: MCP tool calls → HTTP POST to REDACTED (localhost:4242)
+ * Thin translation layer: MCP tool calls → HTTP POST to the daemon (localhost:4242)
  * Plus 3 standalone tools: davinci_resolve, devonthink, gh_issues
  *
  * Usage:
@@ -11,7 +11,7 @@
  *   GC_MCP_TRANSPORT=all node dist/index.js
  *
  * Config:
- *   { "mcpServers": { "gc": { "command": "node", "args": ["~/Sites/agents/gc_mcp/dist/index.js"] } } }
+ *   { "mcpServers": { "gc": { "command": "node", "args": ["/path/to/gc_mcp/dist/index.js"] } } }
  */
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
@@ -26,7 +26,7 @@ import { createServer } from "node:http";
 import { resolve, dirname, join } from "node:path";
 import { homedir } from "node:os";
 // ════════════════════════════════════════════════════════════════
-// HTTP Client — REDACTED at localhost:4242
+// HTTP Client — daemon at localhost:4242
 // ════════════════════════════════════════════════════════════════
 const GC_BASE = process.env.GC_DAEMON_URL || "http://localhost:4242";
 /**
@@ -35,7 +35,7 @@ const GC_BASE = process.env.GC_DAEMON_URL || "http://localhost:4242";
  * passes (or omits). A daemon call that blocks longer than that before
  * answering — a synchronous workflow resume, a wait-mode dispatch — was cut by
  * the HTTP client at exactly 300 s with a bare "fetch failed", while the work
- * carried on in the daemon (GC-5374). The same limit applied to SSE streams
+ * carried on in the daemon. The same limit applied to SSE streams
  * that stay quiet for five minutes.
  *
  * Every daemon request therefore goes through this dispatcher, which has
@@ -86,7 +86,7 @@ function describeError(e) {
     return described;
 }
 /**
- * POST to REDACTED.
+ * POST to the daemon.
  *
  * timeoutMs controls the client-side abort:
  *   - undefined (default) → 15s, suitable for fire-and-forget tools
@@ -110,7 +110,7 @@ async function gcPost(path, body, timeoutMs = 15_000) {
     const resp = await daemonFetch(url, init);
     if (!resp.ok) {
         const text = await resp.text().catch(() => "");
-        throw new Error(`REDACTED ${path} failed (${resp.status}): ${text}`);
+        throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
     }
     return resp.json();
 }
@@ -118,7 +118,7 @@ async function gcGet(path) {
     const url = `${GC_BASE}${path}`;
     const resp = await daemonFetch(url, { signal: AbortSignal.timeout(5_000) });
     if (!resp.ok)
-        throw new Error(`REDACTED ${path} failed (${resp.status})`);
+        throw new Error(`daemon ${path} failed (${resp.status})`);
     return resp.json();
 }
 async function gcGetResponse(path, timeoutMs = 15_000) {
@@ -130,7 +130,7 @@ async function gcGetResponse(path, timeoutMs = 15_000) {
     const resp = await daemonFetch(url, init);
     if (!resp.ok) {
         const text = await resp.text().catch(() => "");
-        throw new Error(`REDACTED ${path} failed (${resp.status}): ${text}`);
+        throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
     }
     return resp;
 }
@@ -142,7 +142,7 @@ async function gcDelete(path) {
     });
     if (!resp.ok) {
         const text = await resp.text().catch(() => "");
-        throw new Error(`REDACTED ${path} failed (${resp.status}): ${text}`);
+        throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
     }
     return resp.json();
 }
@@ -159,7 +159,7 @@ function clean(params) {
 // Response truncation
 // ════════════════════════════════════════════════════════════════
 //
-// Several daemon tools (gc_ticker, gc_convergence report, gc_work list) can
+// Several daemon tools (ticker, convergence report, work list) can
 // return responses that exceed what the host context window can hold. When an
 // agent fires multiple such tools in parallel the combined result easily
 // breaks the harness (tool_results_required). Cap each tool response at a
@@ -190,12 +190,12 @@ function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS, hint = "Use narro
         `${droppedChars.toLocaleString()} chars omitted. ` +
         `${hint}]`);
 }
-// GC-6364: a dispatch report past the cap could not be read at all — the
+// A dispatch report past the cap could not be read at all — the
 // daemon had no paging. It pages in bytes now; say so where the cut lands.
 const DISPATCH_OUTPUT_TRUNCATION_HINT = "This is a dispatch report. Read it in pages: action:output job_id:<id> " +
     "offset:<n> limit:10000 (bytes) — the response carries total_bytes and " +
     "next_offset; pass next_offset back as offset until it is null.";
-// GC-5424: a truncated workflow read used to end in the generic hint above,
+// A truncated workflow read used to end in the generic hint above,
 // and the agent reading a 60k-character run never learned that one step's
 // output can be fetched on its own and in pages.
 const WORKFLOW_TRUNCATION_HINT = "This is a workflow read. One step's output: action:context key:<step_id>, " +
@@ -250,7 +250,7 @@ function isFailedWatchEvent(event) {
 }
 async function readSseStream(resp, onEvent) {
     if (!resp.body) {
-        throw new Error("REDACTED SSE stream returned no response body");
+        throw new Error("daemon SSE stream returned no response body");
     }
     const reader = resp.body.getReader();
     const decoder = new TextDecoder();
@@ -324,7 +324,7 @@ function isAbortError(e) {
     const name = e?.name;
     return name === "AbortError" || name === "TimeoutError";
 }
-// GC-5424: a watch whose own `timeout` elapsed used to come back as
+// A watch whose own `timeout` elapsed used to come back as
 // "ERROR: The operation was aborted due to timeout", with every event it had
 // collected thrown away — the normal outcome of "watch for N seconds" was an
 // error. The events are kept as they arrive, and a client-side abort returns
@@ -419,7 +419,7 @@ async function daemonCall(endpoint, params, timeoutMs = 15_000, maxResponseChars
 //
 // The daemon parses every timeout via GcDaemon.Timeouts.parse/2 which
 // accepts: integer | string-of-int | "none" | "infinity" | "infinite".
-// Pre-GC-773 the MCP shim declared `timeout: z.number()` which rejected
+// Earlier, the MCP shim declared `timeout: z.number()` which rejected
 // LLM-stringified values like "600" — the user couldn't wait on a workflow
 // because the Zod layer rejected the call before it ever reached the
 // daemon. zTimeout() / zPositiveNumber() close that value-shape hole and
@@ -544,9 +544,9 @@ function buildMcpServer() {
     const packageVersion = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf-8")).version;
     const server = new McpServer({ name: "gc", version: packageVersion }, {
         instructions: [
-            "Grand Central operations hub. All tools route to REDACTED (localhost:4242).",
+            "Operations hub. All tools route to the daemon (localhost:4242).",
             "Use gc_recall for memory search (FTS5, instant). gc_retain to store facts.",
-            "gc_docs queries the packaged REDACTED user manual — use it for setup, configuration, workflows, templates, and troubleshooting.",
+            "gc_docs queries the packaged daemon user manual — use it for setup, configuration, workflows, templates, and troubleshooting.",
             "gc_onboarding drives the guided setup DAG and setup-degree checks.",
             "gc_control executes deterministic, approval-gated operations directly.",
             "gc_capability reports which features are currently lit up.",
@@ -558,7 +558,7 @@ function buildMcpServer() {
             "Heavy work rule: run full test suites, test-database setup and landings (Gate → merge → deploy) through gc_lease action:run {command, cwd, issue} (an allowlisted argv such as `mix test`, run contained), never as a raw shell command — the daemon queues them on shared slots, tells you 'queued, position N', and starts them when a slot frees. gc_dispatch of a CLI agent queues by itself the same way (response status queued, with position and resource; it starts when a slot frees), and workflow dispatch steps simply wait for a slot while the run stays running; there is nothing to configure in your harness.",
             "gc_checkpoint fetches and resolves approval checkpoints.",
             "gc_workflow_watch follows a workflow execution live via SSE.",
-            "gc_work manages the Bee DAG — issues, dependencies, assignments.",
+            "gc_work manages the work graph — issues, dependencies, assignments.",
             "gc_plan answers 'what should I work on next?' with scored recommendations.",
             "gc_convergence tracks strategic vectors — use 'report' for the real 'where are we at?'",
             "gc_ticker provides situational awareness snapshots.",
@@ -688,7 +688,7 @@ Actions: "reindex" = enqueue a full reindex now, "status" = show vault config an
     // DAEMON TOOLS — Documentation
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_docs", {
-        description: `Query the packaged REDACTED user manual.
+        description: `Query the packaged daemon user manual.
 Use this whenever you need authoritative help with daemon setup, configuration, workflows, templates, or troubleshooting.
 Actions:
 - search: keyword search over doc titles, ids, and tags
@@ -746,7 +746,7 @@ Use when recall/search is returning stale or incomplete results despite facts ex
     // DAEMON TOOLS — Uniform Tool Call Surface
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_tool_call", {
-        description: `Execute any daemon tool by name through the uniform tool-call surface (GC-2632).
+        description: `Execute any daemon tool by name through the uniform tool-call surface.
 Useful when you know the exact tool name and want to dispatch it without a dedicated MCP tool. Handler tools (gc_*) are always available. Code tools (bash, read_file, etc.) require server-side code-tool execution to be enabled.`,
         inputSchema: z.object({
             name: z.string().describe("Tool name to execute"),
@@ -768,7 +768,7 @@ Useful when you know the exact tool name and want to dispatch it without a dedic
     // DAEMON TOOLS — Templating
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_template", {
-        description: `Merge-field templating (GC-2774).
+        description: `Merge-field templating.
 - placeholders: list available {{ }} placeholders for a context
 - fill: render a template block with explicit values`,
         inputSchema: z.object({
@@ -1096,10 +1096,10 @@ Actions:
 - spawn: create a new session (persona/agent_name is required, optional config; make_apex:true takes the Apex seat, otherwise the session never does)
 - turn: send a message and get the assistant response
 - submit_tool_results: provide results for pending tool calls
-- cut_in: an operator message into a session. mode "queue" (default): read before the agent's next model call. mode "interrupt": the running turn is stopped at once (what it did stays, marked cut; a running tool finishes and its result is recorded when it arrives, never re-run) and the message is sent now; the answer is the new turn's. mode "consult" is reserved (501, GC-6991)
-- stop: stop the running turn at once; recorded on the transcript as interrupted by the operator (GC-6986)
-- effect_fence: the session's effect fence: none | in_progress | orphaned (GC-6985)
-- release_effect_fence: operator recovery, release an orphaned fence (audited; refuses a running turn) (GC-6985)
+- cut_in: an operator message into a session. mode "queue" (default): read before the agent's next model call. mode "interrupt": the running turn is stopped at once (what it did stays, marked cut; a running tool finishes and its result is recorded when it arrives, never re-run) and the message is sent now; the answer is the new turn's. mode "consult" is reserved (501)
+- stop: stop the running turn at once; recorded on the transcript as interrupted by the operator
+- effect_fence: the session's effect fence: none | in_progress | orphaned
+- release_effect_fence: operator recovery, release an orphaned fence (audited; refuses a running turn)
 - get/list/delete: inspect or close sessions
 - diagnostics: persona/path resolution diagnostics
 - apex_status: show the active apex session
@@ -1212,7 +1212,7 @@ Actions:
     server.registerTool("gc_agent_conversation", {
         description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
-- stop: stop the session's running turn at once (same stop as gc_conversation stop, GC-6986)`,
+- stop: stop the session's running turn at once (same stop as gc_conversation stop)`,
         inputSchema: z.object({
             action: z
                 .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1356,7 +1356,7 @@ Actions:
                         ? params.timeout * 1000
                         : 30_000;
                 // The daemon's run watch takes `timeout` and `heartbeat` in ms and
-                // closes the stream itself at the deadline (GC-5424).
+                // closes the stream itself at the deadline.
                 const query = [`since=${encodeURIComponent(params.since ?? 0)}`];
                 if (timeoutMs !== null)
                     query.push(`timeout=${timeoutMs}`);
@@ -1368,7 +1368,7 @@ Actions:
                 });
                 if (!resp.ok) {
                     const textBody = await resp.text().catch(() => "");
-                    throw new Error(`REDACTED run watch failed (${resp.status}): ${textBody}`);
+                    throw new Error(`daemon run watch failed (${resp.status}): ${textBody}`);
                 }
                 const { events, terminal, timed_out } = await collectSseStream(resp);
                 const summary = terminal
@@ -1446,14 +1446,14 @@ Actions:
     // DAEMON TOOLS — Relay Ingress
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_relay", {
-        description: `Relay ingress for external peers (e.g. Pluto). Sends a message to an existing agent session or creates a new one. Defaults to the daemon-owned ingress agent (charon).`,
+        description: `Relay ingress for external peers. Sends a message to an existing agent session or creates a new one. Defaults to the daemon-owned ingress agent.`,
         inputSchema: z.object({
             message: z.string().describe("Message to relay"),
             session_id: z
                 .string()
                 .optional()
                 .describe("Existing session ID (if omitted, a new session is spawned)"),
-            agent: z.string().optional().describe("Target agent name (default charon)"),
+            agent: z.string().optional().describe("Target agent name (default: the daemon's ingress agent)"),
             config: z.record(z.any()).optional().describe("Session config (for new sessions)"),
         }),
     }, async (params) => daemonCall("/gc/relay", params));
@@ -1522,7 +1522,7 @@ Actions:
                     ? params.timeout * 1000
                     : 30_000;
             // The daemon's capability watch takes `timeout` and `heartbeat` in ms
-            // and closes the stream itself at the deadline (GC-5424).
+            // and closes the stream itself at the deadline.
             const query = [];
             if (timeoutMs !== null)
                 query.push(`timeout=${timeoutMs}`);
@@ -1534,7 +1534,7 @@ Actions:
             });
             if (!resp.ok) {
                 const textBody = await resp.text().catch(() => "");
-                throw new Error(`REDACTED capability watch failed (${resp.status}): ${textBody}`);
+                throw new Error(`daemon capability watch failed (${resp.status}): ${textBody}`);
             }
             const { events, terminal, timed_out } = await collectSseStream(resp);
             const summary = terminal
@@ -1705,10 +1705,10 @@ Matching behavior:
         }),
     }, async (params) => daemonCall("/gc/skill", params));
     // ════════════════════════════════════════════════════════════════
-    // DAEMON TOOLS — Work (Bee DAG)
+    // DAEMON TOOLS — Work (dependency DAG)
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_work", {
-        description: `Bee work coordination: scoped issue queries, dependency-DAG analysis, reusable intents, measurements, projects, agents, assignments, and locks.
+        description: `Work coordination: scoped issue queries, dependency-DAG analysis, reusable intents, measurements, projects, agents, assignments, and locks.
 
 Choose the narrow action that answers the question; do not read bee.db directly and do not fetch the whole backlog to filter it yourself.
 - Latest issue activity in one project: query {project, status:"all", order:"updated_at:desc", limit}; updated_at includes coordination/bookkeeping mutations.
@@ -1767,7 +1767,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
                 "import_jsonl",
                 "backfill_projects",
             ])
-                .describe("Bee operation; see the tool description for task-to-action recipes."),
+                .describe("Work operation; see the tool description for task-to-action recipes."),
             title: z.string().optional().describe("Issue title"),
             description: z.string().optional().describe("Issue description (create/update). For register_project: the project description."),
             priority: zNumber()
@@ -1933,7 +1933,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
             fallback_project: z
                 .string()
                 .optional()
-                .describe("For action=backfill_projects: fallback project id for GC-* issues (default REDACTED)"),
+                .describe("For action=backfill_projects: fallback project id for issues that have none (default: the daemon's configured project)"),
             limit: zNumber()
                 .int()
                 .positive()
@@ -1963,7 +1963,7 @@ plan is a deprecated compatibility alias for critical_path; it is not the gc_pla
     // DAEMON TOOLS — Timeline
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_timeline", {
-        description: `Manage timeline events — deadlines, appointments, blocks, milestones. Links events to Bee issues and other entities.
+        description: `Manage timeline events — deadlines, appointments, blocks, milestones. Links events to work issues and other entities.
 Actions: create_event, update_event, delete_event, get, link, unlink, query, today, upcoming_deadlines, slipped.`,
         inputSchema: z.object({
             action: z
@@ -2040,9 +2040,9 @@ Actions: start_timer, stop_timer, log, log_agent_job, delete, running, query, ag
             resource: z
                 .string()
                 .optional()
-                .describe("Resource name: REDACTED, REDACTED, ops, etc."),
+                .describe("Resource name: e.g. host:heavy, ops, or a team name"),
             id: zNumber().optional().describe("Time entry ID"),
-            bee_issue_id: z.string().optional().describe("Bee issue ID to link to"),
+            bee_issue_id: z.string().optional().describe("Work issue ID to link to"),
             event_id: zNumber().optional().describe("Timeline event ID to link to"),
             started_at: z.string().optional().describe("Start time (ISO 8601)"),
             ended_at: z.string().optional().describe("End time (ISO 8601)"),
@@ -2074,7 +2074,7 @@ Actions: start_timer, stop_timer, log, log_agent_job, delete, running, query, ag
     // DAEMON TOOLS — Engagement / Timesheets
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_engagement", {
-        description: `Reconstruct engaged-attention hours from Timing presence plus project-touch events across Claude Code, pi, Codex, and Bee.
+        description: `Reconstruct engaged-attention hours from Timing presence plus project-touch events across Claude Code, pi, Codex, and other agent tools.
 Screen-first by default. File output only when target=file|both.
 Actions: compute, per_day, audit, sensitivity, projects, timesheet_export.`,
         inputSchema: z.object({
@@ -2257,12 +2257,12 @@ Actions: add, update, delete, get, query, runway, monthly, forecast, drift.`,
         }),
     }, async (params) => daemonCall("/gc/cash", params));
     // ════════════════════════════════════════════════════════════════
-    // DAEMON TOOLS — Leases (GC-6722)
+    // DAEMON TOOLS — Leases
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_lease", {
         description: `Leases on shared resources: counted host:heavy slots (full test suites, test DBs; default 2) and exclusive landing:<repo> (Gate → merge → deploy). FIFO waiting; liveness by heartbeat + TTL (a lapsed lease expires and the next waiter is admitted).
 Actions: acquire (returns state held | waiting+position | busy; poll by passing lease_id back), heartbeat, release (idempotent), list, show, run.
-run: the daemon runs a heavy command for you under a lease (default resource host:heavy): {command, cwd, issue}. The command is a plain argv (no shell: no pipes, &&, ;, redirects, quotes, globs or VAR=x) and must start with a permitted prefix (daemon config :lease_run_commands; default: mix test, mix ecto.create|migrate|reset, npm test, npm run test, pnpm test, yarn test, cargo test, pytest); anything else is refused. The allowlist constrains the executable prefix only (e.g. 'mix test <path>' or 'pytest <dir>' run the code they point at). It runs contained: writes are limited to the cwd tree plus a private scratch dir, and the call is refused if the daemon cannot contain it. The network is loopback-only (other destinations are denied; loopback ports and unix sockets stay open except container-runtime sockets, so a local service there can relay what the child sends it) and the child gets an allowlisted environment (no credentials). Children can still read files under the home directory except the containment credential deny list. It answers at once with {job_id, status: running} or {job_id, status: queued, position, resource} and starts by itself when a slot frees. Read the result with gc_dispatch action:status / output job_id=… , or pass wait:true to block until it ends (output tail returned). If a wait:true call errors with a timeout or transport error, the job is still running in the daemon: poll gc_dispatch status with its job_id (a transport may cut a call off after about 5 minutes). resource may be another host: capacity kind, never host:agent or landing:*. cwd must be a directory under ~/Sites. Use this for full test suites, test-DB setup and landings; it needs no hook or install in your harness. The output is readable while the job runs (gc_dispatch action:output job_id=… answers partial: true until it ends), an abort or a timeout keeps what was written, and gc_dispatch action:cancel job_id=… stops it. KNOWN LIMIT (GC-6913): about 50 tests of the REDACTED suite fail inside a contained run (they signal or probe processes outside the sandbox, write /tmp, or need services the profile denies), so a FULL REDACTED suite still goes through the gc-lease CLI (ops/gc-lease/gc-lease run host:heavy -- mix test) until those tests are made containment-aware.`,
+run: the daemon runs a heavy command for you under a lease (default resource host:heavy): {command, cwd, issue}. The command is a plain argv (no shell: no pipes, &&, ;, redirects, quotes, globs or VAR=x) and must start with a permitted prefix (daemon config :lease_run_commands; default: mix test, mix ecto.create|migrate|reset, npm test, npm run test, pnpm test, yarn test, cargo test, pytest); anything else is refused. The allowlist constrains the executable prefix only (e.g. 'mix test <path>' or 'pytest <dir>' run the code they point at). It runs contained: writes are limited to the cwd tree plus a private scratch dir, and the call is refused if the daemon cannot contain it. The network is loopback-only (other destinations are denied; loopback ports and unix sockets stay open except container-runtime sockets, so a local service there can relay what the child sends it) and the child gets an allowlisted environment (no credentials). Children can still read files under the home directory except the containment credential deny list. It answers at once with {job_id, status: running} or {job_id, status: queued, position, resource} and starts by itself when a slot frees. Read the result with gc_dispatch action:status / output job_id=… , or pass wait:true to block until it ends (output tail returned). If a wait:true call errors with a timeout or transport error, the job is still running in the daemon: poll gc_dispatch status with its job_id (a transport may cut a call off after about 5 minutes). resource may be another host: capacity kind, never host:agent or landing:*. cwd must be an absolute directory path. Use this for full test suites, test-DB setup and landings; it needs no hook or install in your harness. The output is readable while the job runs (gc_dispatch action:output job_id=… answers partial: true until it ends), an abort or a timeout keeps what was written, and gc_dispatch action:cancel job_id=… stops it. KNOWN LIMIT: about 50 tests of the daemon suite fail inside a contained run (they signal or probe processes outside the sandbox, write /tmp, or need services the profile denies), so a FULL daemon suite still goes through the separate lease CLI until those tests are made containment-aware.`,
         inputSchema: z.object({
             action: z
                 .enum(["acquire", "heartbeat", "release", "list", "show", "run"])
@@ -2270,12 +2270,12 @@ run: the daemon runs a heavy command for you under a lease (default resource hos
             resource: z
                 .string()
                 .optional()
-                .describe("Resource, e.g. host:heavy or landing:REDACTED_umbrella (acquire; optional filter for list)"),
+                .describe("Resource, e.g. host:heavy or landing:my-project (acquire; optional filter for list)"),
             holder: z
                 .string()
                 .optional()
                 .describe("Holder label: session/job/agent (acquire)"),
-            issue: z.string().optional().describe("Bee issue, e.g. GC-6722"),
+            issue: z.string().optional().describe("Issue ID"),
             cwd: z.string().optional().describe("Working directory of the holder"),
             pid: zNumber().optional().describe("Holder pid, if any"),
             ttl_s: zNumber()
@@ -2325,7 +2325,7 @@ Actions: create (piece), post (distribution), snapshot (manual metrics), ingest 
             id: z.string().optional().describe("Piece slug ID (for create)"),
             title: z.string().optional().describe("Piece title"),
             url: z.string().optional().describe("Canonical URL"),
-            brand: z.string().optional().describe("Brand: REDACTED, fosferon, sil"),
+            brand: z.string().optional().describe("Brand identifier"),
             category: z
                 .string()
                 .optional()
@@ -2443,7 +2443,7 @@ Actions: next, replan, profile, switch_profile, list_profiles, upsert_profile, r
             resource: z
                 .string()
                 .optional()
-                .describe("Resource name (default: REDACTED)"),
+                .describe("Resource name (optional; daemon default applies)"),
             name: z.string().optional().describe("Profile or resource name"),
             description: z.string().optional().describe("Profile description"),
             weights: z
@@ -2530,7 +2530,7 @@ invest, update_investment, investments, causal_chain, project, projections, expe
             handle: z
                 .string()
                 .optional()
-                .describe("Vector handle (e.g. revenue:REDACTED)"),
+                .describe("Vector handle (e.g. revenue:my-project)"),
             vector: z.string().optional().describe("Vector handle for linking"),
             name: z.string().optional().describe("Vector name"),
             category: z
@@ -2540,7 +2540,7 @@ invest, update_investment, investments, causal_chain, project, projections, expe
             domain: z
                 .string()
                 .optional()
-                .describe("Domain: REDACTED, fosferon, gc, etc."),
+                .describe("Domain: e.g. my-project, ops, gc"),
             status: z.string().optional().describe("active|dormant|emerged"),
             notes: z.string().optional().describe("Notes"),
             type: z
@@ -2652,7 +2652,7 @@ related projects, and strategy-sync metadata. Prefer this over maintaining sidec
     // DAEMON TOOLS — Dispatch (on-demand agent execution)
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_peer_conversation", {
-        description: `Persistent chat-style sessions with external A2A peers such as Pluto. Use this for dialogue, clarification, synthesis, and back-and-forth coordination. Do NOT use gc_dispatch for conversational turns; gc_dispatch is for job assignments.
+        description: `Persistent chat-style sessions with external A2A peers. Use this for dialogue, clarification, synthesis, and back-and-forth coordination. Do NOT use gc_dispatch for conversational turns; gc_dispatch is for job assignments.
 
 Actions:
   - create: open a new peer conversation session and bind it to a registered A2A peer
@@ -2823,11 +2823,11 @@ Default is fire-and-forget (returns job_id immediately). Set wait=true to block 
 
 Dispatch options: call_profile "worker" (default, a tool-using agent) or "completion" (one reply, no tools; refused for a route with no completion recipe, and also honoured by explain_route); idempotency_key (a repeated key with the same agent/task/profile returns the same job, a different one is a 409 idempotency_key_reused).
 
-Availability ledger (GC-6926): a route that refused at the door (usage limit, auth, containment denial) is remembered and skipped up front, with the declared fallback used and no attempt spent on the dead route; when retry_at passes the next real call probes it. action=availability lists the entries (state, reason, source, retry_at); clear:"provider" or "provider/model" forgets one; set:"provider[/model]" retry_at:"2026-11-10 13:57" (ISO 8601 with an offset, or in the machine's zone; must be in the future) state:quota|auth_failed|containment_denied|unhealthy reason:"..." records a reset time known from the provider's own page.
+Availability ledger: a route that refused at the door (usage limit, auth, containment denial) is remembered and skipped up front, with the declared fallback used and no attempt spent on the dead route; when retry_at passes the next real call probes it. action=availability lists the entries (state, reason, source, retry_at); clear:"provider" or "provider/model" forgets one; set:"provider[/model]" retry_at:"2026-11-10 13:57" (ISO 8601 with an offset, or in the machine's zone; must be in the future) state:quota|auth_failed|containment_denied|unhealthy reason:"..." records a reset time known from the provider's own page.
 
 Reading output: action=output returns the whole report by default, with total_bytes. A report longer than this tool's 16k-character response cap must be paged: offset/limit are BYTES of the UTF-8 report (a page never splits a character, and is never empty). Each page carries total_bytes, offset, returned_bytes, truncated and next_offset (null on the last page); pass next_offset back as offset. A limit of about 10000 keeps a page under the cap. A read of a job that has not finished carries partial: true (and its status): the text may still grow, and a gc_lease run job refreshes it about once a second.
 
-Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer (for example Pluto), use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
+Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer, use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
 Do not inspect past sessions to guess provider/model defaults. Use list_agents, list_providers, list_models, and especially resolve_dispatch instead.
 
 Semantics:
@@ -2926,7 +2926,7 @@ Claude-specific permission controls:
                 .string()
                 .optional()
                 .describe("Working directory (optional, defaults to project default)"),
-            issue: z.string().optional().describe("Bee issue ID to link (optional)"),
+            issue: z.string().optional().describe("Work issue ID to link (optional)"),
             on_complete: z
                 .string()
                 .optional()
@@ -3021,8 +3021,8 @@ Claude-specific permission controls:
         // - wait: true + "none" / "infinity" / "infinite" → no client abort at all.
         // - wait: true + integer → (seconds * 1000) + 10s buffer past daemon deadline.
         //   (The buffer differs by tool for no recorded reason: +10s here, +5s on
-        //   the run and capability watch streams, none on gc_workflow.)
-        // - wait: true + undefined → no client abort (GC-6928: no default deadline).
+        //   the run and capability watch streams, none on the workflow tool.)
+        // - wait: true + undefined → no client abort (no default deadline).
         let clientTimeoutMs = 15_000;
         if (params.action === "dispatch" && params.wait === true) {
             const t = params.timeout;
@@ -3033,7 +3033,7 @@ Claude-specific permission controls:
                 clientTimeoutMs = t * 1000 + 10_000;
             }
             else {
-                clientTimeoutMs = null; // GC-6928: the daemon default is no deadline
+                clientTimeoutMs = null; // the daemon default is no deadline
             }
         }
         return daemonCall("/gc/dispatch", params, clientTimeoutMs, MAX_RESPONSE_CHARS, params.action === "output" ? DISPATCH_OUTPUT_TRUNCATION_HINT : undefined);
@@ -3189,7 +3189,7 @@ Actions:
         body is refused with the parser's error;
       * a name with anything but lowercase letters, digits, _ and - is refused;
       * the parity-protected workflows (development-*, support-*) are refused —
-        change those in REDACTED priv/workflows and sync;
+        change those in the daemon's workflow config and sync;
       * a valid proposal is STAGED and answered with an error carrying
         recovery { kind: "needs_confirmation", confirm_id, expires_at,
         operator_prompt (with a diff), tool_result_for_model }. The operator
@@ -3327,14 +3327,14 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
             params: z
                 .string()
                 .optional()
-                .describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["REDACTED"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
+                .describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["my-project"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
             async: zBoolean()
                 .optional()
                 .describe("run: if true, return immediately with execution_id. resume: defaults to TRUE (answers 'resumed' at once); pass false to wait for the next checkpoint."),
             from_step: z
                 .string()
                 .optional()
-                .describe("resume: the step id to run again — an earlier step of the run, never the one it stopped at or a later one (GC-5425). Omit to continue from the checkpoint (or the halt's on_resume target)."),
+                .describe("resume: the step id to run again — an earlier step of the run, never the one it stopped at or a later one. Omit to continue from the checkpoint (or the halt's on_resume target)."),
             status: z
                 .string()
                 .optional()
@@ -3409,12 +3409,12 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         if (normalized.execution_id && !normalized.id) {
             normalized.id = normalized.execution_id;
         }
-        // GC-6365: a workflow write is confirmed by the operator in the GUI
+        // A workflow write is confirmed by the operator in the GUI
         // (confirm_write, which is not in this schema). Never forward an approval
         // a model put in its arguments, whatever the schema let through.
         delete normalized.approval;
-        // GC-5452: resume is async unless the caller says otherwise. The daemon
-        // has run resumes in a supervised task since GC-5439; holding an HTTP
+        // Resume is async unless the caller says otherwise. The daemon
+        // has run resumes in a supervised task for a while; holding an HTTP
         // request for a whole 7-20 minute stage was the shim's habit, not a need.
         if (params.action === "resume" && normalized.async === undefined) {
             normalized.async = true;
@@ -3426,7 +3426,7 @@ Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
         // - sync resume (async: false, no explicit timeout) → null: the daemon
         //   answers a resume only when the run reaches its next checkpoint, and a
         //   stage routinely takes 7-20 minutes, so any fixed default reports a
-        //   failure that did not happen (GC-5374)
+        //   failure that did not happen
         // - run/wait/watch (no explicit timeout) → 300s default (this is the client's own
         //   300 s abort; the daemon's sync wait budget is 15 min, :workflow_sync)
         // - everything else → 15s default
@@ -3882,7 +3882,7 @@ Actions: connect (register + connect), disconnect, remove, servers (list registe
     // DAEMON TOOLS — Ticker (Situational Awareness)
     // ════════════════════════════════════════════════════════════════
     server.registerTool("gc_ticker", {
-        description: `Situational awareness snapshot. Returns the latest ticker state from REDACTED.
+        description: `Situational awareness snapshot. Returns the latest ticker state from the daemon.
 Actions: "get" (default) = latest snapshot, "tick" = force a fresh tick.`,
         inputSchema: z.object({
             action: z
@@ -4542,7 +4542,7 @@ end tell`;
     // calls at whatever tracker the author happened to be working on.
     //
     // This default is honoured by the READ tools only. The write tools require an
-    // explicit `repo` — see the note on gh_issue_create. (GC-3726)
+    // explicit `repo` — see the note on gh_issue_create.
     const GH_DEFAULT_REPO = process.env.GH_DEFAULT_REPO ?? "";
     const GH_TOKEN_PATH = resolve(homedir(), ".config", "gh-token");
     function getGhToken() {
@@ -4600,7 +4600,7 @@ end tell`;
             body: z.string().describe("Issue body (markdown)"),
             // Required, unlike the read tools. A write that infers its target from
             // ambient config will eventually file into the wrong tracker, and the
-            // caller who omitted it gets no signal that it happened. (GC-3726)
+            // caller who omitted it gets no signal that it happened.
             repo: z
                 .string()
                 .describe("owner/repo — required; a write never infers its target"),
@@ -4653,7 +4653,6 @@ end tell`;
             number: zNumber().describe("Issue number"),
             // Required — see gh_issue_create. This tool also closes and reopens, so
             // an inferred target could change the state of someone else's issue.
-            // (GC-3726)
             repo: z
                 .string()
                 .describe("owner/repo — required; a write never infers its target"),
@@ -4713,7 +4712,7 @@ end tell`;
         inputSchema: z.object({
             number: zNumber().describe("Issue number"),
             body: z.string().describe("Comment body (markdown)"),
-            // Required — see gh_issue_create. (GC-3726)
+            // Required — see gh_issue_create.
             repo: z
                 .string()
                 .describe("owner/repo — required; a write never infers its target"),
