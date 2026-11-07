@@ -21,8 +21,8 @@ cd "$top" || {
 
 self='^scripts/public_guard(_test)?\.sh$'
 patterns=(
-  '~
-  '~/'
+  '/Us'"ers/[A-Za-z]"
+  '/ho'"me/[a-z]+/"
   '[A-Za-z0-9._%+-]+@gmail\.com'
   '\b192\.168\.[0-9]+\.[0-9]+'
   '\b10\.[0-9]+\.[0-9]+\.[0-9]+'
