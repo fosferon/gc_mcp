@@ -14,4 +14,16 @@ node_modules/
 # coupling is exactly what let src and dist drift apart for weeks (gc_records
 # was in src and missing from dist from f55c692 until agents@6b0641d), so if
 # packaging ever moves to npm, ignore dist/ and publish the artifact instead.
-# Tracked in GC-3719.
+
+# Internal audit reports and working papers stay out of the public tree.
+/audits/
+/notes/
+CLAUDE.md
+AGENTS.md
+.claude/
+.serena/
+.dev*/
+.planning/
+.cursor/
+.swarm/
+_bmad*/
