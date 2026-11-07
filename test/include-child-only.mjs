@@ -1,4 +1,4 @@
-// GC-6907: gc_workflow advertises `include_child_only` (list_workflows), accepts
+// gc_workflow advertises `include_child_only` (list_workflows), accepts
 // boolean and string forms, and still rejects unknown params.
 import assert from "node:assert/strict";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

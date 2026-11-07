@@ -1,8 +1,10 @@
-// GC-6858: gc_lease `run` reaches POST /gc/lease with exactly the caller's
+// gc_lease `run` reaches POST /gc/lease with exactly the caller's
 // parameters (coerced types, no extras, nothing dropped), including the
 // `wait: true` path, and the daemon's answer comes back unchanged.
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
@@ -38,20 +40,21 @@ try {
     callToolHandler({ method: "tools/call", params: { name: "gc_lease", arguments: args } }, {});
 
   // fire-and-forget form
-  let result = await call({ action: "run", command: "mix test", cwd: "~/Sites/r", issue: "GC-1", timeout_ms: "5000" });
+  const testCwd = join(tmpdir(), "gc-mcp-lease-test");
+  let result = await call({ action: "run", command: "mix test", cwd: testCwd, issue: "EX-1", timeout_ms: "5000" });
   assert.equal(seen.length, 1);
   assert.deepEqual(seen[0], {
     url: "/gc/lease",
     method: "POST",
-    body: { action: "run", command: "mix test", cwd: "~/Sites/r", issue: "GC-1", timeout_ms: 5000 },
+    body: { action: "run", command: "mix test", cwd: testCwd, issue: "EX-1", timeout_ms: 5000 },
   });
   const answer = JSON.parse(result.content[0].text);
   assert.deepEqual(answer, { ok: true, job_id: "j1", status: "queued", position: 2, resource: "host:heavy" });
 
   // wait:true form (no client-side timeout path) forwards the same way, wait coerced to a boolean
-  await call({ action: "run", command: "true", cwd: "~/Sites/r", wait: "true", resource: "host:heavy" });
+  await call({ action: "run", command: "true", cwd: testCwd, wait: "true", resource: "host:heavy" });
   assert.equal(seen.length, 2);
-  assert.deepEqual(seen[1].body, { action: "run", command: "true", cwd: "~/Sites/r", wait: true, resource: "host:heavy" });
+  assert.deepEqual(seen[1].body, { action: "run", command: "true", cwd: testCwd, wait: true, resource: "host:heavy" });
 
   process.stdout.write("gc_lease run forwards its parameters to /gc/lease unchanged.\n");
 } finally {

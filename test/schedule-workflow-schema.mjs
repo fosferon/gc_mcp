@@ -1,4 +1,4 @@
-// GC-6963: gc_schedule advertises the workflow action type, accepts `workflow`
+// gc_schedule advertises the workflow action type, accepts `workflow`
 // and `params` (object or JSON string), and says what a fire records and what a
 // manual fire leaves alone.
 import assert from "node:assert/strict";

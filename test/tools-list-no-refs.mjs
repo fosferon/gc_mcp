@@ -48,7 +48,7 @@ try {
   assert.equal(refs.length, 0, `tools/list should not advertise $ref schemas: ${JSON.stringify(refs.slice(0, 10), null, 2)}`);
   assert.ok(Array.isArray(result.tools) && result.tools.length > 0, "tools/list returned no tools");
 
-  // GC-5441: a bare count let a tool go missing for weeks — gc_a2a's
+  // A bare count let a tool go missing for weeks — gc_a2a's
   // registration sat inside getResolveBridgePath() and never ran, and "63
   // tools" looked fine. Every tool the server's own instructions advertise
   // must be in the list by name.

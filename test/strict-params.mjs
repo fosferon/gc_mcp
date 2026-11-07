@@ -180,7 +180,7 @@ try {
     "diagnostic lists registered parameters",
   );
 
-  assert.equal(daemonRequests, 0, "invalid parameters must not reach REDACTED");
+  assert.equal(daemonRequests, 0, "invalid parameters must not reach the daemon");
 
   const multipleUnknown = await callToolHandler(
     {
@@ -205,7 +205,7 @@ try {
         method: "tools/call",
         params: {
           name,
-          arguments: { __gc3703_undeclared_root_key: true },
+          arguments: { __undeclared_root_key: true },
         },
       },
       {},
@@ -218,7 +218,7 @@ try {
     );
     assert.match(
       allToolsResult.content?.[0]?.text || "",
-      /__gc3703_undeclared_root_key/,
+      /__undeclared_root_key/,
       `${name} diagnostic must name the undeclared root parameter`,
     );
   }
@@ -304,7 +304,7 @@ try {
     true,
     "gc_work must accept daemon-supported pagination and tree fields",
   );
-  assert.equal(daemonRequests, 1, "valid gc_work pagination reaches REDACTED");
+  assert.equal(daemonRequests, 1, "valid gc_work pagination reaches the daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     offset: 25,
@@ -320,8 +320,8 @@ try {
         name: "gc_work",
         arguments: {
           action: "critical_path",
-          root: "GC-42",
-          project: "REDACTED",
+          root: "EX-42",
+          project: "my-project",
           dependency_types: ["blocks", "waits_for"],
           depth: 12,
           detail: "minimal",
@@ -334,13 +334,13 @@ try {
   assert.notEqual(
     workPowerResult.isError,
     true,
-    "gc_work must expose scoped Bee graph analysis parameters",
+    "gc_work must expose scoped work graph analysis parameters",
   );
-  assert.equal(daemonRequests, 2, "valid graph analysis reaches REDACTED");
+  assert.equal(daemonRequests, 2, "valid graph analysis reaches the daemon");
   assert.deepEqual(daemonBody, {
     action: "critical_path",
-    root: "GC-42",
-    project: "REDACTED",
+    root: "EX-42",
+    project: "my-project",
     dependency_types: ["blocks", "waits_for"],
     depth: 12,
     detail: "minimal",
@@ -353,8 +353,8 @@ try {
         name: "gc_work",
         arguments: {
           action: "query",
-          text: "REDACTED",
-          projects: ["REDACTED_umbrella", "REDACTED"],
+          text: "example-client",
+          projects: ["my-project", "other-project"],
           status: "all",
           ready: true,
           assigned_to: "pluto",
@@ -370,13 +370,13 @@ try {
   assert.notEqual(
     workQueryResult.isError,
     true,
-    "gc_work must expose composable multi-project Bee queries",
+    "gc_work must expose composable multi-project work queries",
   );
-  assert.equal(daemonRequests, 3, "valid composable query reaches REDACTED");
+  assert.equal(daemonRequests, 3, "valid composable query reaches the daemon");
 
-  // GC-6363: the parent-tree fields the daemon's query/list/count read must be
+  // The parent-tree fields the daemon's query/list/count read must be
   // reachable. The strict root schema rejects any key it does not declare, so an
-  // undeclared `under` was not stripped but refused before reaching REDACTED.
+  // undeclared `under` was not stripped but refused before reaching the daemon.
   const workTreeResult = await callToolHandler(
     {
       method: "tools/call",
@@ -384,7 +384,7 @@ try {
         name: "gc_work",
         arguments: {
           action: "query",
-          under: "GC-5128",
+          under: "EX-5128",
           depth: 2,
           include_root: true,
           after: "cursor-token",
@@ -407,8 +407,8 @@ try {
     true,
     `gc_work must accept the parent-tree query fields: ${workTreeResult.content?.[0]?.text}`,
   );
-  assert.equal(daemonRequests, 4, "valid tree query reaches REDACTED");
-  assert.equal(daemonBody.under, "GC-5128");
+  assert.equal(daemonRequests, 4, "valid tree query reaches the daemon");
+  assert.equal(daemonBody.under, "EX-5128");
   assert.equal(daemonBody.include_root, true);
   assert.equal(daemonBody.after, "cursor-token");
 
@@ -419,8 +419,8 @@ try {
     },
     {},
   );
-  assert.notEqual(workParentList.isError, true, "list parent is forwarded to REDACTED");
-  assert.equal(daemonRequests, 5, "list parent reaches REDACTED");
+  assert.notEqual(workParentList.isError, true, "list parent is forwarded to the daemon");
+  assert.equal(daemonRequests, 5, "list parent reaches the daemon");
   assert.deepEqual(daemonBody, { action: "list", parent: "5128" });
 
   const requestsBeforeInvalidNotify = daemonRequests;
@@ -556,7 +556,7 @@ try {
   );
 
   assert.notEqual(nestedResult.isError, true, "declared nested map remains valid");
-  assert.equal(daemonRequests, 9, "valid calls reach REDACTED");
+  assert.equal(daemonRequests, 9, "valid calls reach the daemon");
   assert.deepEqual(daemonBody, {
     action: "list",
     params: { future_filter: { nested: "preserved" } },
@@ -620,7 +620,7 @@ try {
 
   process.stdout.write("Verified response truncation for oversized daemon payloads.\n");
 
-  // GC-6364: gc_dispatch output pages in bytes. offset/limit must reach the
+  // gc_dispatch output pages in bytes. offset/limit must reach the
   // daemon (the strict schema rejected offset before), and a cut dispatch
   // report must say how to read the rest.
   daemonBody = null;

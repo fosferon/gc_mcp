@@ -1,11 +1,10 @@
 # gc_mcp
 
-`gc_mcp` exposes Grand Central daemon capabilities as MCP tools.
+`gc_mcp` exposes a local daemon's capabilities as MCP tools.
 
 It is a client, not a server of record: every tool call is proxied to a running
-[`REDACTED`](https://github.com/fosferon/REDACTED). Without one listening on
-`GC_DAEMON_URL` (default `http://localhost:4242`) the tools will load and then
-fail to reach anything.
+daemon. Without one listening on `GC_DAEMON_URL` (default
+`http://localhost:4242`) the tools will load and then fail to reach anything.
 
 ## Install
 
@@ -36,7 +35,7 @@ From a clone, `npm install && npm run build` then point the client at
 ## Parameter validation
 
 Every tool rejects unsupported **top-level** parameters before its callback can
-contact `REDACTED`. MCP returns its standard `isError: true` tool result; the
+contact the daemon. MCP returns its standard `isError: true` tool result; the
 diagnostic names the rejected parameter and lists the parameters registered for
 that tool. This makes a misspelled or obsolete option recoverable instead of
 silently ignoring it.
@@ -44,16 +43,17 @@ silently ignoring it.
 This boundary does not alter nested payload contracts: a declared map or object
 parameter continues to accept the nested values its existing schema allows.
 
-## Bee work queries
+## Work queries
 
-`gc_work` exposes Bee's query and dependency-analysis engine directly. Prefer a
-bounded server-side query over fetching a backlog and filtering it in the client:
+The work-query tool exposes a query and dependency-analysis engine directly.
+Prefer a bounded server-side query over fetching a backlog and filtering it in
+the client:
 
 ```json
 {
   "action": "query",
-  "text": "REDACTED",
-  "projects": ["REDACTED_umbrella", "REDACTED"],
+  "text": "example-client",
+  "projects": ["my-project", "other-project"],
   "status": "all",
   "order": "updated_at:desc",
   "detail": "compact",
@@ -75,7 +75,7 @@ analysis. Call the relevant list action before guessing stored vocabulary.
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `GC_DAEMON_URL` | `http://localhost:4242` | Base URL of the `REDACTED` this wraps. |
+| `GC_DAEMON_URL` | `http://localhost:4242` | Base URL of the daemon this wraps. |
 | `GC_MCP_TRANSPORT` | `stdio` | `stdio`, `streamable-http`, or `all`. |
 | `GC_MCP_HOST` | `127.0.0.1` | Bind host, `streamable-http` only. |
 | `GC_MCP_PORT` | `8765` | Bind port, `streamable-http` only. |
@@ -93,3 +93,16 @@ Reads carry no such consequence, so they may fall back to the environment.
 
 There is deliberately no compiled-in default. A shipped repository name aims
 every installation's bare calls at whatever tracker the author last worked on.
+
+## Contributing
+
+Enable the repository hooks once per clone; the pre-push hook runs the public
+guard over every commit being pushed:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`npm test` builds and runs the test suite. The public guard can also be run
+directly with `bash scripts/public_guard.sh`; it fails closed when the private
+term list is unavailable and `PUBLIC_GUARD_REQUIRE_EXTRA=1` is set.

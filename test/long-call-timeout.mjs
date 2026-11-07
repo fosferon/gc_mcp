@@ -1,4 +1,4 @@
-// GC-5374 — a daemon call that blocks longer than 300 s must not be cut by the
+// A daemon call that blocks longer than 300 s must not be cut by the
 // HTTP client, and a transport failure must say what it was.
 //
 // The fast half runs in `npm test`. The slow half is the real thing — a server
@@ -68,7 +68,7 @@ try {
   const lastInit = () => seen.at(-1).init;
   const lastBody = () => JSON.parse(lastInit().body);
 
-  // GC-5452: resume is async unless told otherwise, and from_step travels.
+  // Resume is async unless told otherwise, and from_step travels.
   await callTool("gc_workflow", { action: "resume", id: "wf-1", from_step: "audit" });
   assert.equal(lastBody().async, true, "resume defaults to async: true");
   assert.equal(lastBody().from_step, "audit", "from_step must reach the daemon");
@@ -136,13 +136,13 @@ try {
     assert.equal(lastInit().dispatcher, dispatcher, "one shared dispatcher for every daemon call");
   }
 
-  // GC-6928: agent work has no default deadline, so wait:true with no timeout
+  // Agent work has no default deadline, so wait:true with no timeout
   // carries no client-side abort either; an explicit timeout still does.
   await callTool("gc_dispatch", { action: "dispatch", agent: "auditor", task: "t", wait: true });
   assert.equal(
     lastInit().signal,
     undefined,
-    "gc_dispatch wait:true with no timeout must carry no client-side deadline (GC-6928)",
+    "gc_dispatch wait:true with no timeout must carry no client-side deadline",
   );
   await callTool("gc_dispatch", {
     action: "dispatch",

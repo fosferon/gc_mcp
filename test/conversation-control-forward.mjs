@@ -1,4 +1,4 @@
-// GC-6985/6986: gc_conversation reaches the daemon's turn controls. `stop` and
+// gc_conversation reaches the daemon's turn controls. `stop` and
 // `release_effect_fence` POST to their routes, `effect_fence` GETs the fence,
 // and cut_in carries its `mode` (zod strips unknown keys, so a missing schema
 // field would silently drop it and every cut-in would be a queue).
@@ -57,7 +57,7 @@ try {
   assert.equal(seen.at(-1).body.mode, "interrupt");
   assert.equal(seen.at(-1).body.message, "change course");
 
-  // gc_agent_conversation stop (GC-6986 audit r1 F2)
+  // gc_agent_conversation stop
   await callToolHandler(
     { method: "tools/call", params: { name: "gc_agent_conversation", arguments: { action: "stop", session_id: "a1" } } },
     {},

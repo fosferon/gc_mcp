@@ -1,4 +1,4 @@
-// GC-6926: gc_dispatch advertises explain_route and availability, and dispatch's
+// gc_dispatch advertises explain_route and availability, and dispatch's
 // call_profile / idempotency_key / metadata, and passes them through to the daemon unchanged.
 import assert from "node:assert/strict";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";

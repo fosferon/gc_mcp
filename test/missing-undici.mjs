@@ -1,4 +1,4 @@
-// GC-5374 — harnesses launch the committed dist/index.js from a checkout with
+// Harnesses launch the committed dist/index.js from a checkout with
 // no install step. On a tree whose node_modules predates the undici dependency
 // the server must still start, fall back to plain fetch, and say what to do.
 
