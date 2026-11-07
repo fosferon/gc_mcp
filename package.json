@@ -1,7 +1,7 @@
 {
   "name": "@fosferon/gc-mcp",
-  "version": "1.5.0",
-  "description": "Universal MCP server for Grand Central — exposes REDACTED API as MCP tools",
+  "version": "1.5.1",
+  "description": "Universal MCP server that exposes a local daemon's API as MCP tools",
   "keywords": [
     "mcp",
     "model-context-protocol",
@@ -31,7 +31,8 @@
     "dist",
     "src",
     "README.md",
-    "LICENSE"
+    "LICENSE",
+    "package.json"
   ],
   "engines": {
     "node": ">=20.18.1"
