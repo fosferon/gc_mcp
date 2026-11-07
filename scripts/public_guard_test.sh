@@ -55,6 +55,18 @@ XFILE=''
 reset; add READINESS.md "x"; add DEVELOPMENT.md "y";                    expect 0 "READINESS and DEVELOPMENT are standard files"
 EXTRA=""
 
+# Repo-local literal allowlist (.public-guard-allow). Only exact, whole tokens are
+# removed before extra patterns are matched; the allow file is not a scan exemption.
+allowfile() { printf '%s\n' "$@" > .public-guard-allow; git add .public-guard-allow; }
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 0 "allowlisted exact token passes"
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"; c = "Acmecorp"'; EXTRA=$'allowed_token\nacmecorp' expect 1 "allowlisted token does not hide a second extra term"
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN_EXTRA"'; EXTRA='allowed_token' expect 1 "token containing an allowlisted token as a substring still fails"
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 0 "adjacent allowlisted tokens are all removed"
+reset; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 1 "no allow file means no allowance"
+reset; add .public-guard-allow ''; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 1 "empty allow file means no allowance"
+reset; add .public-guard-allow "path = \"/Us""ers/someone/x\""; add lib/a.ex 'x'; expect 1 "allow file is still scanned for built-in patterns"
+EXTRA=""
+
 # Fail closed: no work tree, or nothing tracked, must never report clean.
 reset;                                                                  expect 1 "tree with only the guard tracked fails closed"
 reset; git rm -rq --cached .;                                           expect 1 "zero tracked files fails closed"

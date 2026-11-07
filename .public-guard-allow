@@ -1,0 +1,8 @@
+# Literal identifiers that this public client deliberately exposes as part of the
+# daemon's public API contract. One exact token per line; no patterns. These are
+# removed from a line before the extra (client-name) patterns are matched.
+GC_DAEMON_URL
+GC_WORKFLOW_STATE_DIR
+gc_work
+gc_workflow
+gc_workflow_watch
