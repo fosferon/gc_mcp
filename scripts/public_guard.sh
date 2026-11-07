@@ -101,7 +101,7 @@ if [[ -z "$names" ]]; then
   exit 1
 fi
 
-artefacts=$(echo "$names" | grep -E '(^|/)(CLAUDE\.md|AGENTS\.md|\.claude/|\.serena/|\.REDACTED/|_bmad[^/]*/|\.planning/|\.cursor/|\.swarm/|node_modules/|\.npmrc|\.env($|\.))' || true)
+artefacts=$(echo "$names" | grep -E '(^|/)(CLAUDE\.md|AGENTS\.md|\.claude/|\.serena/|\.dev'"man/"'|_bmad[^/]*/|\.planning/|\.cursor/|\.swarm/|node_modules/|\.npmrc|\.env($|\.))' || true)
 papers=$(echo "$names" | grep -E '^[A-Z0-9_]+\.md$' | grep -Ev '^(README|CHANGELOG|LICENSE|CONTRIBUTING|SECURITY|CODE_OF_CONDUCT|READINESS|DEVELOPMENT)\.md$' || true)
 if [[ -n "$artefacts$papers" ]]; then
   echo "public_guard: internal artefacts or working papers are tracked:"; printf "%s\n%s\n" "$artefacts" "$papers" | sed '/^$/d; s/^/  /'

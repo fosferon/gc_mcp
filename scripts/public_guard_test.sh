@@ -26,7 +26,7 @@ reset; add lib/a.ex "host = \"10.""0.0.7\"";                          expect 1 "
 reset; add lib/a.ex "# fixed in G""C-1234";                            expect 1 "internal issue reference"
 reset; add lib/a.ex "# see g""c2727 run";                               expect 1 "internal issue reference without hyphen"
 reset; add lib/a.ex "branch g""c/6835-x";                               expect 1 "internal branch name"
-for a in CLAUDE.md AGENTS.md .claude/x .serena/x .REDACTED/x .planning/x .cursor/x .swarm/x; do
+for a in CLAUDE.md AGENTS.md .claude/x .serena/x ".dev""man/x" .planning/x .cursor/x .swarm/x; do
   reset; add "$a" 'x';                                                 expect 1 "AI-tool artefact $a"
 done
 reset; add _bmad-output/x.md 'x';                                      expect 1 "planning artefact"
