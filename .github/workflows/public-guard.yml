@@ -1,0 +1,29 @@
+name: public-guard
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  guard:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Guard fixture test
+        run: bash scripts/public_guard_test.sh
+      - name: Content guard
+        env:
+          PUBLIC_GUARD_EXTRA: ${{ secrets.PUBLIC_GUARD_EXTRA }}
+          # Secrets are absent on pull requests from forks; there the built-in
+          # patterns still run, and the push to the default branch afterwards runs
+          # the full set. Fork pushes need no extras; canonical pushes do under any
+          # owner or name. Dependabot runs receive no secrets, so they use the
+          # built-in patterns only.
+          PUBLIC_GUARD_REQUIRE_EXTRA: ${{ ((github.event_name == 'push' && !github.event.repository.fork) || github.event.pull_request.head.repo.full_name == github.repository) && github.actor != 'dependabot[bot]' && '1' || '' }}
+        run: bash scripts/public_guard.sh
+      - name: Secret scan (full history)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
