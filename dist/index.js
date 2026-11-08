@@ -54,51 +54,74 @@ const daemonDispatcher = await import("undici")
     process.stderr.write(`gc_mcp: undici is not installed (${e?.code ?? e?.message}); daemon calls longer than 300 s will fail. Run \`npm install\` in the gc_mcp checkout.\n`);
     return undefined;
 });
-const connectionStore = new AsyncLocalStorage();
+const callStore = new AsyncLocalStorage();
 function newConnection() {
-    return { id: `gcmcp-${randomUUID()}`, pendingAck: [], inlineSeqs: [] };
+    return { id: `gcmcp-${randomUUID()}`, pendingAck: [], queue: Promise.resolve() };
 }
 /** A daemon answer that returned a delegation's result inline carries its seq. */
 function noteInlineSeq(json) {
     const seq = json?.delegation_seq ?? json?.data?.delegation_seq;
-    const conn = connectionStore.getStore();
-    if (conn && Number.isInteger(seq))
-        conn.inlineSeqs.push(seq);
+    const call = callStore.getStore();
+    if (call && Number.isInteger(seq))
+        call.inlineSeqs.push(seq);
 }
 const DELIVERY_HEADER = "[finished since your last call]";
 /**
- * Fetch this connection's finished delegations and return the block to append,
- * or null. Never throws: delivery must not break the tool call it rides on.
+ * Run `fn` after every earlier delivery step of this connection has finished,
+ * so parallel tool calls cannot interleave their take and acknowledgement.
  */
-async function takeDelegations(conn) {
-    const ack = conn.pendingAck;
-    const inline = new Set(conn.inlineSeqs);
-    try {
-        const resp = await daemonFetch(`${GC_BASE}/gc/delegations/take`, {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-gc-client": conn.id },
-            body: JSON.stringify({ ack }),
-            signal: AbortSignal.timeout(3_000),
-        });
-        if (!resp.ok)
-            return null;
-        const json = await resp.json();
-        const outcomes = json?.outcomes ?? json?.data?.outcomes ?? [];
-        // Acknowledged now; what this response shows (and what it returned inline)
-        // is acknowledged by the next call.
-        conn.pendingAck = [...new Set([...outcomes.map((o) => o.seq), ...inline])];
+function serialized(conn, fn) {
+    const next = conn.queue.then(fn, fn);
+    conn.queue = next.catch(() => undefined);
+    return next;
+}
+/**
+ * Append this connection's finished delegations to `result` and return it.
+ * The previous responses' seqs are acknowledged by this take; the seqs this
+ * response shows (and the ones it returned inline) become pending only once the
+ * block is actually attached, so a line that is never returned is never
+ * acknowledged. Never throws: delivery must not break the call it rides on.
+ */
+async function deliver(call, result) {
+    const { conn } = call;
+    return serialized(conn, async () => {
+        const ack = conn.pendingAck;
+        const inline = new Set(call.inlineSeqs);
+        let outcomes;
+        try {
+            const resp = await daemonFetch(`${GC_BASE}/gc/delegations/take`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json", "x-gc-client": conn.id },
+                body: JSON.stringify({ ack }),
+                signal: AbortSignal.timeout(3_000),
+            });
+            if (!resp.ok) {
+                // Not taken, so nothing was acknowledged: keep the pending seqs, add
+                // this call's inline ones.
+                conn.pendingAck = [...new Set([...ack, ...inline])];
+                return result;
+            }
+            const json = await resp.json();
+            outcomes = json?.outcomes ?? json?.data?.outcomes ?? [];
+        }
+        catch {
+            conn.pendingAck = [...new Set([...ack, ...inline])];
+            return result;
+        }
+        // The take acknowledged `ack`. What is returned now is pending.
         const shown = outcomes.filter((o) => !inline.has(o.seq));
-        return shown.length ? [DELIVERY_HEADER, ...shown.map((o) => o.line)].join("\n") : null;
-    }
-    catch {
-        return null;
-    }
-    finally {
-        conn.inlineSeqs = [];
-    }
+        const attachable = shown.length > 0 && result && Array.isArray(result.content);
+        conn.pendingAck = [
+            ...new Set([...(attachable ? shown.map((o) => o.seq) : []), ...inline]),
+        ];
+        if (!attachable)
+            return result;
+        const block = [DELIVERY_HEADER, ...shown.map((o) => o.line)].join("\n");
+        return { ...result, content: [...result.content, { type: "text", text: block }] };
+    });
 }
 function daemonFetch(url, init = {}) {
-    const conn = connectionStore.getStore();
+    const conn = callStore.getStore()?.conn;
     if (conn) {
         const headers = new Headers(init.headers ?? {});
         if (!headers.has("x-gc-client"))
@@ -630,13 +653,13 @@ function buildMcpServer() {
     server.registerTool = ((name, config, callback) => registerTool(name, {
         ...config,
         inputSchema: strictRootInputSchema(config.inputSchema),
-    }, (async (...args) => connectionStore.run(connection, async () => {
-        const result = await callback(...args);
-        const block = await takeDelegations(connection);
-        if (!block || !result || !Array.isArray(result.content))
-            return result;
-        return { ...result, content: [...result.content, { type: "text", text: block }] };
-    }))));
+    }, (async (...args) => {
+        const call = { conn: connection, inlineSeqs: [] };
+        return callStore.run(call, async () => {
+            const result = await callback(...args);
+            return deliver(call, result);
+        });
+    })));
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Memory
     // ════════════════════════════════════════════════════════════════

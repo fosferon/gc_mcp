@@ -78,58 +78,89 @@ const daemonDispatcher: unknown = await import("undici")
 
 interface Connection {
   id: string;
-  /** seqs handed on in the last response, acknowledged on the next take */
+  /** seqs handed on in returned responses, acknowledged by the next take */
   pendingAck: number[];
-  /** seqs whose results this call returned inline */
+  /** serializes take + acknowledgement across this connection's parallel calls */
+  queue: Promise<unknown>;
+}
+
+/** One tool call: its connection, and the seqs whose results it returned inline. */
+interface CallContext {
+  conn: Connection;
   inlineSeqs: number[];
 }
 
-const connectionStore = new AsyncLocalStorage<Connection>();
+const callStore = new AsyncLocalStorage<CallContext>();
 
 function newConnection(): Connection {
-  return { id: `gcmcp-${randomUUID()}`, pendingAck: [], inlineSeqs: [] };
+  return { id: `gcmcp-${randomUUID()}`, pendingAck: [], queue: Promise.resolve() };
 }
 
 /** A daemon answer that returned a delegation's result inline carries its seq. */
 function noteInlineSeq(json: any): void {
   const seq = json?.delegation_seq ?? json?.data?.delegation_seq;
-  const conn = connectionStore.getStore();
-  if (conn && Number.isInteger(seq)) conn.inlineSeqs.push(seq);
+  const call = callStore.getStore();
+  if (call && Number.isInteger(seq)) call.inlineSeqs.push(seq);
 }
 
 const DELIVERY_HEADER = "[finished since your last call]";
 
 /**
- * Fetch this connection's finished delegations and return the block to append,
- * or null. Never throws: delivery must not break the tool call it rides on.
+ * Run `fn` after every earlier delivery step of this connection has finished,
+ * so parallel tool calls cannot interleave their take and acknowledgement.
  */
-async function takeDelegations(conn: Connection): Promise<string | null> {
-  const ack = conn.pendingAck;
-  const inline = new Set(conn.inlineSeqs);
-  try {
-    const resp = await daemonFetch(`${GC_BASE}/gc/delegations/take`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json", "x-gc-client": conn.id },
-      body: JSON.stringify({ ack }),
-      signal: AbortSignal.timeout(3_000),
-    });
-    if (!resp.ok) return null;
-    const json: any = await resp.json();
-    const outcomes: Array<{ seq: number; line: string }> = json?.outcomes ?? json?.data?.outcomes ?? [];
-    // Acknowledged now; what this response shows (and what it returned inline)
-    // is acknowledged by the next call.
-    conn.pendingAck = [...new Set([...outcomes.map((o) => o.seq), ...inline])];
+function serialized<T>(conn: Connection, fn: () => Promise<T>): Promise<T> {
+  const next = conn.queue.then(fn, fn);
+  conn.queue = next.catch(() => undefined);
+  return next;
+}
+
+/**
+ * Append this connection's finished delegations to `result` and return it.
+ * The previous responses' seqs are acknowledged by this take; the seqs this
+ * response shows (and the ones it returned inline) become pending only once the
+ * block is actually attached, so a line that is never returned is never
+ * acknowledged. Never throws: delivery must not break the call it rides on.
+ */
+async function deliver(call: CallContext, result: any): Promise<any> {
+  const { conn } = call;
+  return serialized(conn, async () => {
+    const ack = conn.pendingAck;
+    const inline = new Set(call.inlineSeqs);
+    let outcomes: Array<{ seq: number; line: string }>;
+    try {
+      const resp = await daemonFetch(`${GC_BASE}/gc/delegations/take`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "x-gc-client": conn.id },
+        body: JSON.stringify({ ack }),
+        signal: AbortSignal.timeout(3_000),
+      });
+      if (!resp.ok) {
+        // Not taken, so nothing was acknowledged: keep the pending seqs, add
+        // this call's inline ones.
+        conn.pendingAck = [...new Set([...ack, ...inline])];
+        return result;
+      }
+      const json: any = await resp.json();
+      outcomes = json?.outcomes ?? json?.data?.outcomes ?? [];
+    } catch {
+      conn.pendingAck = [...new Set([...ack, ...inline])];
+      return result;
+    }
+    // The take acknowledged `ack`. What is returned now is pending.
     const shown = outcomes.filter((o) => !inline.has(o.seq));
-    return shown.length ? [DELIVERY_HEADER, ...shown.map((o) => o.line)].join("\n") : null;
-  } catch {
-    return null;
-  } finally {
-    conn.inlineSeqs = [];
-  }
+    const attachable = shown.length > 0 && result && Array.isArray(result.content);
+    conn.pendingAck = [
+      ...new Set([...(attachable ? shown.map((o) => o.seq) : []), ...inline]),
+    ];
+    if (!attachable) return result;
+    const block = [DELIVERY_HEADER, ...shown.map((o) => o.line)].join("\n");
+    return { ...result, content: [...result.content, { type: "text", text: block }] };
+  });
 }
 
 function daemonFetch(url: string, init: RequestInit = {}): Promise<Response> {
-  const conn = connectionStore.getStore();
+  const conn = callStore.getStore()?.conn;
   if (conn) {
     const headers = new Headers(init.headers ?? {});
     if (!headers.has("x-gc-client")) headers.set("x-gc-client", conn.id);
@@ -811,13 +842,13 @@ function buildMcpServer() {
         ...config,
         inputSchema: strictRootInputSchema(config.inputSchema),
       } as unknown as typeof config,
-      (async (...args: any[]) =>
-        connectionStore.run(connection, async () => {
+      (async (...args: any[]) => {
+        const call: CallContext = { conn: connection, inlineSeqs: [] };
+        return callStore.run(call, async () => {
           const result: any = await (callback as any)(...args);
-          const block = await takeDelegations(connection);
-          if (!block || !result || !Array.isArray(result.content)) return result;
-          return { ...result, content: [...result.content, { type: "text", text: block }] };
-        })) as unknown as typeof callback,
+          return deliver(call, result);
+        });
+      }) as unknown as typeof callback,
     )) as typeof server.registerTool;
 
 // ════════════════════════════════════════════════════════════════
