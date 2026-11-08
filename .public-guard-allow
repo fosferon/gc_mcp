@@ -2,6 +2,10 @@
 # daemon's public API contract. One exact token per line; no patterns. These are
 # removed from a line before the extra (client-name) patterns are matched.
 GC_DAEMON_URL
+# Appears only in the gc_workflow tool description, as an env var the daemon sets
+# for workflow shell steps; gc_mcp itself never reads it. It is listed because it
+# is a public API identifier that description advertises and must stay publishable,
+# while the extra-pattern scan would otherwise flag it.
 GC_WORKFLOW_STATE_DIR
 gc_work
 gc_workflow

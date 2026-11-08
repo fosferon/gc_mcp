@@ -61,7 +61,16 @@ allowfile() { printf '%s\n' "$@" > .public-guard-allow; git add .public-guard-al
 reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 0 "allowlisted exact token passes"
 reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"; c = "Acmecorp"'; EXTRA=$'allowed_token\nacmecorp' expect 1 "allowlisted token does not hide a second extra term"
 reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN_EXTRA"'; EXTRA='allowed_token' expect 1 "token containing an allowlisted token as a substring still fails"
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "allowed_token"'; EXTRA='allowed_token' expect 1 "differently-cased allowlisted token is not removed and still fails"
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"; c = "AcMeCorp"'; EXTRA='acmecorp' expect 1 "differently-cased extra term on an allowlisted line still fails"
 reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 0 "adjacent allowlisted tokens are all removed"
+# Accepted limitation: the whole allowlisted token is removed before extra patterns
+# are matched, so an extra pattern occurring only inside such a token is invisible.
+# That is acceptable because the allowlist holds only our own public identifiers
+# (daemon env vars and work/workflow tool names), so a term matching inside one is
+# part of a reviewed public identifier; whole-token removal is also what lets
+# adjacent allowlisted tokens pass.
+reset; allowfile 'ALLOWED_TOKEN'; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='token' expect 0 "term embedded inside an allowlisted token is not detected (accepted limitation)"
 reset; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 1 "no allow file means no allowance"
 reset; add .public-guard-allow ''; add lib/a.ex 'v = "ALLOWED_TOKEN"'; EXTRA='allowed_token' expect 1 "empty allow file means no allowance"
 reset; add .public-guard-allow "path = \"/Us""ers/someone/x\""; add lib/a.ex 'x'; expect 1 "allow file is still scanned for built-in patterns"
