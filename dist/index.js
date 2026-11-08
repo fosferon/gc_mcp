@@ -21,6 +21,7 @@ import { z } from "zod";
 import * as z4 from "zod/v4";
 import { execFileSync, execSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
 import { resolve, dirname, join } from "node:path";
@@ -53,7 +54,57 @@ const daemonDispatcher = await import("undici")
     process.stderr.write(`gc_mcp: undici is not installed (${e?.code ?? e?.message}); daemon calls longer than 300 s will fail. Run \`npm install\` in the gc_mcp checkout.\n`);
     return undefined;
 });
+const connectionStore = new AsyncLocalStorage();
+function newConnection() {
+    return { id: `gcmcp-${randomUUID()}`, pendingAck: [], inlineSeqs: [] };
+}
+/** A daemon answer that returned a delegation's result inline carries its seq. */
+function noteInlineSeq(json) {
+    const seq = json?.delegation_seq ?? json?.data?.delegation_seq;
+    const conn = connectionStore.getStore();
+    if (conn && Number.isInteger(seq))
+        conn.inlineSeqs.push(seq);
+}
+const DELIVERY_HEADER = "[finished since your last call]";
+/**
+ * Fetch this connection's finished delegations and return the block to append,
+ * or null. Never throws: delivery must not break the tool call it rides on.
+ */
+async function takeDelegations(conn) {
+    const ack = conn.pendingAck;
+    const inline = new Set(conn.inlineSeqs);
+    try {
+        const resp = await daemonFetch(`${GC_BASE}/gc/delegations/take`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-gc-client": conn.id },
+            body: JSON.stringify({ ack }),
+            signal: AbortSignal.timeout(3_000),
+        });
+        if (!resp.ok)
+            return null;
+        const json = await resp.json();
+        const outcomes = json?.outcomes ?? json?.data?.outcomes ?? [];
+        // Acknowledged now; what this response shows (and what it returned inline)
+        // is acknowledged by the next call.
+        conn.pendingAck = [...new Set([...outcomes.map((o) => o.seq), ...inline])];
+        const shown = outcomes.filter((o) => !inline.has(o.seq));
+        return shown.length ? [DELIVERY_HEADER, ...shown.map((o) => o.line)].join("\n") : null;
+    }
+    catch {
+        return null;
+    }
+    finally {
+        conn.inlineSeqs = [];
+    }
+}
 function daemonFetch(url, init = {}) {
+    const conn = connectionStore.getStore();
+    if (conn) {
+        const headers = new Headers(init.headers ?? {});
+        if (!headers.has("x-gc-client"))
+            headers.set("x-gc-client", conn.id);
+        init = { ...init, headers };
+    }
     if (daemonDispatcher === undefined)
         return fetch(url, init);
     return fetch(url, { ...init, dispatcher: daemonDispatcher });
@@ -112,7 +163,9 @@ async function gcPost(path, body, timeoutMs = 15_000) {
         const text = await resp.text().catch(() => "");
         throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
     }
-    return resp.json();
+    const json = await resp.json();
+    noteInlineSeq(json);
+    return json;
 }
 async function gcGet(path) {
     const url = `${GC_BASE}${path}`;
@@ -566,13 +619,24 @@ function buildMcpServer() {
             "gc_peer_conversation is the chat-style lane for ongoing dialogue with external A2A peers; use it instead of gc_dispatch when you want a conversation rather than a job.",
         ].join(" "),
     });
+    // GC-6860: this connection's delivery address and acknowledgement state.
+    const connection = newConnection();
     // Keep strict root validation registration-level so every current and future
     // tool receives the same boundary guarantee without per-tool boilerplate.
+    // The same wrapper runs every tool call as this connection (so daemon calls
+    // carry its id) and appends its finished delegations as a second content item,
+    // after any truncation, so a tool whose text is JSON still parses.
     const registerTool = server.registerTool.bind(server);
     server.registerTool = ((name, config, callback) => registerTool(name, {
         ...config,
         inputSchema: strictRootInputSchema(config.inputSchema),
-    }, callback));
+    }, (async (...args) => connectionStore.run(connection, async () => {
+        const result = await callback(...args);
+        const block = await takeDelegations(connection);
+        if (!block || !result || !Array.isArray(result.content))
+            return result;
+        return { ...result, content: [...result.content, { type: "text", text: block }] };
+    }))));
     // ════════════════════════════════════════════════════════════════
     // DAEMON TOOLS — Memory
     // ════════════════════════════════════════════════════════════════

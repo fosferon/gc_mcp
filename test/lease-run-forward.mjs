@@ -15,7 +15,8 @@ const daemon = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
-    seen.push({ url: req.url, method: req.method, body: JSON.parse(body || "{}") });
+    // GC-6860: the delivery read after every tool call is not part of this test.
+    if (req.url !== "/gc/delegations/take") seen.push({ url: req.url, method: req.method, body: JSON.parse(body || "{}") });
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({ ok: true, job_id: "j1", status: "queued", position: 2, resource: "host:heavy" }));
   });

@@ -61,6 +61,8 @@ try {
   // ── every daemon request carries the no-limit dispatcher ────────────────
   const seen = [];
   globalThis.fetch = async (url, init = {}) => {
+    // GC-6860: the delivery read after every tool call is not part of this test.
+    if (String(url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     seen.push({ url: String(url), init });
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };

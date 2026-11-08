@@ -83,6 +83,8 @@ try {
   };
 
   globalThis.fetch = async (_url, init) => {
+    // GC-6860: the delivery read after every tool call is not counted here.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     daemonRequests += 1;
     daemonBody = JSON.parse(init.body);
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -443,6 +445,8 @@ try {
   );
 
   globalThis.fetch = async (_url, init) => {
+    // GC-6860: the delivery read after every tool call is not counted here.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     daemonRequests += 1;
     daemonBody = JSON.parse(init.body);
 
@@ -490,6 +494,8 @@ try {
   assert.equal(notifyResponse.next_cursor_id, "cursor-2");
 
   globalThis.fetch = async (_url, init) => {
+    // GC-6860: the delivery read after every tool call is not counted here.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     daemonRequests += 1;
     daemonBody = JSON.parse(init.body);
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
@@ -613,6 +619,8 @@ try {
 
   // Restore the simple mock for any future additions.
   globalThis.fetch = async (_url, init) => {
+    // GC-6860: the delivery read after every tool call is not counted here.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     daemonRequests += 1;
     daemonBody = JSON.parse(init.body);
     return new Response(JSON.stringify({ ok: true }), { status: 200 });

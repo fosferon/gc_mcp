@@ -52,6 +52,8 @@ try {
 
   // pass-through: the daemon receives the new fields exactly as given
   globalThis.fetch = async (_url, init) => {
+    // GC-6860: the delivery read after every tool call is not part of this test.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     sent = JSON.parse(init.body);
     return new Response(JSON.stringify({ ok: true, entries: [] }), { status: 200, headers: { "content-type": "application/json" } });
   };

@@ -56,6 +56,8 @@ try {
 
   let lastInit = null;
   globalThis.fetch = async (_url, init = {}) => {
+    // GC-6860: the delivery read after every tool call is not part of this test.
+    if (String(_url).endsWith("/gc/delegations/take")) return new Response(JSON.stringify({ ok: true, outcomes: [] }), { status: 200 });
     lastInit = init;
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };
