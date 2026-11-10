@@ -171,6 +171,13 @@ function describeError(e) {
  * Long-running tools (wait-mode dispatch, workflow wait) must override the
  * default — the 15s default exists only because most tools are interactive.
  */
+// GC-7152: the daemon's conversation turn budget (Providers.conversation_cli_timeout_ms,
+// 30 min) plus a minute, so the client never gives up on a turn the daemon is
+// still allowed to finish.
+// GC_MCP_TURN_TIMEOUT_MS overrides it for tests only.
+const AGENT_CONVERSATION_TURN_TIMEOUT_MS = Number(process.env.GC_MCP_TURN_TIMEOUT_MS) > 0
+    ? Number(process.env.GC_MCP_TURN_TIMEOUT_MS)
+    : 31 * 60 * 1000;
 async function gcPost(path, body, timeoutMs = 15_000) {
     const url = `${GC_BASE}${path}`;
     const init = {
@@ -1299,7 +1306,8 @@ Actions:
     server.registerTool("gc_agent_conversation", {
         description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
-- stop: stop the session's running turn at once (same stop as gc_conversation stop)`,
+- stop: stop the session's running turn at once (same stop as gc_conversation stop)
+- turn: waits up to the daemon's turn budget (30 min). Each turn carries an idempotency_key: pass your own when you might retry, or one is generated and reported if the call is cut short. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (check with get).`,
         inputSchema: z.object({
             action: z
                 .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1310,6 +1318,12 @@ Actions: spawn, turn, stop, get, list, delete.
             session_id: z.string().optional().describe("Session ID"),
             id: z.string().optional().describe("Alias for session_id"),
             message: z.string().optional().describe("Message (for turn)"),
+            idempotency_key: z
+                .string()
+                .min(1)
+                .max(128)
+                .optional()
+                .describe("turn: retry key, 1-128 printable ASCII characters, unique per intended turn. The same key returns the stored turn instead of running it again. Generated when omitted."),
         }),
     }, async (params) => {
         const action = params.action;
@@ -1326,8 +1340,24 @@ Actions: spawn, turn, stop, get, list, delete.
             if (action === "turn") {
                 if (!sessionId)
                     return err("session_id (or id) is required");
-                const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, params);
-                return text(JSON.stringify(result, null, 2));
+                // GC-7152: a turn outlives the default 15 s request deadline, and a
+                // caller that retried after an abort sent the turn twice. The deadline
+                // now matches the daemon's turn budget, and every turn carries a key
+                // the daemon stores with the reply.
+                const idempotencyKey = params.idempotency_key ?? `gcmcp-turn-${randomUUID()}`;
+                try {
+                    const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                catch (e) {
+                    if (e?.name === "TimeoutError") {
+                        return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
+                            `To retry without sending it twice, repeat the call with idempotency_key ` +
+                            `"${idempotencyKey}": a finished turn returns its stored reply, a running ` +
+                            `one answers turn_in_progress.`);
+                    }
+                    throw e;
+                }
             }
             if (action === "stop") {
                 if (!sessionId)
