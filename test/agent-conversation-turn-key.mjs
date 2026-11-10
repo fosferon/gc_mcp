@@ -175,6 +175,20 @@ try {
   await call({ action: "turn", session_id: "turn_in_progress-sid", message: "m" });
   assert.notEqual(seen.at(-1).body.idempotency_key, k9);
 
+  // 409 corrupt_transcript_item is settled too: nothing was stored (audit r10)
+  delayMs = 1000;
+  await call({ action: "turn", session_id: "s-corrupt", message: "m" });
+  const kc = seen.at(-1).body.idempotency_key;
+  delayMs = 0;
+  status = 409;
+  answer = { ok: false, error: "corrupt_transcript_item", index: 1, retryable: false };
+  await call({ action: "turn", session_id: "s-corrupt", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, kc);
+  status = 200;
+  answer = { ok: true, response: "hi" };
+  await call({ action: "turn", session_id: "s-corrupt", message: "m" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, kc);
+
   // a caller's own key is sent verbatim on its retry after a cut short
   delayMs = 1000;
   await call({ action: "turn", session_id: "s5", message: "m", idempotency_key: "own-1" });

@@ -473,8 +473,12 @@ function turnOutcomeSettled(e) {
     const status = e?.status;
     if (typeof status !== "number")
         return false;
-    if (status === 409)
-        return e?.body?.error === "turn_interrupted";
+    // 409 turn_interrupted: the key is burned. 409 corrupt_transcript_item
+    // (GC-7151): the turn was refused and nothing stored. Both are settled; only
+    // 409 turn_in_progress leaves the outcome open (audit r10).
+    if (status === 409) {
+        return e?.body?.error === "turn_interrupted" || e?.body?.error === "corrupt_transcript_item";
+    }
     return status === 400 || status === 404 || status === 422;
 }
 function turnKeySlot(connectionId, sessionId, message) {
