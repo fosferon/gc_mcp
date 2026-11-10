@@ -14,13 +14,16 @@ let status = 200;
 let answer = { ok: true, response: "hi" };
 let destroy = false;
 let takeBody = { ok: true, items: [] };
+let holdTake = null; // a promise the take response waits on
 const daemon = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     if (req.url === "/gc/delegations/take") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify(takeBody));
+      const send = () => res.end(JSON.stringify(takeBody));
+      if (holdTake) holdTake.then(send);
+      else send();
       return;
     }
     seen.push({ url: req.url, method: req.method, body: body ? JSON.parse(body) : null });
@@ -238,17 +241,26 @@ try {
   assert.notEqual(kB, kA);
   mod.finishTurnKey("conn-y\u0000s\u0000digest-a", true, 0);
 
-  // a kept key expires about half an hour after the last call on it ended,
-  // never while a call on it is in flight
+  // a kept key expires a TTL after the last call on it ended; while a call is
+  // in flight it survives its own TTL, and is reclaimed one more TTL later only
+  // if that call never finishes (audit r8 F1). TTL here = 300 ms + 60 s.
+  const TTL = 60_300;
   const slotT = "conn-x\u0000s\u0000digest-t";
   mod.turnKeyFor(slotT, 0);
-  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000); // sweep while T in flight
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", TTL + 1); // expired, in flight
   assert.ok(mod.turnKeyKept(slotT));
-  mod.finishTurnKey(slotT, false, 10_000_000);
-  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000 + 59_000); // inside the TTL
+  mod.finishTurnKey(slotT, false, TTL + 1);
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", TTL + 1 + 59_000); // inside the TTL
   assert.ok(mod.turnKeyKept(slotT));
-  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000 + 10_000_000); // past it
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000); // past it
   assert.equal(mod.turnKeyKept(slotT), undefined);
+
+  const slotH = "conn-x\u0000s\u0000digest-hung";
+  mod.turnKeyFor(slotH, 20_000_000); // a call that never finishes
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper2", 20_000_000 + 2 * TTL - 1);
+  assert.ok(mod.turnKeyKept(slotH));
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper2", 20_000_000 + 2 * TTL);
+  assert.equal(mod.turnKeyKept(slotH), undefined);
 
   // through the real handler: two overlapping identical turns on one connection
   // send the same key (the slot carries a live connection id; with none, each
@@ -275,6 +287,20 @@ try {
   await call({ action: "turn", session_id: "s-deliv", message: "m" });
   assert.notEqual(seen.at(-1).body.idempotency_key, kd); // delivered, freed
   takeBody = { ok: true, items: [] };
+
+  // the slot settles after delivery, not when the tool callback returns (audit
+  // r8 F2): while the first call's delivery is held open, a second identical
+  // turn reuses its key
+  let release;
+  holdTake = new Promise((r) => (release = r));
+  const first = call({ action: "turn", session_id: "s-hold", message: "m" });
+  await new Promise((r) => setTimeout(r, 100)); // the turn answered; delivery held
+  const kHold = seen.at(-1).body.idempotency_key;
+  holdTake = null;
+  await call({ action: "turn", session_id: "s-hold", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, kHold);
+  release();
+  await first;
 
   // undici's own limits count as cut short (audit r1 F3, r2 test gap)
   const undici = (code) => Object.assign(new TypeError("fetch failed"), { cause: { code } });

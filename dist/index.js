@@ -122,6 +122,18 @@ async function deliver(call, result) {
         return { ...result, content: [...result.content, { type: "text", text: block }] };
     });
 }
+// GC-7152 audit r8 F3: a hook that throws must not turn a delivered reply into an
+// error, nor replace the delivery error being rethrown.
+function runAfterReply(call, replied) {
+    for (const f of call.afterReply) {
+        try {
+            f(replied);
+        }
+        catch {
+            // the reply (or the error being rethrown) stands
+        }
+    }
+}
 function daemonFetch(url, init = {}) {
     const conn = callStore.getStore()?.conn;
     if (conn) {
@@ -472,8 +484,12 @@ function turnKeySlot(connectionId, sessionId, message) {
 /** Start a call on a slot: the kept key, or a new one. Exported for its test. */
 export function turnKeyFor(slot, now = Date.now()) {
     for (const [s, entry] of unconfirmedTurnKeys) {
-        if (entry.inFlight === 0 && entry.expires <= now)
+        // GC-7152 audit r8 F1: an entry whose calls never finished (a delivery that
+        // never resolved) is reclaimed one more TTL after it would have expired.
+        const backstop = entry.expires + UNCONFIRMED_TURN_KEY_TTL_MS;
+        if ((entry.inFlight === 0 && entry.expires <= now) || backstop <= now) {
             unconfirmedTurnKeys.delete(s);
+        }
     }
     const kept = unconfirmedTurnKeys.get(slot);
     const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
@@ -767,12 +783,10 @@ function buildMcpServer() {
                 delivered = await deliver(call, result);
             }
             catch (e) {
-                for (const f of call.afterReply)
-                    f(false);
+                runAfterReply(call, false);
                 throw e;
             }
-            for (const f of call.afterReply)
-                f(true);
+            runAfterReply(call, true);
             return delivered;
         });
     })));
