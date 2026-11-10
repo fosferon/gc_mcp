@@ -559,7 +559,7 @@ const UNCONFIRMED_TURN_KEY_TTL_MS = AGENT_CONVERSATION_TURN_TIMEOUT_MS + 60_000;
 // GC-7152 audit r4 F2: the key is freed only on evidence that the turn's
 // outcome is settled: delivered (2xx), or a daemon answer that says the turn
 // did not run or will not run under this key (400, 404, 422, 409
-// turn_interrupted). A 409 turn_in_progress, a 5xx (the turn may be stored
+// turn_interrupted, 409 corrupt_transcript_item). A 409 turn_in_progress, a 5xx (the turn may be stored
 // before the error), a transport failure, a cut-short call and a host cancel
 // all keep it.
 function turnOutcomeSettled(e: any): boolean {
