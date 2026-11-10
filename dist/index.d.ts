@@ -14,3 +14,13 @@
  *   { "mcpServers": { "gc": { "command": "node", "args": ["/path/to/gc_mcp/dist/index.js"] } } }
  */
 export declare function isClientCutShort(e: unknown): boolean;
+/** Start a call on a slot: the kept key, or a new one. Exported for its test. */
+export declare function turnKeyFor(slot: string, now?: number): string;
+/**
+ * End a call on a slot. `settled`: its caller learned the outcome. The slot is
+ * freed only when settled and no other call on it is in flight; otherwise the
+ * key is kept for the TTL from now. Exported for its test.
+ */
+export declare function finishTurnKey(slot: string, settled: boolean, now?: number): void;
+/** Whether a slot still holds a key. Exported for its test. */
+export declare function turnKeyKept(slot: string): string | undefined;

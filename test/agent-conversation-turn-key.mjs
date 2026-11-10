@@ -210,6 +210,36 @@ try {
   assert.equal(bad.isError, true);
   assert.equal(seen.length, before);
 
+  // concurrent identical calls on one slot (audit r5 F1): a delivered call does
+  // not free the key while another call on the slot is still in flight
+  const slotA = "conn-x\u0000s\u0000digest-a";
+  const kA = mod.turnKeyFor(slotA, 0);
+  assert.equal(mod.turnKeyFor(slotA, 1), kA); // the second, concurrent call reuses it
+  mod.finishTurnKey(slotA, true, 2); // B delivered
+  assert.equal(mod.turnKeyKept(slotA), kA); // A still in flight: kept
+  mod.finishTurnKey(slotA, false, 3); // A cut short
+  assert.equal(mod.turnKeyKept(slotA), kA);
+  assert.equal(mod.turnKeyFor(slotA, 4), kA); // A's retry reuses the key
+  mod.finishTurnKey(slotA, true, 5); // delivered, nothing else in flight
+  assert.equal(mod.turnKeyKept(slotA), undefined);
+
+  // another connection never shares a slot
+  const kB = mod.turnKeyFor("conn-y\u0000s\u0000digest-a", 0);
+  assert.notEqual(kB, kA);
+  mod.finishTurnKey("conn-y\u0000s\u0000digest-a", true, 0);
+
+  // a kept key expires about half an hour after the last call on it ended,
+  // never while a call on it is in flight
+  const slotT = "conn-x\u0000s\u0000digest-t";
+  mod.turnKeyFor(slotT, 0);
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000); // sweep while T in flight
+  assert.ok(mod.turnKeyKept(slotT));
+  mod.finishTurnKey(slotT, false, 10_000_000);
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000 + 59_000); // inside the TTL
+  assert.ok(mod.turnKeyKept(slotT));
+  mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000 + 10_000_000); // past it
+  assert.equal(mod.turnKeyKept(slotT), undefined);
+
   // undici's own limits count as cut short (audit r1 F3, r2 test gap)
   const undici = (code) => Object.assign(new TypeError("fetch failed"), { cause: { code } });
   assert.equal(mod.isClientCutShort(undici("UND_ERR_HEADERS_TIMEOUT")), true);

@@ -439,6 +439,11 @@ export function isClientCutShort(e) {
 // and the next identical message is a new turn. A turn_in_progress answer, a
 // cut-short call or a host cancel keeps it, because the turn's outcome is still
 // unknown. A key the caller passes is always used as given.
+// GC-7152 audit r5 F1: a slot is per MCP connection, session and exact
+// message, and counts the calls on it still in flight. A delivered outcome
+// frees the slot only when no other call on it is in flight, so one caller's
+// delivery cannot take the key from a concurrent identical call that has not
+// learned its outcome. Different connections never share a slot.
 const unconfirmedTurnKeys = new Map();
 // GC-7152 audit r4 F1: the kept key outlives the deadline of the call that
 // kept it, so the retry that follows a deadline abort still finds it.
@@ -457,25 +462,45 @@ function turnOutcomeSettled(e) {
         return e?.body?.error === "turn_interrupted";
     return status === 400 || status === 404 || status === 422;
 }
-function keepTurnKey(sessionId, message, now = Date.now()) {
-    const slot = turnKeySlot(sessionId, message);
-    const kept = unconfirmedTurnKeys.get(slot);
-    if (kept)
-        unconfirmedTurnKeys.set(slot, { ...kept, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+function turnKeySlot(connectionId, sessionId, message) {
+    const digest = createHash("sha256").update(message).digest("hex");
+    return `${connectionId}\u0000${sessionId}\u0000${digest}`;
 }
-function turnKeySlot(sessionId, message) {
-    return `${sessionId}\u0000${createHash("sha256").update(message).digest("hex")}`;
-}
-function turnKeyFor(sessionId, message, now = Date.now()) {
-    for (const [slot, entry] of unconfirmedTurnKeys) {
-        if (entry.expires <= now)
-            unconfirmedTurnKeys.delete(slot);
+/** Start a call on a slot: the kept key, or a new one. Exported for its test. */
+export function turnKeyFor(slot, now = Date.now()) {
+    for (const [s, entry] of unconfirmedTurnKeys) {
+        if (entry.inFlight === 0 && entry.expires <= now)
+            unconfirmedTurnKeys.delete(s);
     }
-    const slot = turnKeySlot(sessionId, message);
     const kept = unconfirmedTurnKeys.get(slot);
     const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
-    unconfirmedTurnKeys.set(slot, { key, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+    unconfirmedTurnKeys.set(slot, {
+        key,
+        expires: now + UNCONFIRMED_TURN_KEY_TTL_MS,
+        inFlight: (kept?.inFlight ?? 0) + 1,
+    });
     return key;
+}
+/**
+ * End a call on a slot. `settled`: its caller learned the outcome. The slot is
+ * freed only when settled and no other call on it is in flight; otherwise the
+ * key is kept for the TTL from now. Exported for its test.
+ */
+export function finishTurnKey(slot, settled, now = Date.now()) {
+    const entry = unconfirmedTurnKeys.get(slot);
+    if (!entry)
+        return;
+    const inFlight = Math.max(0, entry.inFlight - 1);
+    if (settled && inFlight === 0) {
+        unconfirmedTurnKeys.delete(slot);
+    }
+    else {
+        unconfirmedTurnKeys.set(slot, { ...entry, inFlight, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+    }
+}
+/** Whether a slot still holds a key. Exported for its test. */
+export function turnKeyKept(slot) {
+    return unconfirmedTurnKeys.get(slot)?.key;
 }
 // A watch whose own `timeout` elapsed used to come back as
 // "ERROR: The operation was aborted due to timeout", with every event it had
@@ -1377,7 +1402,7 @@ Actions:
         description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session before the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
         inputSchema: z.object({
             action: z
                 .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1415,30 +1440,19 @@ Actions: spawn, turn, stop, get, list, delete.
                 // the daemon stores with the reply.
                 const message = params.message ?? "";
                 const generated = params.idempotency_key === undefined;
-                const idempotencyKey = generated
-                    ? turnKeyFor(sessionId, message)
-                    : params.idempotency_key;
+                const slot = turnKeySlot(callStore.getStore()?.conn.id ?? "", sessionId, message);
+                const idempotencyKey = generated ? turnKeyFor(slot) : params.idempotency_key;
                 try {
                     const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
                     // The turn's outcome reached a caller still waiting: the next identical
                     // message is a new turn.
-                    if (generated) {
-                        if (!extra?.signal?.aborted)
-                            unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
-                        else
-                            keepTurnKey(sessionId, message);
-                    }
+                    if (generated)
+                        finishTurnKey(slot, !extra?.signal?.aborted);
                     return text(JSON.stringify(result, null, 2));
                 }
                 catch (e) {
-                    if (generated) {
-                        if (turnOutcomeSettled(e) && !extra?.signal?.aborted) {
-                            unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
-                        }
-                        else {
-                            keepTurnKey(sessionId, message);
-                        }
-                    }
+                    if (generated)
+                        finishTurnKey(slot, turnOutcomeSettled(e) && !extra?.signal?.aborted);
                     if (isClientCutShort(e)) {
                         return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
                             `To retry without sending it twice, repeat the call with idempotency_key ` +
