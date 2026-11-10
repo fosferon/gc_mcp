@@ -527,6 +527,59 @@ export function finishTurnKey(slot, key, settled, now = Date.now()) {
 export function turnKeyKept(slot) {
     return unconfirmedTurnKeys.get(slot)?.key;
 }
+/**
+ * GC-7152 / GC-7153: one keyed conversation turn (gc_agent_conversation and
+ * gc_conversation). The turn waits the daemon's turn budget plus a minute,
+ * carries the caller's idempotency_key or a generated one kept per connection,
+ * route, session and exact message until its outcome has left gc_mcp for a
+ * waiting caller, and on a client-side cut-short names the key to retry with.
+ */
+async function keyedTurn(path, sessionId, params, extra) {
+    const message = params.message ?? "";
+    const generated = params.idempotency_key === undefined;
+    // GC-7152 audit r6 F2: without a connection there is no slot to share, so
+    // the call gets a fresh key and no reuse (never one slot for every caller).
+    const connId = callStore.getStore()?.conn.id;
+    // The route is part of the slot (GC-7153), so the two tools never share a key.
+    const slot = connId ? turnKeySlot(connId, `${path}\u0000${sessionId}`, message) : undefined;
+    const idempotencyKey = !generated
+        ? params.idempotency_key
+        : slot
+            ? turnKeyFor(slot)
+            : `gcmcp-turn-${randomUUID()}`;
+    try {
+        const result = await gcPost(path, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
+        // GC-7152 audit r6 F5: serialize first, so nothing after the finish can throw
+        // into the catch and finish the slot a second time.
+        const body = JSON.stringify(result, null, 2);
+        // GC-7152 audit r7 N1: the slot is settled only once the reply has left
+        // the wrapper (after delivery), not when this function returns. What
+        // happens on the wire after that is not observable here, so a reply
+        // lost in transport still frees the key; the tool text tells callers
+        // to pass their own key where that matters.
+        if (generated && slot) {
+            const store = callStore.getStore();
+            const settle = (replied) => finishTurnKey(slot, idempotencyKey, replied && !extra?.signal?.aborted);
+            if (store)
+                store.afterReply.push(settle);
+            else
+                settle(true);
+        }
+        return text(body);
+    }
+    catch (e) {
+        if (generated && slot) {
+            finishTurnKey(slot, idempotencyKey, turnOutcomeSettled(e) && !extra?.signal?.aborted);
+        }
+        if (isClientCutShort(e)) {
+            return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
+                `To retry without sending it twice, repeat the call with idempotency_key ` +
+                `"${idempotencyKey}": a finished turn returns its stored reply, a running ` +
+                `one answers turn_in_progress.`);
+        }
+        throw e;
+    }
+}
 // A watch whose own `timeout` elapsed used to come back as
 // "ERROR: The operation was aborted due to timeout", with every event it had
 // collected thrown away — the normal outcome of "watch for N seconds" was an
@@ -1317,7 +1370,7 @@ Actions: health, recall, reflect, retain.`,
         description: `Interactive AI conversation sessions (backend-neutral).
 Actions:
 - spawn: create a new session (persona/agent_name is required, optional config; make_apex:true takes the Apex seat, otherwise the session never does)
-- turn: send a message and get the assistant response
+- turn: send a message and get the assistant response. Waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key: pass your own when you might retry (it survives a reconnect), or one is generated and reused for the same message on the same MCP connection until the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored response (replayed: true, tool calls included), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key)
 - submit_tool_results: provide results for pending tool calls
 - cut_in: an operator message into a session. mode "queue" (default): read before the agent's next model call. mode "interrupt": the running turn is stopped at once (what it did stays, marked cut; a running tool finishes and its result is recorded when it arrives, never re-run) and the message is sent now; the answer is the new turn's. mode "consult" is reserved (501)
 - stop: stop the running turn at once; recorded on the transcript as interrupted by the operator
@@ -1355,6 +1408,11 @@ Actions:
             session_id: z.string().optional().describe("Session ID (for turn/get/delete/etc.)"),
             id: z.string().optional().describe("Alias for session_id"),
             message: z.string().optional().describe("User message (for turn/cut_in)"),
+            idempotency_key: z
+                .string()
+                .regex(/^[\x20-\x7E]{1,128}$/, "1-128 printable ASCII characters (space included)")
+                .optional()
+                .describe("turn: retry key, 1-128 printable ASCII characters (space included), unique per intended turn. The same key returns the stored turn instead of running it again; the message must be resent byte for byte. Generated when omitted."),
             from: z.string().optional().describe("Cut-in sender label (for cut_in)"),
             mode: z
                 .enum(["queue", "interrupt", "consult"])
@@ -1369,7 +1427,7 @@ Actions:
                 .optional()
                 .describe("Alias for tool_results"),
         }),
-    }, async (params) => {
+    }, async (params, extra) => {
         const action = params.action;
         const sessionId = params.session_id || params.id;
         try {
@@ -1393,14 +1451,18 @@ Actions:
                 });
                 return text(JSON.stringify(result, null, 2));
             }
-            if (action === "turn" || action === "submit_tool_results" || action === "cut_in") {
+            if (action === "turn") {
                 if (!sessionId)
                     return err("session_id (or id) is required");
-                const path = action === "turn"
-                    ? `/gc/conversation/${encodeURIComponent(sessionId)}/turn`
-                    : action === "cut_in"
-                        ? `/gc/conversation/${encodeURIComponent(sessionId)}/cut_in`
-                        : `/gc/conversation/${encodeURIComponent(sessionId)}/tool_results`;
+                // GC-7153: the same keyed turn as gc_agent_conversation (GC-7152).
+                return await keyedTurn(`/gc/conversation/${encodeURIComponent(sessionId)}/turn`, sessionId, params, extra);
+            }
+            if (action === "submit_tool_results" || action === "cut_in") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const path = action === "cut_in"
+                    ? `/gc/conversation/${encodeURIComponent(sessionId)}/cut_in`
+                    : `/gc/conversation/${encodeURIComponent(sessionId)}/tool_results`;
                 const result = await gcPost(path, params);
                 return text(JSON.stringify(result, null, 2));
             }
@@ -1468,55 +1530,7 @@ Actions: spawn, turn, stop, get, list, delete.
             if (action === "turn") {
                 if (!sessionId)
                     return err("session_id (or id) is required");
-                // GC-7152: a turn outlives the default 15 s request deadline, and a
-                // caller that retried after an abort sent the turn twice. The deadline
-                // now matches the daemon's turn budget, and every turn carries a key
-                // the daemon stores with the reply.
-                const message = params.message ?? "";
-                const generated = params.idempotency_key === undefined;
-                // GC-7152 audit r6 F2: without a connection there is no slot to share, so
-                // the call gets a fresh key and no reuse (never one slot for every caller).
-                const connId = callStore.getStore()?.conn.id;
-                const slot = connId ? turnKeySlot(connId, sessionId, message) : undefined;
-                const idempotencyKey = !generated
-                    ? params.idempotency_key
-                    : slot
-                        ? turnKeyFor(slot)
-                        : `gcmcp-turn-${randomUUID()}`;
-                try {
-                    const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
-                    // The turn's reply is on its way to a caller still waiting: the next
-                    // identical message is a new turn.
-                    // GC-7152 audit r6 F5: serialize first, so nothing after the finish can throw
-                    // into the catch and finish the slot a second time.
-                    const body = JSON.stringify(result, null, 2);
-                    // GC-7152 audit r7 N1: the slot is settled only once the reply has left
-                    // the wrapper (after delivery), not when this callback returns. What
-                    // happens on the wire after that is not observable here, so a reply
-                    // lost in transport still frees the key; the tool text tells callers
-                    // to pass their own key where that matters.
-                    if (generated && slot) {
-                        const store = callStore.getStore();
-                        const settle = (replied) => finishTurnKey(slot, idempotencyKey, replied && !extra?.signal?.aborted);
-                        if (store)
-                            store.afterReply.push(settle);
-                        else
-                            settle(true);
-                    }
-                    return text(body);
-                }
-                catch (e) {
-                    if (generated && slot) {
-                        finishTurnKey(slot, idempotencyKey, turnOutcomeSettled(e) && !extra?.signal?.aborted);
-                    }
-                    if (isClientCutShort(e)) {
-                        return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
-                            `To retry without sending it twice, repeat the call with idempotency_key ` +
-                            `"${idempotencyKey}": a finished turn returns its stored reply, a running ` +
-                            `one answers turn_in_progress.`);
-                    }
-                    throw e;
-                }
+                return await keyedTurn(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, sessionId, params, extra);
             }
             if (action === "stop") {
                 if (!sessionId)
