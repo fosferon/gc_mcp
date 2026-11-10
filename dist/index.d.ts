@@ -21,6 +21,6 @@ export declare function turnKeyFor(slot: string, now?: number): string;
  * freed only when settled and no other call on it is in flight; otherwise the
  * key is kept for the TTL from now. Exported for its test.
  */
-export declare function finishTurnKey(slot: string, settled: boolean, now?: number): void;
+export declare function finishTurnKey(slot: string, key: string, settled: boolean, now?: number): void;
 /** Whether a slot still holds a key. Exported for its test. */
 export declare function turnKeyKept(slot: string): string | undefined;

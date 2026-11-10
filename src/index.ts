@@ -599,9 +599,16 @@ export function turnKeyFor(slot: string, now = Date.now()): string {
  * freed only when settled and no other call on it is in flight; otherwise the
  * key is kept for the TTL from now. Exported for its test.
  */
-export function finishTurnKey(slot: string, settled: boolean, now = Date.now()): void {
+export function finishTurnKey(
+  slot: string,
+  key: string,
+  settled: boolean,
+  now = Date.now(),
+): void {
   const entry = unconfirmedTurnKeys.get(slot);
-  if (!entry) return;
+  // GC-7152 audit r9 F1: a late finish from a call whose entry the backstop
+  // already reclaimed must not touch a newer entry on the same slot.
+  if (!entry || entry.key !== key) return;
   const inFlight = Math.max(0, entry.inFlight - 1);
   if (settled && inFlight === 0) {
     unconfirmedTurnKeys.delete(slot);
@@ -1760,7 +1767,7 @@ server.registerTool(
     description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts (unless it resumes the same MCP session), a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended (about an hour if a call on it never ends), and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts (unless it resumes the same MCP session), a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
     inputSchema: z.object({
       action: z
         .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1829,13 +1836,15 @@ Actions: spawn, turn, stop, get, list, delete.
           if (generated && slot) {
             const store = callStore.getStore();
             const settle = (replied: boolean) =>
-              finishTurnKey(slot, replied && !extra?.signal?.aborted);
+              finishTurnKey(slot, idempotencyKey, replied && !extra?.signal?.aborted);
             if (store) store.afterReply.push(settle);
             else settle(true);
           }
           return text(body);
         } catch (e: any) {
-          if (generated && slot) finishTurnKey(slot, turnOutcomeSettled(e) && !extra?.signal?.aborted);
+          if (generated && slot) {
+            finishTurnKey(slot, idempotencyKey, turnOutcomeSettled(e) && !extra?.signal?.aborted);
+          }
           if (isClientCutShort(e)) {
             return err(
               `ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +

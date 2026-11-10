@@ -219,37 +219,37 @@ try {
   const slotA = "conn-x\u0000s\u0000digest-a";
   const kA = mod.turnKeyFor(slotA, 0);
   assert.equal(mod.turnKeyFor(slotA, 1), kA); // the second, concurrent call reuses it
-  mod.finishTurnKey(slotA, true, 2); // B delivered
+  mod.finishTurnKey(slotA, kA, true, 2); // B delivered
   assert.equal(mod.turnKeyKept(slotA), kA); // A still in flight: kept
-  mod.finishTurnKey(slotA, false, 3); // A cut short
+  mod.finishTurnKey(slotA, kA, false, 3); // A cut short
   assert.equal(mod.turnKeyKept(slotA), kA);
   assert.equal(mod.turnKeyFor(slotA, 4), kA); // A's retry reuses the key
-  mod.finishTurnKey(slotA, true, 5); // delivered, nothing else in flight
+  mod.finishTurnKey(slotA, kA, true, 5); // delivered, nothing else in flight
   assert.equal(mod.turnKeyKept(slotA), undefined);
 
   // the freeing order with the unsettled sibling first (audit r6 F3)
   const slotO = "conn-x\u0000s\u0000digest-order";
   const kO = mod.turnKeyFor(slotO, 0);
   mod.turnKeyFor(slotO, 1);
-  mod.finishTurnKey(slotO, false, 2);
+  mod.finishTurnKey(slotO, kO, false, 2);
   assert.equal(mod.turnKeyKept(slotO), kO);
-  mod.finishTurnKey(slotO, true, 3);
+  mod.finishTurnKey(slotO, kO, true, 3);
   assert.equal(mod.turnKeyKept(slotO), undefined);
 
   // another connection never shares a slot
   const kB = mod.turnKeyFor("conn-y\u0000s\u0000digest-a", 0);
   assert.notEqual(kB, kA);
-  mod.finishTurnKey("conn-y\u0000s\u0000digest-a", true, 0);
+  mod.finishTurnKey("conn-y\u0000s\u0000digest-a", kB, true, 0);
 
   // a kept key expires a TTL after the last call on it ended; while a call is
   // in flight it survives its own TTL, and is reclaimed one more TTL later only
   // if that call never finishes (audit r8 F1). TTL here = 300 ms + 60 s.
   const TTL = 60_300;
   const slotT = "conn-x\u0000s\u0000digest-t";
-  mod.turnKeyFor(slotT, 0);
+  const kT = mod.turnKeyFor(slotT, 0);
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", TTL + 1); // expired, in flight
   assert.ok(mod.turnKeyKept(slotT));
-  mod.finishTurnKey(slotT, false, TTL + 1);
+  mod.finishTurnKey(slotT, kT, false, TTL + 1);
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", TTL + 1 + 59_000); // inside the TTL
   assert.ok(mod.turnKeyKept(slotT));
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000); // past it
@@ -260,6 +260,15 @@ try {
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper2", 20_000_000 + 2 * TTL - 1);
   assert.ok(mod.turnKeyKept(slotH));
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper2", 20_000_000 + 2 * TTL);
+  assert.equal(mod.turnKeyKept(slotH), undefined);
+
+  // a late finish for a reclaimed entry does not touch the newer entry on the
+  // same slot (audit r9 F1)
+  const kH = "stale-key-from-the-hung-call";
+  const kNew = mod.turnKeyFor(slotH, 20_000_000 + 2 * TTL + 1);
+  mod.finishTurnKey(slotH, kH, true, 20_000_000 + 2 * TTL + 2);
+  assert.equal(mod.turnKeyKept(slotH), kNew);
+  mod.finishTurnKey(slotH, kNew, true, 20_000_000 + 2 * TTL + 3);
   assert.equal(mod.turnKeyKept(slotH), undefined);
 
   // through the real handler: two overlapping identical turns on one connection
