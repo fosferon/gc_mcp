@@ -13,13 +13,14 @@ let delayMs = 0;
 let status = 200;
 let answer = { ok: true, response: "hi" };
 let destroy = false;
+let takeBody = { ok: true, items: [] };
 const daemon = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
   req.on("end", () => {
     if (req.url === "/gc/delegations/take") {
       res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, items: [] }));
+      res.end(JSON.stringify(takeBody));
       return;
     }
     seen.push({ url: req.url, method: req.method, body: body ? JSON.parse(body) : null });
@@ -264,6 +265,16 @@ try {
   assert.equal(par.length, 2);
   assert.equal(par[0], par[1]);
   delayMs = 0;
+
+  // a malformed delivery body cannot fail the call after the turn succeeded,
+  // and the key is settled only after delivery (audit r7 N1)
+  takeBody = { ok: true, outcomes: "not a list" };
+  const r = await call({ action: "turn", session_id: "s-deliv", message: "m" });
+  assert.notEqual(r.isError, true);
+  const kd = seen.at(-1).body.idempotency_key;
+  await call({ action: "turn", session_id: "s-deliv", message: "m" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, kd); // delivered, freed
+  takeBody = { ok: true, items: [] };
 
   // undici's own limits count as cut short (audit r1 F3, r2 test gap)
   const undici = (code) => Object.assign(new TypeError("fetch failed"), { cause: { code } });

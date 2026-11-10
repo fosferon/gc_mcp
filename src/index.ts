@@ -88,6 +88,11 @@ interface Connection {
 interface CallContext {
   conn: Connection;
   inlineSeqs: number[];
+  /**
+   * GC-7152 audit r7 N1: work to run once the tool's reply has left this
+   * wrapper (`true`) or the wrapper failed after the tool returned (`false`).
+   */
+  afterReply: Array<(replied: boolean) => void>;
 }
 
 const callStore = new AsyncLocalStorage<CallContext>();
@@ -142,7 +147,9 @@ async function deliver(call: CallContext, result: any): Promise<any> {
         return result;
       }
       const json: any = await resp.json();
-      outcomes = json?.outcomes ?? json?.data?.outcomes ?? [];
+      const raw = json?.outcomes ?? json?.data?.outcomes;
+      // GC-7152 audit r7 N1: a malformed body must not make delivery throw.
+      outcomes = Array.isArray(raw) ? raw : [];
     } catch {
       conn.pendingAck = [...new Set([...ack, ...inline])];
       return result;
@@ -521,7 +528,8 @@ export function isClientCutShort(e: unknown): boolean {
 // (our deadline, an undici limit, the MCP host cancelling the call, a daemon
 // error) keeps its key for the turn budget, so the same message sent again
 // without a key is a retry of that turn, not a new one. The key is kept until
-// an outcome of that turn reaches a waiting caller (audit r3 F1): a reply or a
+// an outcome of that turn has left gc_mcp for a waiting caller (audit r3 F1;
+// r7 N1: after delivery, not when the tool callback returns): a reply or a
 // replay, turn_interrupted, or any other definitive daemon answer clears it,
 // and the next identical message is a new turn. A turn_in_progress answer, a
 // cut-short call or a host cancel keeps it, because the turn's outcome is still
@@ -947,10 +955,18 @@ function buildMcpServer() {
         inputSchema: strictRootInputSchema(config.inputSchema),
       } as unknown as typeof config,
       (async (...args: any[]) => {
-        const call: CallContext = { conn: connection, inlineSeqs: [] };
+        const call: CallContext = { conn: connection, inlineSeqs: [], afterReply: [] };
         return callStore.run(call, async () => {
           const result: any = await (callback as any)(...args);
-          return deliver(call, result);
+          let delivered: any;
+          try {
+            delivered = await deliver(call, result);
+          } catch (e) {
+            for (const f of call.afterReply) f(false);
+            throw e;
+          }
+          for (const f of call.afterReply) f(true);
+          return delivered;
         });
       }) as unknown as typeof callback,
     )) as typeof server.registerTool;
@@ -1727,7 +1743,7 @@ server.registerTool(
     description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts, a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts (unless it resumes the same MCP session), a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
     inputSchema: z.object({
       action: z
         .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1783,12 +1799,23 @@ Actions: spawn, turn, stop, get, list, delete.
             { ...params, idempotency_key: idempotencyKey },
             AGENT_CONVERSATION_TURN_TIMEOUT_MS,
           );
-          // The turn's outcome reached a caller still waiting: the next identical
-          // message is a new turn.
+          // The turn's reply is on its way to a caller still waiting: the next
+          // identical message is a new turn.
           // GC-7152 audit r6 F5: serialize first, so nothing after the finish can throw
           // into the catch and finish the slot a second time.
           const body = JSON.stringify(result, null, 2);
-          if (generated && slot) finishTurnKey(slot, !extra?.signal?.aborted);
+          // GC-7152 audit r7 N1: the slot is settled only once the reply has left
+          // the wrapper (after delivery), not when this callback returns. What
+          // happens on the wire after that is not observable here, so a reply
+          // lost in transport still frees the key; the tool text tells callers
+          // to pass their own key where that matters.
+          if (generated && slot) {
+            const store = callStore.getStore();
+            const settle = (replied: boolean) =>
+              finishTurnKey(slot, replied && !extra?.signal?.aborted);
+            if (store) store.afterReply.push(settle);
+            else settle(true);
+          }
           return text(body);
         } catch (e: any) {
           if (generated && slot) finishTurnKey(slot, turnOutcomeSettled(e) && !extra?.signal?.aborted);
