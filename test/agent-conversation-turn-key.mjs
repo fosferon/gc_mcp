@@ -74,6 +74,37 @@ try {
   assert.ok(textOf(timedOut).includes(`idempotency_key "${key}"`), textOf(timedOut));
   assert.ok(textOf(timedOut).includes("turn_in_progress"));
 
+  // the same message sent again to the same session after a cut-short call is a
+  // retry of that turn: it reuses the key (audit r1 F2)
+  delayMs = 0;
+  await call({ action: "turn", session_id: "s1", message: "slow" });
+  assert.equal(seen.at(-1).body.idempotency_key, key);
+
+  // once that result was delivered, the same message again is a new turn
+  await call({ action: "turn", session_id: "s1", message: "slow" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, key);
+
+  // another session or another message does not inherit the kept key
+  delayMs = 1000;
+  await call({ action: "turn", session_id: "s1", message: "slow again" });
+  const kept = seen.at(-1).body.idempotency_key;
+  delayMs = 0;
+  await call({ action: "turn", session_id: "s2", message: "slow again" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, kept);
+
+  // a key with a space is accepted; a tab is refused by the schema (audit r1 F5)
+  await call({ action: "turn", session_id: "s1", message: "x", idempotency_key: "sess 42" });
+  assert.equal(seen.at(-1).body.idempotency_key, "sess 42");
+  const countBeforeTab = seen.length;
+  const tab = await call({
+    action: "turn",
+    session_id: "s1",
+    message: "x",
+    idempotency_key: "a\tb",
+  }).catch((e) => ({ isError: true, content: [{ text: String(e) }] }));
+  assert.equal(tab.isError, true);
+  assert.equal(seen.length, countBeforeTab);
+
   // an over-long key is refused by the schema before anything is sent
   const before = seen.length;
   const bad = await call({

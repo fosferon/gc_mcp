@@ -20,7 +20,7 @@ import { ListToolsRequestSchema } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import * as z4 from "zod/v4";
 import { execFileSync, execSync } from "node:child_process";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { readFileSync, existsSync } from "node:fs";
 import { createServer } from "node:http";
@@ -406,6 +406,39 @@ async function readSseStream(resp, onEvent) {
 function isAbortError(e) {
     const name = e?.name;
     return name === "AbortError" || name === "TimeoutError";
+}
+// GC-7152 audit r1 F3: the call ended on the client side (our deadline, or
+// undici's own header/body limit on a checkout without the no-limit
+// dispatcher) while the daemon may still be working.
+function isClientCutShort(e) {
+    if (isAbortError(e))
+        return true;
+    const code = e?.cause?.code;
+    return code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT";
+}
+// GC-7152 audit r1 F2: a generated turn key is kept, per session and exact
+// message, until gc_mcp has handed that turn's result to a caller that was
+// still waiting for it. A turn whose result may not have reached the caller
+// (our deadline, an undici limit, the MCP host cancelling the call, a daemon
+// error) keeps its key for the turn budget, so the same message sent again
+// without a key is a retry of that turn, not a new one. A key the caller
+// passes is always used as given.
+const unconfirmedTurnKeys = new Map();
+// The daemon's turn budget plus a minute; not shortened by GC_MCP_TURN_TIMEOUT_MS.
+const UNCONFIRMED_TURN_KEY_TTL_MS = 31 * 60 * 1000;
+function turnKeySlot(sessionId, message) {
+    return `${sessionId}\u0000${createHash("sha256").update(message).digest("hex")}`;
+}
+function turnKeyFor(sessionId, message, now = Date.now()) {
+    for (const [slot, entry] of unconfirmedTurnKeys) {
+        if (entry.expires <= now)
+            unconfirmedTurnKeys.delete(slot);
+    }
+    const slot = turnKeySlot(sessionId, message);
+    const kept = unconfirmedTurnKeys.get(slot);
+    const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
+    unconfirmedTurnKeys.set(slot, { key, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+    return key;
 }
 // A watch whose own `timeout` elapsed used to come back as
 // "ERROR: The operation was aborted due to timeout", with every event it had
@@ -1307,7 +1340,7 @@ Actions:
         description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits up to the daemon's turn budget (30 min). Each turn carries an idempotency_key: pass your own when you might retry, or one is generated and reported if the call is cut short. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (check with get).`,
+- turn: waits up to the daemon's turn budget (30 min). Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session before the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
         inputSchema: z.object({
             action: z
                 .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1320,12 +1353,11 @@ Actions: spawn, turn, stop, get, list, delete.
             message: z.string().optional().describe("Message (for turn)"),
             idempotency_key: z
                 .string()
-                .min(1)
-                .max(128)
+                .regex(/^[\x20-\x7E]{1,128}$/, "1-128 printable ASCII characters (space included)")
                 .optional()
-                .describe("turn: retry key, 1-128 printable ASCII characters, unique per intended turn. The same key returns the stored turn instead of running it again. Generated when omitted."),
+                .describe("turn: retry key, 1-128 printable ASCII characters (space included), unique per intended turn. The same key returns the stored turn instead of running it again; the message must be resent byte for byte. Generated when omitted."),
         }),
-    }, async (params) => {
+    }, async (params, extra) => {
         const action = params.action;
         const sessionId = params.session_id || params.id;
         try {
@@ -1344,13 +1376,21 @@ Actions: spawn, turn, stop, get, list, delete.
                 // caller that retried after an abort sent the turn twice. The deadline
                 // now matches the daemon's turn budget, and every turn carries a key
                 // the daemon stores with the reply.
-                const idempotencyKey = params.idempotency_key ?? `gcmcp-turn-${randomUUID()}`;
+                const message = params.message ?? "";
+                const generated = params.idempotency_key === undefined;
+                const idempotencyKey = generated
+                    ? turnKeyFor(sessionId, message)
+                    : params.idempotency_key;
                 try {
                     const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
+                    // Delivered to a caller still waiting: the next identical message is a new turn.
+                    if (generated && !extra?.signal?.aborted) {
+                        unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+                    }
                     return text(JSON.stringify(result, null, 2));
                 }
                 catch (e) {
-                    if (e?.name === "TimeoutError") {
+                    if (isClientCutShort(e)) {
                         return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
                             `To retry without sending it twice, repeat the call with idempotency_key ` +
                             `"${idempotencyKey}": a finished turn returns its stored reply, a running ` +
