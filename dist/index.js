@@ -410,7 +410,7 @@ function isAbortError(e) {
 // GC-7152 audit r1 F3: the call ended on the client side (our deadline, or
 // undici's own header/body limit on a checkout without the no-limit
 // dispatcher) while the daemon may still be working.
-function isClientCutShort(e) {
+export function isClientCutShort(e) {
     if (isAbortError(e))
         return true;
     const code = e?.cause?.code;
@@ -421,7 +421,9 @@ function isClientCutShort(e) {
 // still waiting for it. A turn whose result may not have reached the caller
 // (our deadline, an undici limit, the MCP host cancelling the call, a daemon
 // error) keeps its key for the turn budget, so the same message sent again
-// without a key is a retry of that turn, not a new one. A key the caller
+// without a key is a retry of that turn, not a new one. The kept key serves
+// that one resend only (audit r2 F2): a later identical message is a new turn,
+// so at most one intended repeat can be answered as a replay. A key the caller
 // passes is always used as given.
 const unconfirmedTurnKeys = new Map();
 // The daemon's turn budget plus a minute; not shortened by GC_MCP_TURN_TIMEOUT_MS.
@@ -436,8 +438,17 @@ function turnKeyFor(sessionId, message, now = Date.now()) {
     }
     const slot = turnKeySlot(sessionId, message);
     const kept = unconfirmedTurnKeys.get(slot);
-    const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
-    unconfirmedTurnKeys.set(slot, { key, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+    if (kept && !kept.retried) {
+        // This send is the one retry the kept key serves.
+        unconfirmedTurnKeys.set(slot, { ...kept, retried: true });
+        return kept.key;
+    }
+    const key = `gcmcp-turn-${randomUUID()}`;
+    unconfirmedTurnKeys.set(slot, {
+        key,
+        expires: now + UNCONFIRMED_TURN_KEY_TTL_MS,
+        retried: false,
+    });
     return key;
 }
 // A watch whose own `timeout` elapsed used to come back as

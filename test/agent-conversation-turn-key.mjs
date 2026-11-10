@@ -41,7 +41,7 @@ try {
     if (method === "tools/call") callToolHandler = handler;
     return originalSetRequestHandler.call(this, schema, handler);
   };
-  await import("../dist/index.js");
+  const mod = await import("../dist/index.js");
   assert.ok(callToolHandler, "Failed to capture tools/call handler");
 
   const call = (args) =>
@@ -84,6 +84,17 @@ try {
   await call({ action: "turn", session_id: "s1", message: "slow" });
   assert.notEqual(seen.at(-1).body.idempotency_key, key);
 
+  // the kept key serves one resend only (audit r2 F2): cut short twice, the
+  // second resend is a new turn
+  delayMs = 1000;
+  await call({ action: "turn", session_id: "s3", message: "twice" });
+  const k1 = seen.at(-1).body.idempotency_key;
+  await call({ action: "turn", session_id: "s3", message: "twice" });
+  assert.equal(seen.at(-1).body.idempotency_key, k1);
+  delayMs = 0;
+  await call({ action: "turn", session_id: "s3", message: "twice" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, k1);
+
   // another session or another message does not inherit the kept key
   delayMs = 1000;
   await call({ action: "turn", session_id: "s1", message: "slow again" });
@@ -115,6 +126,13 @@ try {
   }).catch((e) => ({ isError: true, content: [{ text: String(e) }] }));
   assert.equal(bad.isError, true);
   assert.equal(seen.length, before);
+
+  // undici's own limits count as cut short (audit r1 F3, r2 test gap)
+  const undici = (code) => Object.assign(new TypeError("fetch failed"), { cause: { code } });
+  assert.equal(mod.isClientCutShort(undici("UND_ERR_HEADERS_TIMEOUT")), true);
+  assert.equal(mod.isClientCutShort(undici("UND_ERR_BODY_TIMEOUT")), true);
+  assert.equal(mod.isClientCutShort(Object.assign(new Error("t"), { name: "TimeoutError" })), true);
+  assert.equal(mod.isClientCutShort(undici("ECONNREFUSED")), false);
 
   console.log("agent-conversation-turn-key: ok");
 } finally {

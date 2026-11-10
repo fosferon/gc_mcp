@@ -498,7 +498,7 @@ function isAbortError(e: unknown): boolean {
 // GC-7152 audit r1 F3: the call ended on the client side (our deadline, or
 // undici's own header/body limit on a checkout without the no-limit
 // dispatcher) while the daemon may still be working.
-function isClientCutShort(e: unknown): boolean {
+export function isClientCutShort(e: unknown): boolean {
   if (isAbortError(e)) return true;
   const code = (e as { cause?: { code?: string } } | null)?.cause?.code;
   return code === "UND_ERR_HEADERS_TIMEOUT" || code === "UND_ERR_BODY_TIMEOUT";
@@ -509,9 +509,11 @@ function isClientCutShort(e: unknown): boolean {
 // still waiting for it. A turn whose result may not have reached the caller
 // (our deadline, an undici limit, the MCP host cancelling the call, a daemon
 // error) keeps its key for the turn budget, so the same message sent again
-// without a key is a retry of that turn, not a new one. A key the caller
+// without a key is a retry of that turn, not a new one. The kept key serves
+// that one resend only (audit r2 F2): a later identical message is a new turn,
+// so at most one intended repeat can be answered as a replay. A key the caller
 // passes is always used as given.
-const unconfirmedTurnKeys = new Map<string, { key: string; expires: number }>();
+const unconfirmedTurnKeys = new Map<string, { key: string; expires: number; retried: boolean }>();
 // The daemon's turn budget plus a minute; not shortened by GC_MCP_TURN_TIMEOUT_MS.
 const UNCONFIRMED_TURN_KEY_TTL_MS = 31 * 60 * 1000;
 
@@ -525,8 +527,17 @@ function turnKeyFor(sessionId: string, message: string, now = Date.now()): strin
   }
   const slot = turnKeySlot(sessionId, message);
   const kept = unconfirmedTurnKeys.get(slot);
-  const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
-  unconfirmedTurnKeys.set(slot, { key, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+  if (kept && !kept.retried) {
+    // This send is the one retry the kept key serves.
+    unconfirmedTurnKeys.set(slot, { ...kept, retried: true });
+    return kept.key;
+  }
+  const key = `gcmcp-turn-${randomUUID()}`;
+  unconfirmedTurnKeys.set(slot, {
+    key,
+    expires: now + UNCONFIRMED_TURN_KEY_TTL_MS,
+    retried: false,
+  });
   return key;
 }
 
