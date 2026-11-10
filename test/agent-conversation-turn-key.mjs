@@ -223,6 +223,15 @@ try {
   mod.finishTurnKey(slotA, true, 5); // delivered, nothing else in flight
   assert.equal(mod.turnKeyKept(slotA), undefined);
 
+  // the freeing order with the unsettled sibling first (audit r6 F3)
+  const slotO = "conn-x\u0000s\u0000digest-order";
+  const kO = mod.turnKeyFor(slotO, 0);
+  mod.turnKeyFor(slotO, 1);
+  mod.finishTurnKey(slotO, false, 2);
+  assert.equal(mod.turnKeyKept(slotO), kO);
+  mod.finishTurnKey(slotO, true, 3);
+  assert.equal(mod.turnKeyKept(slotO), undefined);
+
   // another connection never shares a slot
   const kB = mod.turnKeyFor("conn-y\u0000s\u0000digest-a", 0);
   assert.notEqual(kB, kA);
@@ -239,6 +248,22 @@ try {
   assert.ok(mod.turnKeyKept(slotT));
   mod.turnKeyFor("conn-x\u0000s\u0000digest-sweeper", 10_000_000 + 10_000_000); // past it
   assert.equal(mod.turnKeyKept(slotT), undefined);
+
+  // through the real handler: two overlapping identical turns on one connection
+  // send the same key (the slot carries a live connection id; with none, each
+  // call would get its own key and this would fail) (audit r6 F4)
+  delayMs = 200;
+  status = 200;
+  answer = { ok: true, response: "hi" };
+  const before2 = seen.length;
+  await Promise.all([
+    call({ action: "turn", session_id: "s-par", message: "same" }),
+    call({ action: "turn", session_id: "s-par", message: "same" }),
+  ]);
+  const par = seen.slice(before2).map((r) => r.body.idempotency_key);
+  assert.equal(par.length, 2);
+  assert.equal(par[0], par[1]);
+  delayMs = 0;
 
   // undici's own limits count as cut short (audit r1 F3, r2 test gap)
   const undici = (code) => Object.assign(new TypeError("fetch failed"), { cause: { code } });

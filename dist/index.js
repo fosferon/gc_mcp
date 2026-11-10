@@ -1402,7 +1402,7 @@ Actions:
         description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended, and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts, a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
         inputSchema: z.object({
             action: z
                 .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1440,18 +1440,28 @@ Actions: spawn, turn, stop, get, list, delete.
                 // the daemon stores with the reply.
                 const message = params.message ?? "";
                 const generated = params.idempotency_key === undefined;
-                const slot = turnKeySlot(callStore.getStore()?.conn.id ?? "", sessionId, message);
-                const idempotencyKey = generated ? turnKeyFor(slot) : params.idempotency_key;
+                // GC-7152 audit r6 F2: without a connection there is no slot to share, so
+                // the call gets a fresh key and no reuse (never one slot for every caller).
+                const connId = callStore.getStore()?.conn.id;
+                const slot = connId ? turnKeySlot(connId, sessionId, message) : undefined;
+                const idempotencyKey = !generated
+                    ? params.idempotency_key
+                    : slot
+                        ? turnKeyFor(slot)
+                        : `gcmcp-turn-${randomUUID()}`;
                 try {
                     const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
                     // The turn's outcome reached a caller still waiting: the next identical
                     // message is a new turn.
-                    if (generated)
+                    // GC-7152 audit r6 F5: serialize first, so nothing after the finish can throw
+                    // into the catch and finish the slot a second time.
+                    const body = JSON.stringify(result, null, 2);
+                    if (generated && slot)
                         finishTurnKey(slot, !extra?.signal?.aborted);
-                    return text(JSON.stringify(result, null, 2));
+                    return text(body);
                 }
                 catch (e) {
-                    if (generated)
+                    if (generated && slot)
                         finishTurnKey(slot, turnOutcomeSettled(e) && !extra?.signal?.aborted);
                     if (isClientCutShort(e)) {
                         return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
