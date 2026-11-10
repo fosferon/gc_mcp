@@ -421,10 +421,12 @@ export function isClientCutShort(e) {
 // still waiting for it. A turn whose result may not have reached the caller
 // (our deadline, an undici limit, the MCP host cancelling the call, a daemon
 // error) keeps its key for the turn budget, so the same message sent again
-// without a key is a retry of that turn, not a new one. The kept key serves
-// that one resend only (audit r2 F2): a later identical message is a new turn,
-// so at most one intended repeat can be answered as a replay. A key the caller
-// passes is always used as given.
+// without a key is a retry of that turn, not a new one. The key is kept until
+// an outcome of that turn reaches a waiting caller (audit r3 F1): a reply or a
+// replay, turn_interrupted, or any other definitive daemon answer clears it,
+// and the next identical message is a new turn. A turn_in_progress answer, a
+// cut-short call or a host cancel keeps it, because the turn's outcome is still
+// unknown. A key the caller passes is always used as given.
 const unconfirmedTurnKeys = new Map();
 // The daemon's turn budget plus a minute; not shortened by GC_MCP_TURN_TIMEOUT_MS.
 const UNCONFIRMED_TURN_KEY_TTL_MS = 31 * 60 * 1000;
@@ -438,17 +440,8 @@ function turnKeyFor(sessionId, message, now = Date.now()) {
     }
     const slot = turnKeySlot(sessionId, message);
     const kept = unconfirmedTurnKeys.get(slot);
-    if (kept && !kept.retried) {
-        // This send is the one retry the kept key serves.
-        unconfirmedTurnKeys.set(slot, { ...kept, retried: true });
-        return kept.key;
-    }
-    const key = `gcmcp-turn-${randomUUID()}`;
-    unconfirmedTurnKeys.set(slot, {
-        key,
-        expires: now + UNCONFIRMED_TURN_KEY_TTL_MS,
-        retried: false,
-    });
+    const key = kept?.key ?? `gcmcp-turn-${randomUUID()}`;
+    unconfirmedTurnKeys.set(slot, { key, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
     return key;
 }
 // A watch whose own `timeout` elapsed used to come back as
@@ -1394,13 +1387,22 @@ Actions: spawn, turn, stop, get, list, delete.
                     : params.idempotency_key;
                 try {
                     const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
-                    // Delivered to a caller still waiting: the next identical message is a new turn.
+                    // The turn's outcome reached a caller still waiting: the next identical
+                    // message is a new turn.
                     if (generated && !extra?.signal?.aborted) {
                         unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
                     }
                     return text(JSON.stringify(result, null, 2));
                 }
                 catch (e) {
+                    // A definitive daemon answer (not turn_in_progress, not cut short) is an
+                    // outcome too, and frees the key.
+                    if (generated &&
+                        !isClientCutShort(e) &&
+                        !String(e?.message ?? "").includes("turn_in_progress") &&
+                        !extra?.signal?.aborted) {
+                        unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+                    }
                     if (isClientCutShort(e)) {
                         return err(`ERROR: ${describeError(e)}. The turn may still complete in the daemon. ` +
                             `To retry without sending it twice, repeat the call with idempotency_key ` +

@@ -13,4 +13,4 @@
  * Config:
  *   { "mcpServers": { "gc": { "command": "node", "args": ["/path/to/gc_mcp/dist/index.js"] } } }
  */
-export {};
+export declare function isClientCutShort(e: unknown): boolean;

@@ -10,6 +10,8 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 let callToolHandler = null;
 const seen = [];
 let delayMs = 0;
+let status = 200;
+let answer = { ok: true, response: "hi" };
 const daemon = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -22,8 +24,8 @@ const daemon = createServer((req, res) => {
     seen.push({ url: req.url, method: req.method, body: body ? JSON.parse(body) : null });
     setTimeout(() => {
       if (res.destroyed) return;
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end(JSON.stringify({ ok: true, response: "hi" }));
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(answer));
     }, delayMs);
   });
 });
@@ -84,16 +86,46 @@ try {
   await call({ action: "turn", session_id: "s1", message: "slow" });
   assert.notEqual(seen.at(-1).body.idempotency_key, key);
 
-  // the kept key serves one resend only (audit r2 F2): cut short twice, the
-  // second resend is a new turn
+  // the key is kept until an outcome reaches the caller (audit r3 F1): cut
+  // short twice and answered turn_in_progress once, every resend reuses it; the
+  // first delivered outcome frees it
   delayMs = 1000;
   await call({ action: "turn", session_id: "s3", message: "twice" });
   const k1 = seen.at(-1).body.idempotency_key;
   await call({ action: "turn", session_id: "s3", message: "twice" });
   assert.equal(seen.at(-1).body.idempotency_key, k1);
   delayMs = 0;
+  status = 409;
+  answer = { ok: false, error: "turn_in_progress", retryable: true };
+  await call({ action: "turn", session_id: "s3", message: "twice" });
+  assert.equal(seen.at(-1).body.idempotency_key, k1);
+  status = 200;
+  answer = { ok: true, response: "hi", replayed: true };
+  await call({ action: "turn", session_id: "s3", message: "twice" });
+  assert.equal(seen.at(-1).body.idempotency_key, k1);
   await call({ action: "turn", session_id: "s3", message: "twice" });
   assert.notEqual(seen.at(-1).body.idempotency_key, k1);
+
+  // a definitive daemon error (here turn_interrupted) also frees the key
+  delayMs = 1000;
+  await call({ action: "turn", session_id: "s4", message: "m" });
+  const k4 = seen.at(-1).body.idempotency_key;
+  delayMs = 0;
+  status = 409;
+  answer = { ok: false, error: "turn_interrupted", retryable: false };
+  await call({ action: "turn", session_id: "s4", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, k4);
+  status = 200;
+  answer = { ok: true, response: "hi" };
+  await call({ action: "turn", session_id: "s4", message: "m" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, k4);
+
+  // a caller's own key is sent verbatim on its retry after a cut short
+  delayMs = 1000;
+  await call({ action: "turn", session_id: "s5", message: "m", idempotency_key: "own-1" });
+  delayMs = 0;
+  await call({ action: "turn", session_id: "s5", message: "m", idempotency_key: "own-1" });
+  assert.equal(seen.at(-1).body.idempotency_key, "own-1");
 
   // another session or another message does not inherit the kept key
   delayMs = 1000;
