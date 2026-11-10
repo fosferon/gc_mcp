@@ -238,7 +238,18 @@ async function gcPost(
   const resp = await daemonFetch(url, init);
   if (!resp.ok) {
     const text = await resp.text().catch(() => "");
-    throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
+    // GC-7152 audit r4 F3: the status and parsed body travel with the error, so a
+    // caller can classify the answer structurally instead of by substring.
+    let body: unknown = undefined;
+    try {
+      body = JSON.parse(text);
+    } catch {
+      body = undefined;
+    }
+    throw Object.assign(new Error(`daemon ${path} failed (${resp.status}): ${text}`), {
+      status: resp.status,
+      body,
+    });
   }
   const json = await resp.json();
   noteInlineSeq(json);
@@ -516,8 +527,28 @@ export function isClientCutShort(e: unknown): boolean {
 // cut-short call or a host cancel keeps it, because the turn's outcome is still
 // unknown. A key the caller passes is always used as given.
 const unconfirmedTurnKeys = new Map<string, { key: string; expires: number }>();
-// The daemon's turn budget plus a minute; not shortened by GC_MCP_TURN_TIMEOUT_MS.
-const UNCONFIRMED_TURN_KEY_TTL_MS = 31 * 60 * 1000;
+// GC-7152 audit r4 F1: the kept key outlives the deadline of the call that
+// kept it, so the retry that follows a deadline abort still finds it.
+const UNCONFIRMED_TURN_KEY_TTL_MS = AGENT_CONVERSATION_TURN_TIMEOUT_MS + 60_000;
+
+// GC-7152 audit r4 F2: the key is freed only on evidence that the turn's
+// outcome is settled: delivered (2xx), or a daemon answer that says the turn
+// did not run or will not run under this key (400, 404, 422, 409
+// turn_interrupted). A 409 turn_in_progress, a 5xx (the turn may be stored
+// before the error), a transport failure, a cut-short call and a host cancel
+// all keep it.
+function turnOutcomeSettled(e: any): boolean {
+  const status = e?.status;
+  if (typeof status !== "number") return false;
+  if (status === 409) return e?.body?.error === "turn_interrupted";
+  return status === 400 || status === 404 || status === 422;
+}
+
+function keepTurnKey(sessionId: string, message: string, now = Date.now()): void {
+  const slot = turnKeySlot(sessionId, message);
+  const kept = unconfirmedTurnKeys.get(slot);
+  if (kept) unconfirmedTurnKeys.set(slot, { ...kept, expires: now + UNCONFIRMED_TURN_KEY_TTL_MS });
+}
 
 function turnKeySlot(sessionId: string, message: string): string {
   return `${sessionId}\u0000${createHash("sha256").update(message).digest("hex")}`;
@@ -1671,7 +1702,7 @@ server.registerTool(
     description: `Chat-style sessions with local GC agents.
 Actions: spawn, turn, stop, get, list, delete.
 - stop: stop the session's running turn at once (same stop as gc_conversation stop)
-- turn: waits up to the daemon's turn budget (30 min). Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session before the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session before the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
     inputSchema: z.object({
       action: z
         .enum(["spawn", "turn", "stop", "get", "list", "delete"])
@@ -1723,20 +1754,18 @@ Actions: spawn, turn, stop, get, list, delete.
           );
           // The turn's outcome reached a caller still waiting: the next identical
           // message is a new turn.
-          if (generated && !extra?.signal?.aborted) {
-            unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+          if (generated) {
+            if (!extra?.signal?.aborted) unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+            else keepTurnKey(sessionId, message);
           }
           return text(JSON.stringify(result, null, 2));
         } catch (e: any) {
-          // A definitive daemon answer (not turn_in_progress, not cut short) is an
-          // outcome too, and frees the key.
-          if (
-            generated &&
-            !isClientCutShort(e) &&
-            !String(e?.message ?? "").includes("turn_in_progress") &&
-            !extra?.signal?.aborted
-          ) {
-            unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+          if (generated) {
+            if (turnOutcomeSettled(e) && !extra?.signal?.aborted) {
+              unconfirmedTurnKeys.delete(turnKeySlot(sessionId, message));
+            } else {
+              keepTurnKey(sessionId, message);
+            }
           }
           if (isClientCutShort(e)) {
             return err(

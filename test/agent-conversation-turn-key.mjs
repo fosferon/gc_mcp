@@ -12,6 +12,7 @@ const seen = [];
 let delayMs = 0;
 let status = 200;
 let answer = { ok: true, response: "hi" };
+let destroy = false;
 const daemon = createServer((req, res) => {
   let body = "";
   req.on("data", (c) => (body += c));
@@ -24,6 +25,10 @@ const daemon = createServer((req, res) => {
     seen.push({ url: req.url, method: req.method, body: body ? JSON.parse(body) : null });
     setTimeout(() => {
       if (res.destroyed) return;
+      if (destroy) {
+        res.socket?.destroy();
+        return;
+      }
       res.writeHead(status, { "Content-Type": "application/json" });
       res.end(JSON.stringify(answer));
     }, delayMs);
@@ -52,6 +57,11 @@ try {
       {},
     );
   const textOf = (r) => r.content.map((c) => c.text).join("");
+  const callWith = (args, extra) =>
+    callToolHandler(
+      { method: "tools/call", params: { name: "gc_agent_conversation", arguments: args } },
+      extra,
+    );
 
   // no key: one is generated and sent
   await call({ action: "turn", session_id: "s1", message: "hello" });
@@ -119,6 +129,47 @@ try {
   answer = { ok: true, response: "hi" };
   await call({ action: "turn", session_id: "s4", message: "m" });
   assert.notEqual(seen.at(-1).body.idempotency_key, k4);
+
+  // a 5xx keeps the key: the turn may be stored before the error (audit r4 F2)
+  status = 500;
+  answer = { ok: false, error: "boom" };
+  await call({ action: "turn", session_id: "s6", message: "m" });
+  const k6 = seen.at(-1).body.idempotency_key;
+  status = 200;
+  answer = { ok: true, response: "hi" };
+  await call({ action: "turn", session_id: "s6", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, k6);
+
+  // a transport failure keeps the key too
+  destroy = true;
+  await call({ action: "turn", session_id: "s7", message: "m" }).catch(() => null);
+  const k7 = seen.at(-1).body.idempotency_key;
+  destroy = false;
+  await call({ action: "turn", session_id: "s7", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, k7);
+
+  // a host cancel keeps the key even though the daemon answered (audit r4 test gap)
+  const cancelled = new AbortController();
+  cancelled.abort();
+  await callWith({ action: "turn", session_id: "s8", message: "m" }, { signal: cancelled.signal });
+  const k8 = seen.at(-1).body.idempotency_key;
+  await call({ action: "turn", session_id: "s8", message: "m" });
+  assert.equal(seen.at(-1).body.idempotency_key, k8);
+  await call({ action: "turn", session_id: "s8", message: "m" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, k8);
+
+  // a session id containing the words does not flip the classification (audit r4 F3)
+  status = 500;
+  answer = { ok: false, error: "boom", detail: "turn_in_progress mentioned in passing" };
+  await call({ action: "turn", session_id: "turn_in_progress-sid", message: "m" });
+  status = 404;
+  answer = { ok: false, error: "session not found" };
+  await call({ action: "turn", session_id: "turn_in_progress-sid", message: "m" });
+  const k9 = seen.at(-1).body.idempotency_key;
+  status = 200;
+  answer = { ok: true, response: "hi" };
+  await call({ action: "turn", session_id: "turn_in_progress-sid", message: "m" });
+  assert.notEqual(seen.at(-1).body.idempotency_key, k9);
 
   // a caller's own key is sent verbatim on its retry after a cut short
   delayMs = 1000;
