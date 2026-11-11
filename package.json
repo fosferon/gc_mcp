@@ -29,6 +29,7 @@
   },
   "files": [
     "dist",
+    "dist/tools.js",
     "src",
     "README.md",
     "LICENSE",

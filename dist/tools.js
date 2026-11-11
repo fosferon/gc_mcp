@@ -1,0 +1,4597 @@
+import { z } from "zod";
+import { execFileSync, execSync } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
+import { readFileSync, existsSync } from "node:fs";
+import { resolve, join } from "node:path";
+import { homedir } from "node:os";
+let activeShared;
+export function registerTools(server, shared) {
+    activeShared = shared;
+    const handles = [];
+    const registerTool = ((name, config, callback) => {
+        const handle = server.registerTool(name, config, callback);
+        handles.push(handle);
+        return handle;
+    });
+    /** The three spellings of "no deadline" that zTimeout() accepts. */
+    function isNoDeadline(timeout) {
+        return timeout === "none" || timeout === "infinity" || timeout === "infinite";
+    }
+    // GC-7152: the daemon's conversation turn budget (Providers.conversation_cli_timeout_ms,
+    // 30 min) plus a minute, so the client never gives up on a turn the daemon is
+    // still allowed to finish.
+    // GC_MCP_TURN_TIMEOUT_MS overrides it for tests only.
+    const AGENT_CONVERSATION_TURN_TIMEOUT_MS = Number(process.env.GC_MCP_TURN_TIMEOUT_MS) > 0
+        ? Number(process.env.GC_MCP_TURN_TIMEOUT_MS)
+        : 31 * 60 * 1000;
+    async function gcPost(path, body, timeoutMs = 15_000) {
+        const url = `${activeShared.gcBase}${path}`;
+        const init = {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+        };
+        if (timeoutMs !== null && timeoutMs !== undefined) {
+            init.signal = AbortSignal.timeout(timeoutMs);
+        }
+        const resp = await activeShared.fetch(url, init);
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => "");
+            // GC-7152 audit r4 F3: the status and parsed body travel with the error, so a
+            // caller can classify the answer structurally instead of by substring.
+            let body = undefined;
+            try {
+                body = JSON.parse(text);
+            }
+            catch {
+                body = undefined;
+            }
+            throw Object.assign(new Error(`daemon ${path} failed (${resp.status}): ${text}`), {
+                status: resp.status,
+                body,
+            });
+        }
+        const json = await resp.json();
+        activeShared.noteInlineSeq(json);
+        return json;
+    }
+    async function gcGet(path) {
+        const url = `${activeShared.gcBase}${path}`;
+        const resp = await activeShared.fetch(url, { signal: AbortSignal.timeout(5_000) });
+        if (!resp.ok)
+            throw new Error(`daemon ${path} failed (${resp.status})`);
+        return resp.json();
+    }
+    async function gcGetResponse(path, timeoutMs = 15_000) {
+        const url = `${activeShared.gcBase}${path}`;
+        const init = {};
+        if (timeoutMs !== null && timeoutMs !== undefined) {
+            init.signal = AbortSignal.timeout(timeoutMs);
+        }
+        const resp = await activeShared.fetch(url, init);
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => "");
+            throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
+        }
+        return resp;
+    }
+    async function gcDelete(path) {
+        const url = `${activeShared.gcBase}${path}`;
+        const resp = await activeShared.fetch(url, {
+            method: "DELETE",
+            signal: AbortSignal.timeout(5_000),
+        });
+        if (!resp.ok) {
+            const text = await resp.text().catch(() => "");
+            throw new Error(`daemon ${path} failed (${resp.status}): ${text}`);
+        }
+        return resp.json();
+    }
+    /** Strip undefined values from params before sending to daemon */
+    function clean(params) {
+        const out = {};
+        for (const [k, v] of Object.entries(params)) {
+            if (v !== undefined)
+                out[k] = v;
+        }
+        return out;
+    }
+    // ════════════════════════════════════════════════════════════════
+    // Response truncation
+    // ════════════════════════════════════════════════════════════════
+    //
+    // Several daemon tools (ticker, convergence report, work list) can
+    // return responses that exceed what the host context window can hold. When an
+    // agent fires multiple such tools in parallel the combined result easily
+    // breaks the harness (tool_results_required). Cap each tool response at a
+    // safe ceiling and append a clear truncation notice so the agent knows what
+    // happened and can request a narrower query.
+    const MAX_RESPONSE_CHARS = 16_000;
+    /**
+     * Truncate a tool-result string when it exceeds `maxChars`.
+     *
+     * Returns the original string unchanged when within budget. When truncation
+     * fires: cuts at the last newline before the limit (so JSON keys/values are
+     * not split mid-token), then appends a diagnostic block with the original
+     * size, the amount retained, and a hint to narrow the query.
+     */
+    function truncateResponse(body, maxChars = MAX_RESPONSE_CHARS, hint = "Use narrower filters, a smaller limit, or a more specific action to get full results.") {
+        if (body.length <= maxChars)
+            return body;
+        // Reserve room for the truncation notice itself (~300 chars, plus the hint).
+        const cutBudget = maxChars - 350 - hint.length;
+        let cutPoint = body.lastIndexOf("\n", cutBudget);
+        if (cutPoint < cutBudget * 0.5)
+            cutPoint = cutBudget; // no good newline; hard cut
+        const kept = body.slice(0, cutPoint);
+        const droppedChars = body.length - cutPoint;
+        const pct = Math.round((cutPoint / body.length) * 100);
+        return (kept +
+            `\n\n[TRUNCATED — showing ${pct}% (${cutPoint.toLocaleString()} of ${body.length.toLocaleString()} chars). ` +
+            `${droppedChars.toLocaleString()} chars omitted. ` +
+            `${hint}]`);
+    }
+    // A dispatch report past the cap could not be read at all — the
+    // daemon had no paging. It pages in bytes now; say so where the cut lands.
+    const DISPATCH_OUTPUT_TRUNCATION_HINT = "This is a dispatch report. Read it in pages: action:output job_id:<id> " +
+        "offset:<n> limit:10000 (bytes) — the response carries total_bytes and " +
+        "next_offset; pass next_offset back as offset until it is null.";
+    // A truncated workflow read used to end in the generic hint above,
+    // and the agent reading a 60k-character run never learned that one step's
+    // output can be fetched on its own and in pages.
+    const WORKFLOW_TRUNCATION_HINT = "This is a workflow read. One step's output: action:context key:<step_id>, " +
+        "with offset/limit (characters) to page it — the response carries total_chars " +
+        "and next_offset. Narrow show/detail with select:\"step_a,step_b\", or use " +
+        "return:\"lean\" for status alone.";
+    /** Standard MCP text result */
+    function text(t) {
+        return { content: [{ type: "text", text: t }] };
+    }
+    /** Standard MCP error result */
+    function err(msg) {
+        return {
+            content: [{ type: "text", text: msg }],
+            isError: true,
+        };
+    }
+    function toJsonText(value) {
+        return JSON.stringify(value, null, 2);
+    }
+    function summarizeWatchEvent(event) {
+        if (event.data && typeof event.data === "object") {
+            const data = event.data;
+            const bits = [event.event];
+            if (typeof data.status === "string")
+                bits.push(`status=${data.status}`);
+            if (typeof data.step === "string")
+                bits.push(`step=${data.step}`);
+            if (typeof data.id === "string")
+                bits.push(`id=${data.id}`);
+            return bits.join(" ");
+        }
+        return `${event.event} ${event.rawData}`.trim();
+    }
+    function isTerminalWatchEvent(event) {
+        if (event.event === "final")
+            return true;
+        if (event.data && typeof event.data === "object") {
+            const data = event.data;
+            return data.final === true || data.settled === true;
+        }
+        return false;
+    }
+    function isFailedWatchEvent(event) {
+        if (event.event === "error")
+            return true;
+        if (event.data && typeof event.data === "object") {
+            const data = event.data;
+            return data.status === "failed";
+        }
+        return false;
+    }
+    async function readSseStream(resp, onEvent) {
+        if (!resp.body) {
+            throw new Error("daemon SSE stream returned no response body");
+        }
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+        let eventName = "message";
+        let dataLines = [];
+        const events = [];
+        let terminal;
+        const flushEvent = async () => {
+            if (dataLines.length === 0)
+                return;
+            const rawData = dataLines.join("\n");
+            let data = rawData;
+            try {
+                data = JSON.parse(rawData);
+            }
+            catch { }
+            const event = {
+                event: eventName || "message",
+                data,
+                rawData,
+            };
+            events.push(event);
+            await onEvent?.(event, events.length);
+            if (isTerminalWatchEvent(event)) {
+                terminal = event;
+            }
+            eventName = "message";
+            dataLines = [];
+        };
+        while (true) {
+            const { value, done } = await reader.read();
+            buffer += decoder.decode(value, { stream: !done });
+            while (true) {
+                const newlineIndex = buffer.indexOf("\n");
+                if (newlineIndex === -1)
+                    break;
+                let line = buffer.slice(0, newlineIndex);
+                buffer = buffer.slice(newlineIndex + 1);
+                if (line.endsWith("\r"))
+                    line = line.slice(0, -1);
+                if (line === "") {
+                    await flushEvent();
+                    if (terminal) {
+                        await reader.cancel().catch(() => undefined);
+                        return { events, terminal };
+                    }
+                    continue;
+                }
+                if (line.startsWith(":"))
+                    continue;
+                if (line.startsWith("event:")) {
+                    eventName = line.slice("event:".length).trim() || "message";
+                    continue;
+                }
+                if (line.startsWith("data:")) {
+                    dataLines.push(line.slice("data:".length).trimStart());
+                }
+            }
+            if (done) {
+                if (buffer.trim() || dataLines.length > 0) {
+                    if (buffer.trim())
+                        dataLines.push(buffer.trim());
+                    await flushEvent();
+                }
+                return { events, terminal };
+            }
+        }
+    }
+    function isAbortError(e) {
+        const name = e?.name;
+        return name === "AbortError" || name === "TimeoutError";
+    }
+    // GC-7152 audit r4 F2: the key is freed only on evidence that the turn's
+    // outcome is settled: delivered (2xx), or a daemon answer that says the turn
+    // did not run or will not run under this key (400, 404, 422, 409
+    // turn_interrupted, 409 corrupt_transcript_item). A 409 turn_in_progress, a 5xx (the turn may be stored
+    // before the error), a transport failure, a cut-short call and a host cancel
+    // all keep it.
+    function turnOutcomeSettled(e) {
+        const status = e?.status;
+        if (typeof status !== "number")
+            return false;
+        // 409 turn_interrupted: the key is burned. 409 corrupt_transcript_item
+        // (GC-7151): the turn was refused and nothing stored. Both are settled; only
+        // 409 turn_in_progress leaves the outcome open (audit r10).
+        if (status === 409) {
+            return e?.body?.error === "turn_interrupted" || e?.body?.error === "corrupt_transcript_item";
+        }
+        return status === 400 || status === 404 || status === 422;
+    }
+    function turnKeySlot(connectionId, sessionId, message) {
+        const digest = createHash("sha256").update(message).digest("hex");
+        return `${connectionId}\u0000${sessionId}\u0000${digest}`;
+    }
+    /**
+     * GC-7152 / GC-7153: one keyed conversation turn (gc_agent_conversation and
+     * gc_conversation). The turn waits the daemon's turn budget plus a minute,
+     * carries the caller's idempotency_key or a generated one kept per connection,
+     * route, session and exact message until its outcome has left gc_mcp for a
+     * waiting caller, and on a client-side cut-short names the key to retry with.
+     */
+    async function keyedTurn(path, sessionId, params, extra) {
+        const message = params.message ?? "";
+        const generated = params.idempotency_key === undefined;
+        // GC-7152 audit r6 F2: without a connection there is no slot to share, so
+        // the call gets a fresh key and no reuse (never one slot for every caller).
+        const connId = activeShared.callStore.getStore()?.conn.id;
+        // The route is part of the slot (GC-7153), so the two tools never share a key.
+        const slot = connId ? turnKeySlot(connId, `${path}\u0000${sessionId}`, message) : undefined;
+        const idempotencyKey = !generated
+            ? params.idempotency_key
+            : slot
+                ? activeShared.turnKeys.turnKeyFor(slot)
+                : `gcmcp-turn-${randomUUID()}`;
+        try {
+            const result = await gcPost(path, { ...params, idempotency_key: idempotencyKey }, AGENT_CONVERSATION_TURN_TIMEOUT_MS);
+            // GC-7152 audit r6 F5: serialize first, so nothing after the finish can throw
+            // into the catch and finish the slot a second time.
+            const body = JSON.stringify(result, null, 2);
+            // GC-7152 audit r7 N1: the slot is settled only once the reply has left
+            // the wrapper (after delivery), not when this function returns. What
+            // happens on the wire after that is not observable here, so a reply
+            // lost in transport still frees the key; the tool text tells callers
+            // to pass their own key where that matters.
+            if (generated && slot) {
+                const store = activeShared.callStore.getStore();
+                const settle = (replied) => activeShared.turnKeys.finishTurnKey(slot, idempotencyKey, replied && !extra?.signal?.aborted);
+                if (store)
+                    store.afterReply.push(settle);
+                else
+                    settle(true);
+            }
+            return text(body);
+        }
+        catch (e) {
+            if (generated && slot) {
+                activeShared.turnKeys.finishTurnKey(slot, idempotencyKey, turnOutcomeSettled(e) && !extra?.signal?.aborted);
+            }
+            if (activeShared.turnKeys.isClientCutShort(e)) {
+                return err(`ERROR: ${activeShared.describeError(e)}. The turn may still complete in the daemon. ` +
+                    `To retry without sending it twice, repeat the call with idempotency_key ` +
+                    `"${idempotencyKey}": a finished turn returns its stored reply, a running ` +
+                    `one answers turn_in_progress.`);
+            }
+            throw e;
+        }
+    }
+    // A watch whose own `timeout` elapsed used to come back as
+    // "ERROR: The operation was aborted due to timeout", with every event it had
+    // collected thrown away — the normal outcome of "watch for N seconds" was an
+    // error. The events are kept as they arrive, and a client-side abort returns
+    // them with timed_out: true. (The daemon streams also take `timeout`, so the
+    // stream normally closes itself first; the abort is the fallback.)
+    async function collectSseStream(resp, onEvent) {
+        const events = [];
+        try {
+            const result = await readSseStream(resp, async (event, index) => {
+                events.push(event);
+                await onEvent?.(event, index);
+            });
+            return { events: result.events, terminal: result.terminal, timed_out: false };
+        }
+        catch (e) {
+            if (isAbortError(e))
+                return { events, terminal: undefined, timed_out: true };
+            throw e;
+        }
+    }
+    async function readWorkflowWatchStream(executionId, timeoutMs, onEvent) {
+        // The daemon's workflow watch takes `timeout` in seconds and closes the
+        // stream itself at the deadline.
+        const query = typeof timeoutMs === "number" && timeoutMs > 0
+            ? `?timeout=${encodeURIComponent(Math.ceil(timeoutMs / 1000))}`
+            : "";
+        const resp = await gcGetResponse(`/gc/workflow/${encodeURIComponent(executionId)}/watch${query}`, timeoutMs === null || timeoutMs === undefined ? timeoutMs : timeoutMs + 5_000);
+        return collectSseStream(resp, onEvent);
+    }
+    /**
+     * Call daemon and return formatted JSON, truncated when the serialized
+     * response exceeds MAX_RESPONSE_CHARS.
+     *
+     * Pass `maxResponseChars: null` from individual tool handlers that need
+     * the full payload (rare — most tools benefit from the safety cap).
+     */
+    async function daemonCall(endpoint, params, timeoutMs = 15_000, maxResponseChars = MAX_RESPONSE_CHARS, truncationHint) {
+        try {
+            const result = await gcPost(endpoint, clean(params), timeoutMs);
+            const body = JSON.stringify(result, null, 2);
+            return text(maxResponseChars !== null
+                ? truncateResponse(body, maxResponseChars, truncationHint)
+                : body);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    }
+    // ════════════════════════════════════════════════════════════════
+    // Schema helpers — value-shape parity with daemon's GcDaemon.Timeouts
+    // ════════════════════════════════════════════════════════════════
+    //
+    // The daemon parses every timeout via GcDaemon.Timeouts.parse/2 which
+    // accepts: integer | string-of-int | "none" | "infinity" | "infinite".
+    // Earlier, the MCP shim declared `timeout: z.number()` which rejected
+    // LLM-stringified values like "600" — the user couldn't wait on a workflow
+    // because the Zod layer rejected the call before it ever reached the
+    // daemon. zTimeout() / zPositiveNumber() close that value-shape hole and
+    // keep the MCP contract aligned with the daemon's parser.
+    //
+    // `z.coerce.number()` accepts numeric input AND parses string-of-int.
+    // Combined with the literal alternatives we cover the full Timeouts.parse
+    // value space.
+    const zTimeout = () => z.union([
+        z.coerce.number().positive(),
+        z.literal("none"),
+        z.literal("infinity"),
+        z.literal("infinite"),
+    ]);
+    const zPositiveNumber = () => z.coerce.number().positive();
+    // Generic numeric coercion — accepts int, float, and string-of-number.
+    // Same semantic as the old `z.number()` but string-tolerant. Apply to every
+    // numeric field by default; reach for zPositiveNumber() / zTimeout() only when
+    // the field carries additional constraints.
+    const zNumber = () => z.coerce.number();
+    // Boolean with string tolerance. NB: NOT `z.coerce.boolean()` — that coerces
+    // any truthy value and silently turns the string "false" into `true`, which
+    // is the opposite of what an LLM that stringified the literal means. This
+    // helper accepts only real booleans and the exact strings "true"/"false".
+    const zBoolean = () => z.union([
+        z.boolean(),
+        z.literal("true").transform(() => true),
+        z.literal("false").transform(() => false),
+    ]);
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Memory
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_recall", {
+        description: `Search the memory bank for facts matching a query. Uses FTS5/BM25 — instant, zero cost.
+Falls back to the deep-memory backend (expensive, deep) only if no local results and that backend is available.
+Returns ranked facts with bank attribution and match scores.
+
+Superseded facts (those replaced via gc_retain supersedes) are EXCLUDED by default — you get current truth only.
+Each returned fact may include a "superseded_by" field pointing to the fact that replaced it (only visible when include_superseded: true).
+Use include_superseded: true for historical audits.`,
+        inputSchema: z.object({
+            query: z.string().describe("Natural language search query"),
+            bank: z
+                .string()
+                .optional()
+                .describe("Filter to specific bank (omit for global search)"),
+            limit: zNumber().optional().describe("Max results (default 15)"),
+            mode: z
+                .enum(["linear", "deep", "full"])
+                .optional()
+                .describe('"linear" (default) = local facts only, recency-weighted. "deep" = includes HS-imports. "full" = everything, pure BM25 (debug).'),
+            hindsight: z
+                .enum(["never", "fallback", "always"])
+                .optional()
+                .describe('"never" = local only, "fallback" = use if no local results, "always" = always query the deep-memory backend too'),
+            include_superseded: zBoolean()
+                .optional()
+                .describe("If true, include facts that have been superseded. Each such fact is returned with a superseded_by: <id> field. Default: false (current truth only)."),
+        }),
+    }, async (params) => daemonCall("/gc/recall", params));
+    registerTool("gc_retain", {
+        description: `Store a fact in the memory bank. Auto-routes to the best bank by keyword matching, or specify a bank.
+
+Deduplication:
+  - Fingerprint dedup only (exact normalized-content match). Fuzzy/BM25 dedup removed — it was silently rejecting corrections.
+  - Supersedes bypasses even fingerprint dedup — an explicit replacement signal always stores.
+
+Response contract (READ THIS):
+  - { stored: true, duplicate: false, id, bank }  → fact was stored
+  - { stored: false, duplicate: true, existing_id } → fact was NOT stored; same fingerprint already in DB
+  ALWAYS check 'stored' to know whether your content was persisted. 'ok: true' only means the call succeeded, not that storage happened.
+
+Supersedes + recall: when you pass supersedes: [<old-id>], the old fact is marked as replaced and won't show up in default recall results.
+Use recall with include_superseded: true to see historical versions.`,
+        inputSchema: z.object({
+            content: z
+                .string()
+                .describe("The fact to store — be specific and include relevant context"),
+            bank: z
+                .string()
+                .optional()
+                .describe("Target bank (auto-routed if omitted)"),
+            context: z
+                .string()
+                .optional()
+                .describe("Category: architecture, decision, pattern, convention, bug, etc."),
+            tags: z.array(z.string()).optional().describe("Tags for this fact"),
+            source: z.string().optional().describe("Where this fact comes from"),
+            supersedes: z
+                .union([z.string(), z.array(z.string())])
+                .optional()
+                .describe("Fact ID(s) this new fact supersedes. Marks the old fact(s) as replaced (hidden from default recall) AND bypasses fingerprint dedup so your correction is always stored."),
+            origin: z
+                .string()
+                .optional()
+                .describe("Origin: 'local' (default), 'hs-import', 'hs-echo'"),
+            hindsight: zBoolean()
+                .optional()
+                .describe("Also push to the deep-memory backend"),
+        }),
+    }, async (params) => daemonCall("/gc/retain", params));
+    registerTool("gc_reflect", {
+        description: `Analyze coverage for a topic across all memory banks.
+Shows: which banks have relevant facts, tag distribution, coverage gaps, stale facts.`,
+        inputSchema: z.object({
+            topic: z.string().describe("Topic to analyze coverage for"),
+            bank: z.string().optional().describe("Restrict analysis to one bank"),
+        }),
+    }, async (params) => daemonCall("/gc/reflect", params));
+    registerTool("gc_banks", {
+        description: `Manage memory banks: list, create, delete, or restore.
+Actions: "list" = all banks with fact_count (descending), "create" = new bank, "delete" = remove (use force for a non-empty bank), "restore" = undelete a soft-deleted bank.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["list", "create", "delete", "restore"])
+                .describe("Action to perform"),
+            name: z.string().optional().describe("Bank name (for create/delete/restore)"),
+            description: z
+                .string()
+                .optional()
+                .describe("Bank description (for create)"),
+            keywords: z
+                .array(z.string())
+                .optional()
+                .describe("Bank keywords (for create)"),
+            force: zBoolean()
+                .optional()
+                .describe("Force delete a non-empty bank (for delete)"),
+        }),
+    }, async (params) => daemonCall("/gc/banks", params));
+    registerTool("gc_obsidian_vault", {
+        description: `Obsidian vault knowledge-base indexing.
+Indexes Obsidian vault .md files into the memory bank for fast retrieval via gc_recall.
+Actions: "reindex" = enqueue a full reindex now, "status" = show vault config and indexed chunk count.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["reindex", "status"])
+                .describe("Action to perform"),
+        }),
+    }, async (params) => daemonCall("/gc/obsidian_vault", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Documentation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_docs", {
+        description: `Query the packaged daemon user manual.
+Use this whenever you need authoritative help with daemon setup, configuration, workflows, templates, or troubleshooting.
+Actions:
+- search: keyword search over doc titles, ids, and tags
+- get: retrieve a doc body by id or path
+- list: list docs, templates, workflows, or checklists
+- guide: return a ranked guide (docs + checklists + templates) for a topic
+- template: return the raw contents of a starter template by name
+- validate: check that the manual package is intact`,
+        inputSchema: z.object({
+            action: z
+                .enum(["search", "get", "list", "guide", "template", "validate"])
+                .describe("Action to perform"),
+            query: z
+                .string()
+                .optional()
+                .describe("Keyword query (for search)"),
+            tags: z
+                .array(z.string())
+                .optional()
+                .describe("Filter by tags (for search/list)"),
+            limit: zNumber()
+                .optional()
+                .describe("Max results (for search/guide, default 10, cap 100)"),
+            id: z
+                .string()
+                .optional()
+                .describe("Doc id (for get)"),
+            path: z
+                .string()
+                .optional()
+                .describe("Doc path (for get)"),
+            kind: z
+                .enum(["doc", "template", "workflow", "checklist"])
+                .optional()
+                .describe("Collection kind (for list, default doc)"),
+            topic: z
+                .string()
+                .optional()
+                .describe("Topic for guided results (for guide)"),
+            name: z
+                .string()
+                .optional()
+                .describe("Template name or id (for template)"),
+        }),
+    }, async (params) => daemonCall("/gc/docs", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Memory Maintenance
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_rebuild_fts", {
+        description: `Emergency rebuild of the memory-bank FTS5 index.
+Use when recall/search is returning stale or incomplete results despite facts existing in the bank. This is a maintenance operation, not a daily tool.`,
+        inputSchema: z.object({}),
+    }, async () => daemonCall("/gc/rebuild_fts", {}));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Uniform Tool Call Surface
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_tool_call", {
+        description: `Execute any daemon tool by name through the uniform tool-call surface.
+Useful when you know the exact tool name and want to dispatch it without a dedicated MCP tool. Handler tools (gc_*) are always available. Code tools (bash, read_file, etc.) require server-side code-tool execution to be enabled.`,
+        inputSchema: z.object({
+            name: z.string().describe("Tool name to execute"),
+            arguments: z
+                .record(z.any())
+                .optional()
+                .describe("Arguments object for the tool (default {}),"),
+            session_id: z
+                .string()
+                .optional()
+                .describe("Session ID for resolving cwd (code tools)"),
+            cwd: z
+                .string()
+                .optional()
+                .describe("Explicit working directory (code tools)"),
+        }),
+    }, async (params) => daemonCall("/gc/tool_call", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Templating
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_template", {
+        description: `Merge-field templating.
+- placeholders: list available {{ }} placeholders for a context
+- fill: render a template block with explicit values`,
+        inputSchema: z.object({
+            action: z
+                .enum(["placeholders", "fill"])
+                .describe("Action to perform"),
+            context: z
+                .enum(["reply", "template"])
+                .optional()
+                .describe("Template context (for placeholders)"),
+            message_id: z.string().optional().describe("Message ID (for placeholders)"),
+            record_type: z.string().optional().describe("Record type (for placeholders)"),
+            block_json: z
+                .record(z.any())
+                .optional()
+                .describe("Template block JSON object (for fill)"),
+            values: z
+                .record(z.any())
+                .optional()
+                .describe("Merge-field values (for fill)"),
+            email: zBoolean()
+                .optional()
+                .describe("Render email-compatible output (for fill)"),
+        }),
+    }, async (params) => daemonCall("/gc/template", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Deterministic Controls
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_control", {
+        description: `Deterministic dual-path controls (Story 3.1). Direct, LLM-free execution of approved operations.
+- manifest: list control-reachable operations and their risk metadata
+- execute: run one control; may return held: true if the gate requires approval`,
+        inputSchema: z.object({
+            action: z
+                .enum(["manifest", "execute"])
+                .describe("Action to perform"),
+            tool: z.string().optional().describe("Tool name (for execute)"),
+            op: z.string().optional().describe("Operation name (for execute)"),
+            args: z
+                .record(z.any())
+                .optional()
+                .describe("Operation arguments object (for execute)"),
+            idempotency_key: z
+                .string()
+                .optional()
+                .describe("Idempotency key (for execute)"),
+        }),
+    }, async (params) => daemonCall("/gc/control", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Onboarding DAG
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_onboarding", {
+        description: `Onboarding DAG orchestration and setup generation.
+Key actions:
+- setup_degree: current readiness state (ready | setup-required | degraded)
+- bootstrap_apex: minimal pre-apex bootstrap (credential one provider)
+- recommended_action: server-authoritative next step
+- begin/expand/advance: companion-driven guided flow
+- state/summary/show/list/ready/next/node: inspect DAG state
+- launch_node/update_node/submit_answers: drive the DAG
+- create/create_template/template: build onboarding DAGs
+- catalog/admin_overview/readiness: administration views`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "create",
+                "create_template",
+                "template",
+                "list_templates",
+                "catalog",
+                "admin_overview",
+                "readiness",
+                "setup_degree",
+                "bootstrap_apex",
+                "recommended_action",
+                "list",
+                "show",
+                "summary",
+                "state",
+                "focus",
+                "node",
+                "ready",
+                "blocked",
+                "next",
+                "update_node",
+                "bind_execution",
+                "reset_node",
+                "launch_node",
+                "submit_answers",
+                "advance",
+                "reset",
+                "resume_node",
+                "begin",
+                "expand",
+                "provider_setup",
+                "assistant_agent_setup",
+                "optional_schedule_setup",
+                "writer_agent_setup",
+                "optional_content_schedule_setup",
+                "project_discovery_or_registration",
+                "developer_agent_setup",
+                "work_dag_alignment",
+                "project_lane_binding",
+                "project_directive_seed",
+                "mail_endpoint_setup",
+                "optional_mail_digest_setup",
+                "memory_bank_setup",
+                "optional_memory_capture_workflow_setup",
+                "content_piece_setup",
+                "distribution_post_setup",
+                "optional_distribution_workflow_setup",
+            ])
+                .describe("Action to perform"),
+            id: z.string().optional().describe("DAG instance ID"),
+            node_key: z.string().optional().describe("Node key within a DAG"),
+            template: z.string().optional().describe("Template ID (for create_template/template)"),
+            templates: z
+                .array(z.string())
+                .optional()
+                .describe("Multiple template IDs"),
+            status: z.string().optional().describe("New node status (for update_node)"),
+            execution_id: z.string().optional().describe("Workflow execution ID (for bind_execution)"),
+            answers: z
+                .record(z.any())
+                .optional()
+                .describe("Answers object (for submit_answers)"),
+            params: z
+                .record(z.any())
+                .optional()
+                .describe("Override params (for launch_node)"),
+            scope: z
+                .string()
+                .optional()
+                .describe("Reset scope: branch | downstream | all (default branch)"),
+            context: z
+                .record(z.any())
+                .optional()
+                .describe("Resume context object (for resume_node)"),
+            input_payload: z.any().optional().describe("Node input payload"),
+            output_summary: z.string().optional().describe("Node output summary"),
+            resume_execution_id: z.string().optional().describe("Resume execution ID"),
+            metadata: z.record(z.any()).optional().describe("Node metadata"),
+            capability: z.string().optional().describe("Capability scope (for recommended_action)"),
+        }),
+    }, async (params) => daemonCall("/gc/onboarding", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Capability State
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_capability", {
+        description: `Reflected capability-state snapshot (features-light-up). Returns the current capability snapshot the front-end uses to decide which features are available.`,
+        inputSchema: z.object({
+            action: z.literal("state").describe("Action to perform"),
+        }),
+    }, async (params) => daemonCall("/gc/capability", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Beat Accumulation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_beat", {
+        description: `Beat accumulation: ingest turns, check status, flush buffers, report durability.
+Actions: ingest, status, flush, report.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["ingest", "status", "flush", "report"])
+                .describe("Action to perform"),
+            session_id: z.string().optional().describe("Session ID"),
+            role: z.string().optional().describe("Turn role (for ingest)"),
+            text: z.string().optional().describe("Turn text (for ingest)"),
+            tool_calls: z
+                .array(z.any())
+                .optional()
+                .describe("Tool calls in this turn (for ingest)"),
+            files_read: z
+                .array(z.string())
+                .optional()
+                .describe("Files read (for ingest)"),
+            files_modified: z
+                .array(z.string())
+                .optional()
+                .describe("Files modified (for ingest)"),
+            agent: z.string().optional().describe("Agent name (for ingest)"),
+            hostname: z.string().optional().describe("Hostname (for ingest)"),
+            cwd: z.string().optional().describe("Working directory (for ingest)"),
+            bank: z.string().optional().describe("Bank filter (for report)"),
+        }),
+    }, async (params) => daemonCall("/gc/beat", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Cost Guard
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_cost", {
+        description: `Provider cost ceilings and circuit-breaker (Story 3.3, AD-26).
+Actions: set_ceiling, get_ceilings, status, spend, check, reset, estimate.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "set_ceiling",
+                "get_ceilings",
+                "status",
+                "spend",
+                "check",
+                "reset",
+                "estimate",
+            ])
+                .describe("Action to perform"),
+            scope: z
+                .enum(["run", "tree"])
+                .optional()
+                .describe("Cost scope (run or tree)"),
+            scope_id: z.string().optional().describe("Scope ID"),
+            ceiling_cents: zNumber().optional().describe("Ceiling in cents (for set_ceiling)"),
+            cents: zNumber().optional().describe("Spend amount in cents (for spend)"),
+            provider: z.string().optional().describe("Provider name (for spend)"),
+            action_name: z.string().optional().describe("Action name (for spend)"),
+            estimated_cents: zNumber().optional().describe("Estimated cents (for check)"),
+            provider_id: z.string().optional().describe("Provider ID (for estimate)"),
+            input_tokens: zNumber().optional().describe("Input tokens (for estimate)"),
+            output_tokens: zNumber().optional().describe("Output tokens (for estimate)"),
+        }),
+    }, async (params) => daemonCall("/gc/cost", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Trust Posture
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_posture", {
+        description: `Operator-tunable trust posture (Story 3.6, FR-6).
+Actions: get, set_global, set_tool_trust, clear_tool_trust.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["get", "set_global", "set_tool_trust", "clear_tool_trust"])
+                .describe("Action to perform"),
+            level: z
+                .enum(["cautious", "normal", "trusting"])
+                .optional()
+                .describe("Global posture level (for set_global)"),
+            tool: z.string().optional().describe("Tool name (for set_tool_trust/clear_tool_trust)"),
+            loosen_reasons: z
+                .array(z.string())
+                .optional()
+                .describe("Reasons to loosen for this tool (for set_tool_trust)"),
+        }),
+    }, async (params) => daemonCall("/gc/posture", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Orchestration Trees
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_orchestration", {
+        description: `Orchestration trees: create + seat-switch for agent hierarchies (Story 2.11, FR-21).
+Actions: plant, launch, seat, tree, node, list.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["plant", "launch", "seat", "tree", "node", "list"])
+                .describe("Action to perform"),
+            agent: z.string().optional().describe("Agent name (for plant)"),
+            tree_id: z.string().optional().describe("Tree ID (for plant/tree)"),
+            session_id: z.string().optional().describe("Session ID (for plant)"),
+            label: z.string().optional().describe("Label (for plant/launch)"),
+            parent_node_id: z.string().optional().describe("Parent node ID (for launch)"),
+            child_agent: z.string().optional().describe("Child agent name (for launch)"),
+            message: z.string().optional().describe("Dispatch message (for launch)"),
+            node_id: z.string().optional().describe("Node ID (for seat/node)"),
+        }),
+    }, async (params) => daemonCall("/gc/orchestration", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Local Model / Offline Operation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_local_model", {
+        description: `Local MLX model provisioning and offline operation status (Story 2.10, AD-34).
+Actions: provision, status, offline, connectivity.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["provision", "status", "offline", "connectivity"])
+                .describe("Action to perform"),
+            endpoint: z.string().optional().describe("Local model endpoint (for provision)"),
+            model: z.string().optional().describe("Model name (for provision)"),
+        }),
+    }, async (params) => daemonCall("/gc/local_model", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Deep Memory
+    // ════════════════════════════════════════════════════════════════
+    //
+    // The tool name, the /gc/hindsight route and the `hindsight` parameters on
+    // gc_recall/gc_retain are the contract and do not move. The backend behind
+    // them does: Hindsight today, Foresight expected to succeed it. Descriptions
+    // below name the capability rather than the implementation so they stay true
+    // across that swap.
+    registerTool("gc_hindsight", {
+        description: `Direct proxy to the deep-memory backend (Hindsight today; Foresight expected to succeed it).
+Actions: health, recall, reflect, retain.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["health", "recall", "reflect", "retain"])
+                .describe("Action to perform"),
+            query: z.string().optional().describe("Query string (for recall/reflect)"),
+            bank_id: z.string().optional().describe("Deep-memory bank ID (default: default)"),
+            bank: z.string().optional().describe("Alias for bank_id"),
+            limit: zNumber().optional().describe("Max results (for recall, default 10)"),
+            content: z.string().optional().describe("Content to retain (for retain)"),
+            metadata: z
+                .record(z.any())
+                .optional()
+                .describe("Metadata for retained content (for retain)"),
+        }),
+    }, async (params) => daemonCall("/gc/hindsight", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Telegram
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_telegram", {
+        description: `Telegram bot poller status. Returns whether the poller is running and connected.`,
+        inputSchema: z.object({
+            action: z.literal("status").describe("Action to perform"),
+        }),
+    }, async (params) => {
+        // GET endpoint; use gcGet for the simple status query.
+        try {
+            const result = await gcGet("/gc/telegram/status");
+            return text(JSON.stringify(result, null, 2));
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — AI Conversation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_conversation", {
+        description: `Interactive AI conversation sessions (backend-neutral).
+Actions:
+- spawn: create a new session (persona/agent_name is required, optional config; make_apex:true takes the Apex seat, otherwise the session never does)
+- turn: send a message and get the assistant response. Waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key: pass your own when you might retry (it survives a reconnect), or one is generated and reused for the same message on the same MCP connection until the earlier call's result was delivered. Retrying with the same key never runs the turn twice: a finished turn returns its stored response (replayed: true, tool calls included), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key)
+- submit_tool_results: provide results for pending tool calls
+- cut_in: an operator message into a session. mode "queue" (default): read before the agent's next model call. mode "interrupt": the running turn is stopped at once (what it did stays, marked cut; a running tool finishes and its result is recorded when it arrives, never re-run) and the message is sent now; the answer is the new turn's. mode "consult" is reserved (501)
+- stop: stop the running turn at once; recorded on the transcript as interrupted by the operator
+- effect_fence: the session's effect fence: none | in_progress | orphaned
+- release_effect_fence: operator recovery, release an orphaned fence (audited; refuses a running turn)
+- get/list/delete: inspect or close sessions
+- diagnostics: persona/path resolution diagnostics
+- apex_status: show the active apex session
+- activate_apex: bind a session as the apex`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "spawn",
+                "turn",
+                "submit_tool_results",
+                "cut_in",
+                "stop",
+                "effect_fence",
+                "release_effect_fence",
+                "get",
+                "list",
+                "delete",
+                "diagnostics",
+                "apex_status",
+                "activate_apex",
+            ])
+                .describe("Action to perform"),
+            persona: z.string().optional().describe("Persona/agent name (for spawn; one of persona/agent_name/agent is required, else the daemon returns 400 target_required)"),
+            agent_name: z.string().optional().describe("Alias for persona (for spawn)"),
+            agent: z.string().optional().describe("Alias for persona (for spawn)"),
+            config: z.record(z.any()).optional().describe("Session config object (for spawn)"),
+            make_apex: zBoolean()
+                .optional()
+                .describe("Take the Apex seat on spawn. Default false: a spawned session never displaces the seat unless this is true. The response's apex_active says whether it did."),
+            session_id: z.string().optional().describe("Session ID (for turn/get/delete/etc.)"),
+            id: z.string().optional().describe("Alias for session_id"),
+            message: z.string().optional().describe("User message (for turn/cut_in)"),
+            idempotency_key: z
+                .string()
+                .regex(/^[\x20-\x7E]{1,128}$/, "1-128 printable ASCII characters (space included)")
+                .optional()
+                .describe("turn: retry key, 1-128 printable ASCII characters (space included), unique per intended turn. The same key returns the stored turn instead of running it again; the message must be resent byte for byte. Generated when omitted."),
+            from: z.string().optional().describe("Cut-in sender label (for cut_in)"),
+            mode: z
+                .enum(["queue", "interrupt", "consult"])
+                .optional()
+                .describe("Cut-in mode (for cut_in): queue (default) | interrupt (stop the turn, send now) | consult (reserved, 501)"),
+            tool_results: z
+                .array(z.any())
+                .optional()
+                .describe("Tool results array (for submit_tool_results)"),
+            results: z
+                .array(z.any())
+                .optional()
+                .describe("Alias for tool_results"),
+        }),
+    }, async (params, extra) => {
+        const action = params.action;
+        const sessionId = params.session_id || params.id;
+        try {
+            if (action === "spawn") {
+                const result = await gcPost("/gc/conversation", params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "list" || action === "diagnostics" || action === "apex_status") {
+                const path = action === "list"
+                    ? "/gc/conversation"
+                    : action === "diagnostics"
+                        ? "/gc/conversation/diagnostics"
+                        : "/gc/conversation/apex";
+                const result = await gcGet(path);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "activate_apex") {
+                const result = await gcPost("/gc/conversation/apex", {
+                    session_id: sessionId,
+                    id: sessionId,
+                });
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "turn") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                // GC-7153: the same keyed turn as gc_agent_conversation (GC-7152).
+                return await keyedTurn(`/gc/conversation/${encodeURIComponent(sessionId)}/turn`, sessionId, params, extra);
+            }
+            if (action === "submit_tool_results" || action === "cut_in") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const path = action === "cut_in"
+                    ? `/gc/conversation/${encodeURIComponent(sessionId)}/cut_in`
+                    : `/gc/conversation/${encodeURIComponent(sessionId)}/tool_results`;
+                const result = await gcPost(path, params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "stop" || action === "release_effect_fence") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcPost(`/gc/conversation/${encodeURIComponent(sessionId)}/${action}`, {});
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "effect_fence") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcGet(`/gc/conversation/${encodeURIComponent(sessionId)}/effect_fence`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "get" || action === "delete") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const path = `/gc/conversation/${encodeURIComponent(sessionId)}`;
+                const result = action === "get" ? await gcGet(path) : await gcDelete(path);
+                return text(JSON.stringify(result, null, 2));
+            }
+            return err(`unsupported gc_conversation action: ${action}`);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Local Agent Conversation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_agent_conversation", {
+        description: `Chat-style sessions with local GC agents.
+Actions: spawn, turn, stop, get, list, delete.
+- stop: stop the session's running turn at once (same stop as gc_conversation stop)
+- turn: waits the daemon's 30-min turn budget plus a minute. Each turn carries an idempotency_key. Pass your own on any turn you might retry: it is the only key that survives everything, including your host cancelling the call. Without one, gc_mcp generates a key and reuses it when the same message is sent again to the same session, over the same MCP connection, before the earlier call's result was delivered. Reuse is bounded: gc_mcp forgets a generated key about half an hour after the last call on it ended (about an hour if a call on it never ends), and the daemon keeps the last 50 keys of a session. A generated key does not survive a reconnect: after your host reconnects or restarts (unless it resumes the same MCP session), a resend runs the turn again. Pass your own key for any turn you may retry across a reconnect. Retrying with the same key never runs the turn twice: a finished turn returns its stored reply (replayed: true), a running one answers turn_in_progress (wait, then repeat), a turn the operator stopped answers turn_interrupted (send it with a new key to run it again).`,
+        inputSchema: z.object({
+            action: z
+                .enum(["spawn", "turn", "stop", "get", "list", "delete"])
+                .describe("Action to perform"),
+            agent_name: z.string().optional().describe("Agent name (for spawn)"),
+            agent: z.string().optional().describe("Alias for agent_name (for spawn)"),
+            config: z.record(z.any()).optional().describe("Session config (for spawn)"),
+            session_id: z.string().optional().describe("Session ID"),
+            id: z.string().optional().describe("Alias for session_id"),
+            message: z.string().optional().describe("Message (for turn)"),
+            idempotency_key: z
+                .string()
+                .regex(/^[\x20-\x7E]{1,128}$/, "1-128 printable ASCII characters (space included)")
+                .optional()
+                .describe("turn: retry key, 1-128 printable ASCII characters (space included), unique per intended turn. The same key returns the stored turn instead of running it again; the message must be resent byte for byte. Generated when omitted."),
+        }),
+    }, async (params, extra) => {
+        const action = params.action;
+        const sessionId = params.session_id || params.id;
+        try {
+            if (action === "spawn") {
+                const result = await gcPost("/gc/agent_conversation", params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "list") {
+                const result = await gcGet("/gc/agent_conversation");
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "turn") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                return await keyedTurn(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/turn`, sessionId, params, extra);
+            }
+            if (action === "stop") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const result = await gcPost(`/gc/agent_conversation/${encodeURIComponent(sessionId)}/stop`, {});
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "get" || action === "delete") {
+                if (!sessionId)
+                    return err("session_id (or id) is required");
+                const path = `/gc/agent_conversation/${encodeURIComponent(sessionId)}`;
+                const result = action === "get" ? await gcGet(path) : await gcDelete(path);
+                return text(JSON.stringify(result, null, 2));
+            }
+            return err(`unsupported gc_agent_conversation action: ${action}`);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Aden Conversation
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_aden", {
+        description: `Aden conversation instances.
+Actions: spawn, turn, get, list, delete.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["spawn", "turn", "get", "list", "delete"])
+                .describe("Action to perform"),
+            business_name: z.string().optional().describe("Business name (for spawn)"),
+            pre_research: z.string().optional().describe("Pre-research context (for spawn)"),
+            persona: z.string().optional().describe("Persona (for spawn, default noah)"),
+            instance_id: z.string().optional().describe("Instance ID"),
+            id: z.string().optional().describe("Alias for instance_id"),
+            message: z.string().optional().describe("Message (for turn)"),
+        }),
+    }, async (params) => {
+        const action = params.action;
+        const instanceId = params.instance_id || params.id;
+        try {
+            if (action === "spawn") {
+                const result = await gcPost("/gc/aden", params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "list") {
+                const result = await gcGet("/gc/aden");
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "turn") {
+                if (!instanceId)
+                    return err("instance_id (or id) is required");
+                const result = await gcPost(`/gc/aden/${encodeURIComponent(instanceId)}/turn`, params);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "get" || action === "delete") {
+                if (!instanceId)
+                    return err("instance_id (or id) is required");
+                const path = `/gc/aden/${encodeURIComponent(instanceId)}`;
+                const result = action === "get" ? await gcGet(path) : await gcDelete(path);
+                return text(JSON.stringify(result, null, 2));
+            }
+            return err(`unsupported gc_aden action: ${action}`);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Observable Runs
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_run", {
+        description: `Observable run control and event history.
+Actions:
+- events: durable event log since a seq (non-SSE history read)
+- control: operator control (abort)
+- watch: SSE live tail (collects events until terminal or timeout)`,
+        inputSchema: z.object({
+            action: z.enum(["events", "control", "watch"]).describe("Action to perform"),
+            execution_id: z.string().describe("Run execution ID"),
+            id: z.string().optional().describe("Alias for execution_id"),
+            since: zNumber().optional().describe("Start seq (for events/watch, default 0)"),
+            control_action: z
+                .enum(["abort"])
+                .optional()
+                .describe("Control action (for control)"),
+            reason: z.string().optional().describe("Abort reason (for control)"),
+            timeout: zTimeout().optional().describe("Watch timeout (for watch)"),
+            heartbeat: zNumber().optional().describe("Watch heartbeat ms (for watch)"),
+        }),
+    }, async (params) => {
+        const action = params.action;
+        const executionId = params.execution_id || params.id;
+        if (!executionId)
+            return err("execution_id (or id) is required");
+        try {
+            if (action === "events") {
+                const since = params.since ?? 0;
+                const result = await gcGet(`/gc/run/${encodeURIComponent(executionId)}/events?since=${encodeURIComponent(since)}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "control") {
+                const result = await gcPost(`/gc/run/${encodeURIComponent(executionId)}/control`, {
+                    action: params.control_action || "abort",
+                    reason: params.reason,
+                });
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "watch") {
+                const timeoutMs = isNoDeadline(params.timeout)
+                    ? null
+                    : typeof params.timeout === "number"
+                        ? params.timeout * 1000
+                        : 30_000;
+                // The daemon's run watch takes `timeout` and `heartbeat` in ms and
+                // closes the stream itself at the deadline.
+                const query = [`since=${encodeURIComponent(params.since ?? 0)}`];
+                if (timeoutMs !== null)
+                    query.push(`timeout=${timeoutMs}`);
+                if (typeof params.heartbeat === "number")
+                    query.push(`heartbeat=${params.heartbeat}`);
+                const url = `${activeShared.gcBase}/gc/run/${encodeURIComponent(executionId)}/watch?${query.join("&")}`;
+                const resp = await activeShared.fetch(url, {
+                    signal: timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
+                });
+                if (!resp.ok) {
+                    const textBody = await resp.text().catch(() => "");
+                    throw new Error(`daemon run watch failed (${resp.status}): ${textBody}`);
+                }
+                const { events, terminal, timed_out } = await collectSseStream(resp);
+                const summary = terminal
+                    ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+                    : timed_out
+                        ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                        : `\nStream ended without terminal event (${events.length} events)`;
+                return text(JSON.stringify({
+                    execution_id: executionId,
+                    event_count: events.length,
+                    timed_out,
+                    terminal_event: terminal
+                        ? {
+                            event: terminal.event,
+                            data: terminal.data,
+                        }
+                        : null,
+                    events: events.map((e) => ({
+                        event: e.event,
+                        data: e.data,
+                    })),
+                }, null, 2) + summary);
+            }
+            return err(`unsupported gc_run action: ${action}`);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Approval Checkpoints
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_checkpoint", {
+        description: `Approval checkpoints (Story 3.5a).
+- get: fetch a held action's render payload + risk dot
+- resolve: approve or reject a checkpoint; edited_args supports edit-then-approve`,
+        inputSchema: z.object({
+            action: z.enum(["get", "resolve"]).describe("Action to perform"),
+            id: z.string().describe("Checkpoint ID"),
+            decision: z
+                .enum(["approve", "reject"])
+                .optional()
+                .describe("Decision (for resolve)"),
+            edited_args: z
+                .record(z.any())
+                .optional()
+                .describe("Edited args for edit-then-approve (for resolve)"),
+        }),
+    }, async (params) => {
+        const action = params.action;
+        const id = params.id;
+        if (!id)
+            return err("id is required");
+        try {
+            if (action === "get") {
+                const result = await gcGet(`/gc/checkpoint/${encodeURIComponent(id)}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (action === "resolve") {
+                if (!params.decision)
+                    return err("decision is required for resolve");
+                const result = await gcPost(`/gc/checkpoint/${encodeURIComponent(id)}/resolve`, {
+                    decision: params.decision,
+                    edited_args: params.edited_args,
+                });
+                return text(JSON.stringify(result, null, 2));
+            }
+            return err(`unsupported gc_checkpoint action: ${action}`);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Relay Ingress
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_relay", {
+        description: `Relay ingress for external peers. Sends a message to an existing agent session or creates a new one. Defaults to the daemon-owned ingress agent.`,
+        inputSchema: z.object({
+            message: z.string().describe("Message to relay"),
+            session_id: z
+                .string()
+                .optional()
+                .describe("Existing session ID (if omitted, a new session is spawned)"),
+            agent: z.string().optional().describe("Target agent name (default: the daemon's ingress agent)"),
+            config: z.record(z.any()).optional().describe("Session config (for new sessions)"),
+        }),
+    }, async (params) => daemonCall("/gc/relay", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Workflow Watch (SSE)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_workflow_watch", {
+        description: `Live SSE watch of a workflow execution. Collects status events until the execution settles, times out, or the client aborts. Use gc_workflow action=wait for a simpler polling alternative.`,
+        inputSchema: z.object({
+            execution_id: z.string().describe("Workflow execution ID"),
+            id: z.string().optional().describe("Alias for execution_id"),
+            since: zNumber().optional().describe("Start seq (default 0)"),
+            timeout: zTimeout().optional().describe("Max watch time in seconds"),
+            heartbeat: zNumber().optional().describe("Heartbeat interval ms"),
+        }),
+    }, async (params) => {
+        const executionId = params.execution_id || params.id;
+        if (!executionId)
+            return err("execution_id (or id) is required");
+        try {
+            const timeoutMs = isNoDeadline(params.timeout)
+                ? null
+                : typeof params.timeout === "number"
+                    ? params.timeout * 1000
+                    : 30_000;
+            const { events, terminal, timed_out } = await readWorkflowWatchStream(executionId, timeoutMs);
+            const summary = terminal
+                ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+                : timed_out
+                    ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                    : `\nStream ended without terminal event (${events.length} events)`;
+            return text(JSON.stringify({
+                execution_id: executionId,
+                event_count: events.length,
+                timed_out,
+                terminal_event: terminal
+                    ? {
+                        event: terminal.event,
+                        data: terminal.data,
+                    }
+                    : null,
+                events: events.map((e) => ({
+                    event: e.event,
+                    data: e.data,
+                })),
+            }, null, 2) + summary);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Capability Watch (SSE)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_capability_watch", {
+        description: `Live SSE watch of capability-state changes. Returns the initial snapshot plus any capability state changes until timeout.`,
+        inputSchema: z.object({
+            timeout: zTimeout().optional().describe("Max watch time in seconds"),
+            heartbeat: zNumber().optional().describe("Heartbeat interval ms"),
+        }),
+    }, async (params) => {
+        try {
+            const timeoutMs = isNoDeadline(params.timeout)
+                ? null
+                : typeof params.timeout === "number"
+                    ? params.timeout * 1000
+                    : 30_000;
+            // The daemon's capability watch takes `timeout` and `heartbeat` in ms
+            // and closes the stream itself at the deadline.
+            const query = [];
+            if (timeoutMs !== null)
+                query.push(`timeout=${timeoutMs}`);
+            if (typeof params.heartbeat === "number")
+                query.push(`heartbeat=${params.heartbeat}`);
+            const url = `${activeShared.gcBase}/gc/capability/watch${query.length ? `?${query.join("&")}` : ""}`;
+            const resp = await activeShared.fetch(url, {
+                signal: timeoutMs === null ? undefined : AbortSignal.timeout(timeoutMs + 5_000),
+            });
+            if (!resp.ok) {
+                const textBody = await resp.text().catch(() => "");
+                throw new Error(`daemon capability watch failed (${resp.status}): ${textBody}`);
+            }
+            const { events, terminal, timed_out } = await collectSseStream(resp);
+            const summary = terminal
+                ? `\nTerminal event: ${summarizeWatchEvent(terminal)}`
+                : timed_out
+                    ? `\nWatch timed out after ${timeoutMs}ms (${events.length} events collected)`
+                    : `\nStream ended without terminal event (${events.length} events)`;
+            return text(JSON.stringify({
+                event_count: events.length,
+                timed_out,
+                terminal_event: terminal
+                    ? {
+                        event: terminal.event,
+                        data: terminal.data,
+                    }
+                    : null,
+                events: events.map((e) => ({
+                    event: e.event,
+                    data: e.data,
+                })),
+            }, null, 2) + summary);
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Directives
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_directive", {
+        description: `Manage behavioral directives using the @always/@never/@stop/@pin/@until vocabulary.
+Directives are injected into agent context automatically. Scoped to specific agents or global (*).
+Actions: "add" — create, "remove" — hard delete by ID (confirm: true required for pinned), "deactivate" — soft disable (can reactivate later), "reactivate" — re-enable a deactivated directive, "list" — show active, "inject" — formatted for context injection.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["add", "remove", "deactivate", "reactivate", "list", "inject"])
+                .describe("Action to perform"),
+            content: z.string().optional().describe("Directive text (for add)"),
+            persistence: z
+                .string()
+                .optional()
+                .describe("Persistence level: always, pin, never, stop, remember, until"),
+            scope: z
+                .string()
+                .optional()
+                .describe("Agent scope: * for all, or agent name(s) comma-separated"),
+            id: z
+                .string()
+                .optional()
+                .describe("Directive ID (for remove/deactivate/reactivate)"),
+            confirm: zBoolean()
+                .optional()
+                .describe("Required for remove/deactivate of pinned directives"),
+            source: z.string().optional().describe("Where this directive came from"),
+            expires_at: z
+                .string()
+                .optional()
+                .describe("ISO date for @until directives"),
+            query: z
+                .string()
+                .optional()
+                .describe("Similarity query for inject (optional)"),
+        }),
+    }, async (params) => daemonCall("/gc/directive", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Skills
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_skill", {
+        description: `GC-native procedural skill registry.
+Use this when you want to know whether GC already has a reusable procedure for a task before inventing a new workflow or doing ad-hoc work.
+
+Key actions:
+- suggest: rank candidate skills for a task. Returns suggestions plus a recommended top match.
+- resolve: like suggest, but only sets resolved when one skill clearly dominates; use this when you need a safe yes/no pick.
+- list/show: inspect existing skills and their metadata.
+- create/update/deprecate: maintain the skill registry itself.
+- backfill_embeddings: compute vectors for skills that are missing them.
+
+Matching behavior:
+- task text is scored against aliases, skill name, slug, and intent tags
+- project-scoped skills are strongly preferred when project matches
+- mode can bias toward skills that explicitly support baseline or deep execution`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "list",
+                "show",
+                "create",
+                "update",
+                "suggest",
+                "resolve",
+                "deprecate",
+                "backfill_embeddings",
+            ])
+                .describe("Skill action to perform"),
+            task: z
+                .string()
+                .optional()
+                .describe("Task text to match against skills. Required for suggest and resolve."),
+            project: z
+                .string()
+                .optional()
+                .describe("Optional active project. Helps project-scoped skills outrank general fallbacks."),
+            mode: z
+                .enum(["baseline", "deep"])
+                .optional()
+                .describe("Optional execution depth hint used during ranking."),
+            slug: z
+                .string()
+                .optional()
+                .describe("Skill slug for show, update, and deprecate. If omitted on create, daemon derives it from name."),
+            name: z
+                .string()
+                .optional()
+                .describe("Human-readable skill name. Required for create."),
+            description: z
+                .string()
+                .optional()
+                .describe("What the skill does and when to use it."),
+            scope: z
+                .enum(["general", "project"])
+                .optional()
+                .describe("Explicit skill scope. If omitted, daemon infers project scope when project is present."),
+            status: z
+                .enum(["draft", "active", "deprecated"])
+                .optional()
+                .describe("Lifecycle status. Draft is the default on create."),
+            entry_workflow: z
+                .string()
+                .optional()
+                .describe("Canonical workflow entrypoint this skill should invoke when selected."),
+            workflow_entrypoint: z
+                .string()
+                .optional()
+                .describe("Backward-compatible alias for entry_workflow."),
+            aliases: z
+                .array(z.string())
+                .optional()
+                .describe("Exact phrases or shorthand that operators use for this skill."),
+            intent_tags: z
+                .array(z.string())
+                .optional()
+                .describe("Intent keywords used for softer matching during suggest/resolve."),
+            intents: z
+                .array(z.string())
+                .optional()
+                .describe("Backward-compatible alias for intent_tags."),
+            examples: z
+                .array(z.string())
+                .optional()
+                .describe("Positive natural-language task examples that should select this skill."),
+            counterexamples: z
+                .array(z.string())
+                .optional()
+                .describe("Natural-language tasks that must not select this skill."),
+            supports_baseline: zBoolean()
+                .optional()
+                .describe("Whether the skill supports baseline execution mode. Defaults to true."),
+            supports_deep: zBoolean()
+                .optional()
+                .describe("Whether the skill supports deep execution mode. Defaults to false."),
+            include_deprecated: zBoolean()
+                .optional()
+                .describe("For list: include deprecated skills instead of hiding them by default."),
+            limit: zNumber()
+                .optional()
+                .describe("For list/suggest: max rows to return. Suggest defaults to 5, list defaults to 20."),
+        }),
+    }, async (params) => daemonCall("/gc/skill", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Work (dependency DAG)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_work", {
+        description: `Work coordination: scoped issue queries, dependency-DAG analysis, reusable intents, measurements, projects, agents, assignments, and locks.
+
+Choose the narrow action that answers the question; do not read bee.db directly and do not fetch the whole backlog to filter it yourself.
+- Latest issue activity in one project: query {project, status:"all", order:"updated_at:desc", limit}; updated_at includes coordination/bookkeeping mutations.
+- A track/topic across projects, newest first: query {text, projects:[...], status:"all", order:"updated_at:desc", detail:"compact"}; compact retains project and timestamps without descriptions.
+- Duplicate/topic lookup ranked by relevance with snippets: search {q, project?, status?}.
+- Unblocked work: ready with project/assigned/labels/limit, or ask {intent:"what_next", agent?, project?, limit?}.
+- Blocking chain: critical_path {root? or project?, status?, dependency_types?, depth?}. Recursive neighborhood: traverse {id, direction, depth, dependency_types}.
+- Discover reusable capabilities before inventing policy: list_intents and list_measures.
+
+Read actions: query, count, list, search, ready, show, ask, ancestors (the parent chain of one issue, root first), list_intents, list_measures, projects, agents, critical_path, traverse, candidates, tree, rollup, who_blocks_whom, bottlenecks, agent_load, stale, focus.
+Write actions: create, update, done, cancel, comment, block, unblock, claim, release, register_intent, remove_intent, register_measure, measure, register_project, register_agent, assign, join_project, import_jsonl, backfill_projects.
+plan is a deprecated compatibility alias for critical_path; it is not the gc_plan scheduler.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "create",
+                "query",
+                "count",
+                "list",
+                "search",
+                "ready",
+                "show",
+                "ask",
+                "list_intents",
+                "register_intent",
+                "remove_intent",
+                "list_measures",
+                "register_measure",
+                "measure",
+                "projects",
+                "agents",
+                "register_project",
+                "register_agent",
+                "assign",
+                "join_project",
+                "update",
+                "done",
+                "cancel",
+                "block",
+                "unblock",
+                "claim",
+                "release",
+                "comment",
+                "ancestors",
+                "critical_path",
+                "plan",
+                "traverse",
+                "candidates",
+                "tree",
+                "rollup",
+                "who_blocks_whom",
+                "bottlenecks",
+                "agent_load",
+                "stale",
+                "focus",
+                "import_jsonl",
+                "backfill_projects",
+            ])
+                .describe("Work operation; see the tool description for task-to-action recipes."),
+            title: z.string().optional().describe("Issue title"),
+            description: z.string().optional().describe("Issue description (create/update). For register_project: the project description."),
+            priority: zNumber()
+                .optional()
+                .describe("Priority (higher = more important)"),
+            type: z
+                .string()
+                .optional()
+                .describe("Issue type: task, bug, epic, objective"),
+            project: z.string().optional().describe("Project name"),
+            projects: z
+                .array(z.string())
+                .optional()
+                .describe("For query/count/register_intent: match any of these project IDs."),
+            parent: z
+                .string()
+                .optional()
+                .describe("create/update: the parent issue ID to set. Flat list/query/count: a filter for that issue's direct children, an alias for under + depth:1 (not together with under; list mode:\"tree\" rejects it)."),
+            under: z
+                .string()
+                .optional()
+                .describe("For list/query/count/register_intent: only descendants of this issue over parent edges; the issue itself is excluded unless include_root. An unknown ID is an error, not an empty result."),
+            include_root: zBoolean()
+                .optional()
+                .describe("For list/query/count with under: also return the under issue itself (depth 0)."),
+            after: z
+                .string()
+                .optional()
+                .describe("For query: the `next` cursor from the previous page (keyset paging, stable while issues change; not with offset)."),
+            fold: zBoolean()
+                .optional()
+                .describe("For query: roll each returned issue's subtree up into it (requires depth)."),
+            keep_ancestors: zBoolean()
+                .optional()
+                .describe("For query: keep the ancestors of matching issues as context rows."),
+            has_children: zBoolean()
+                .optional()
+                .describe("For query/count: only issues that have (true) or lack (false) children."),
+            blocked: zBoolean()
+                .optional()
+                .describe("For query/count: only open issues gated (true) or not gated (false) by an unresolved blocks/waits_for/conditional_blocks edge."),
+            labels_any: z
+                .array(z.string())
+                .optional()
+                .describe("For query/count: match issues carrying any of these labels (labels matches all)."),
+            issue_types: z
+                .array(z.string())
+                .optional()
+                .describe("For query/count: match any of these issue types."),
+            priority_min: zNumber().optional().describe("For query/count: minimum priority, inclusive."),
+            priority_max: zNumber().optional().describe("For query/count: maximum priority, inclusive."),
+            labels: z.array(z.string()).optional().describe("Labels"),
+            id: z.string().optional().describe("Issue ID (number or full ID)"),
+            depends_on: z.string().optional().describe("Issue ID this depends on"),
+            agent: z.string().optional().describe("Agent name for claim/assign"),
+            assigned_to: z
+                .string()
+                .optional()
+                .describe("Explicit assignment filter/value; assigned remains a compatibility alias."),
+            actor: z.string().optional().describe("Actor recorded on create/comment operations."),
+            metadata: z
+                .record(z.any())
+                .optional()
+                .describe("Issue metadata for create/update. Artifact references use metadata.artifacts = [{path, role, ...}]; update replaces the metadata map, so preserve existing keys from show."),
+            note: z.string().optional().describe("Comment text or close reason"),
+            close_reason: z.string().optional().describe("Explicit close reason for update."),
+            text: z
+                .string()
+                .optional()
+                .describe("Title + description filter for query/count/register_intent. All non-punctuation tokens must match; q is also accepted."),
+            q: z
+                .string()
+                .optional()
+                .describe("Full-text query for action=search — matches issue title + description, ranked by relevance. Bypasses project_id tagging. Punctuation-only queries return an annotated empty result."),
+            status: z
+                .string()
+                .optional()
+                .describe("Filter by status: open, in_progress, closed, all. list defaults to open; search defaults to all statuses."),
+            assigned: z.string().optional().describe("Filter by assigned agent"),
+            ready: zBoolean()
+                .optional()
+                .describe("For query/count/register_intent: retain only dependency-ready issues."),
+            detail: z
+                .enum(["minimal", "compact", "standard", "full"])
+                .optional()
+                .describe("Projection for query/list/search/ready/show/tree/critical_path/traverse. minimal = exactly id/title/status/priority/labels/blocked_by and omits project/timestamps; compact adds coordination fields and timestamps but omits description; full returns the complete issue. Defaults to compact except show, which defaults to full for compatibility."),
+            intent: z
+                .string()
+                .optional()
+                .describe("For ask: core intent what_next or a registered intent name."),
+            name: z.string().optional().describe("Intent or measurement name."),
+            unit: z.string().optional().describe("Unit for register_measure."),
+            domain: z
+                .enum(["any", "non_negative"])
+                .optional()
+                .describe("Measurement value domain; defaults to any."),
+            measure: z.string().optional().describe("Registered measurement name."),
+            measurement: z
+                .record(z.any())
+                .optional()
+                .describe("Measurement payload attached during update."),
+            value: zNumber().optional().describe("Numeric value for action=measure."),
+            dims: z.record(z.any()).optional().describe("Dimensions for action=measure."),
+            source: z.string().optional().describe("Source attribution for action=measure."),
+            root: z
+                .string()
+                .optional()
+                .describe("Goal/root issue for a rooted critical path (path is blocker to goal)."),
+            direction: z
+                .enum(["blockers", "dependents"])
+                .optional()
+                .describe("Traversal direction; defaults to blockers."),
+            depth: zNumber()
+                .optional()
+                .describe("Maximum graph depth (traverse defaults 3, max 10; critical_path max 100). For list/query/count: the deepest parent level returned, 0..10 (1 = direct children of under)."),
+            dependency_type: z
+                .enum([
+                "blocks",
+                "waits_for",
+                "conditional_blocks",
+                "related",
+                "discovered_from",
+                "replies_to",
+            ])
+                .optional()
+                .describe("Dependency type for block/unblock; defaults to blocks."),
+            dependency_types: z
+                .array(z.enum([
+                "blocks",
+                "waits_for",
+                "conditional_blocks",
+                "related",
+                "discovered_from",
+                "replies_to",
+            ]))
+                .optional()
+                .describe("Dependency types followed by traverse/critical_path."),
+            scope: z
+                .enum(["tree", "closure", "critical_path"])
+                .optional()
+                .describe("Graph scope for rollup."),
+            kind: z
+                .enum(["estimate", "actual"])
+                .optional()
+                .describe("Measurement aggregation kind for rollup."),
+            meaning: z
+                .enum(["spent", "to_complete"])
+                .optional()
+                .describe("Semantic interpretation for rollup."),
+            attributes: z
+                .record(z.any())
+                .optional()
+                .describe("Registration attributes. register_project accepts exactly: name, path, status, description, repo_url, domain, stack, canonical_path (strings) and metadata (object); register_agent accepts exactly: name, type, status, capabilities. Put these inside attributes (only description may also be given top-level); any other key is rejected with a validation error naming it."),
+            path: z.string().optional().describe("JSONL file path for import_jsonl."),
+            ttl: zNumber().optional().describe("Claim lock TTL in minutes."),
+            force: zBoolean().optional().describe("Force claim when supported."),
+            days: zNumber()
+                .optional()
+                .describe("For action=stale/focus: stale threshold in days (default 7)"),
+            dry_run: zBoolean()
+                .optional()
+                .describe("For action=backfill_projects: when true, preview only (default true)"),
+            fallback_project: z
+                .string()
+                .optional()
+                .describe("For action=backfill_projects: fallback project id for issues that have none (default: the daemon's configured project)"),
+            limit: zNumber()
+                .int()
+                .positive()
+                .optional()
+                .describe("Max results. query defaults to 50 and caps at 500; list defaults to 50/caps at 500; search defaults to 10/caps at 50; ready/stale/focus/ask use it as their result or sample bound."),
+            offset: zNumber()
+                .optional()
+                .describe("Zero-based query/list page offset. In list tree mode this offsets roots, not descendants."),
+            order: z
+                .string()
+                .optional()
+                .describe("For query/list/register_intent: comma-separated created_at, updated_at, priority, or id terms with optional :asc/:desc. Example: updated_at:desc."),
+            mode: z
+                .enum(["flat", "tree"])
+                .optional()
+                .describe("For action=list: `flat` (default) pages individual issues; `tree` pages root issues while retaining each root's complete dependency subtree."),
+            tree: zBoolean()
+                .optional()
+                .describe("For action=list: legacy alias for `mode: tree` when true."),
+            include: z
+                .array(z.enum(["comments"]))
+                .optional()
+                .describe("For query/list/search/ready/show/tree: load comments in ascending created_at order."),
+        }),
+    }, async (params) => daemonCall("/gc/work", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Timeline
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_timeline", {
+        description: `Manage timeline events — deadlines, appointments, blocks, milestones. Links events to work issues and other entities.
+Actions: create_event, update_event, delete_event, get, link, unlink, query, today, upcoming_deadlines, slipped.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "create_event",
+                "update_event",
+                "delete_event",
+                "get",
+                "link",
+                "unlink",
+                "query",
+                "today",
+                "upcoming_deadlines",
+                "slipped",
+            ])
+                .describe("Action to perform"),
+            id: z
+                .union([zNumber(), z.string()])
+                .optional()
+                .describe("Event or link ID"),
+            title: z.string().optional().describe("Event title"),
+            type: z
+                .string()
+                .optional()
+                .describe("Event type: deadline, appointment, block, milestone"),
+            starts_at: z.string().optional().describe("Start time (ISO 8601)"),
+            ends_at: z.string().optional().describe("End time (ISO 8601)"),
+            all_day: zBoolean().optional().describe("All-day event"),
+            recurrence: z
+                .string()
+                .optional()
+                .describe("Recurrence: daily, weekly, monthly, yearly"),
+            labels: z.array(z.string()).optional().describe("Labels"),
+            notes: z.string().optional().describe("Notes"),
+            event_id: zNumber().optional().describe("Event ID (for linking)"),
+            linkable_type: z
+                .string()
+                .optional()
+                .describe("Link target type: bee_issue, reminder, external"),
+            linkable_id: z.string().optional().describe("Link target ID"),
+            role: z
+                .string()
+                .optional()
+                .describe("Link role: deadline_for, blocks, related"),
+            from: z.string().optional().describe("Query range start (ISO)"),
+            to: z.string().optional().describe("Query range end (ISO)"),
+            hours: zNumber()
+                .optional()
+                .describe("Deadline lookahead hours (default 48)"),
+            limit: zNumber().optional().describe("Max results"),
+        }),
+    }, async (params) => daemonCall("/gc/timeline", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Time Registry
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_time", {
+        description: `Track actual time spent on work. Timers, manual logging, agent job capture, duration models.
+Actions: start_timer, stop_timer, log, log_agent_job, delete, running, query, aggregate, capacity, duration_estimate.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "start_timer",
+                "stop_timer",
+                "log",
+                "log_agent_job",
+                "delete",
+                "running",
+                "query",
+                "aggregate",
+                "capacity",
+                "duration_estimate",
+            ])
+                .describe("Action to perform"),
+            resource: z
+                .string()
+                .optional()
+                .describe("Resource name: e.g. host:heavy, ops, or a team name"),
+            id: zNumber().optional().describe("Time entry ID"),
+            bee_issue_id: z.string().optional().describe("Work issue ID to link to"),
+            event_id: zNumber().optional().describe("Timeline event ID to link to"),
+            started_at: z.string().optional().describe("Start time (ISO 8601)"),
+            ended_at: z.string().optional().describe("End time (ISO 8601)"),
+            duration_minutes: zNumber()
+                .optional()
+                .describe("Explicit duration in minutes"),
+            labels: z
+                .array(z.string())
+                .optional()
+                .describe("Labels for categorization"),
+            notes: z.string().optional().describe("Notes about the work"),
+            source: z.string().optional().describe("Source: manual, agent, auto"),
+            from: z.string().optional().describe("Query range start (ISO)"),
+            to: z.string().optional().describe("Query range end (ISO)"),
+            dimension: z
+                .string()
+                .optional()
+                .describe("Aggregation dimension: resource, bee_issue_id, source"),
+            limit: zNumber().optional().describe("Max results"),
+            agent: z.string().optional().describe("Agent name (for log_agent_job)"),
+            issue: z.string().optional().describe("Issue ID (for log_agent_job)"),
+            task: z
+                .string()
+                .optional()
+                .describe("Task description (for log_agent_job)"),
+        }),
+    }, async (params) => daemonCall("/gc/time", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Engagement / Timesheets
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_engagement", {
+        description: `Reconstruct engaged-attention hours from Timing presence plus project-touch events across Claude Code, pi, Codex, and other agent tools.
+Screen-first by default. File output only when target=file|both.
+Actions: compute, per_day, audit, sensitivity, projects, timesheet_export.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "compute",
+                "per_day",
+                "audit",
+                "sensitivity",
+                "projects",
+                "timesheet_export",
+            ])
+                .describe("Action to perform"),
+            from: z
+                .string()
+                .optional()
+                .describe("Period start (ISO date or datetime)"),
+            to: z.string().optional().describe("Period end (ISO date or datetime)"),
+            project: z
+                .string()
+                .optional()
+                .describe("Single project id or display name"),
+            projects: z
+                .array(z.string())
+                .optional()
+                .describe("Project ids or display names"),
+            bin_minutes: zNumber()
+                .optional()
+                .describe("Bin width in minutes (default 5)"),
+            tolerance_minutes: zNumber()
+                .optional()
+                .describe("Burst tolerance in minutes (default 10)"),
+            target: z
+                .enum(["screen", "file", "both"])
+                .optional()
+                .describe("screen (default), file, both"),
+            out_path: z
+                .string()
+                .optional()
+                .describe("Exact file destination for single-project exports"),
+            out_dir: z
+                .string()
+                .optional()
+                .describe("Directory destination for generated files"),
+            filename: z
+                .string()
+                .optional()
+                .describe("Explicit filename for single-project exports"),
+            filename_prefix: z
+                .string()
+                .optional()
+                .describe("Filename prefix for generated files"),
+            audit_filename: z
+                .string()
+                .optional()
+                .describe("Explicit audit filename when include_audit=true"),
+            include_audit: zBoolean()
+                .optional()
+                .describe("Also export audit CSVs in timesheet_export"),
+            k_values: z
+                .array(zNumber())
+                .optional()
+                .describe("Tolerance values for sensitivity"),
+        }),
+    }, async (params) => daemonCall("/gc/engagement", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Sessions
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_sessions", {
+        description: `Session ingestion ops — scanner status, attribution repair, manual scans, and knowledge backlog control.
+Actions: status, scan, pending_knowledge, enqueue_pending_knowledge, backfill_project_ids, backfill_attributions, enqueue_attribution_backfill, review_attributions, next_review_item, apply_review_decision, work_item_summary, process_session_file.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "status",
+                "scan",
+                "pending_knowledge",
+                "enqueue_pending_knowledge",
+                "backfill_project_ids",
+                "backfill_attributions",
+                "enqueue_attribution_backfill",
+                "review_attributions",
+                "next_review_item",
+                "apply_review_decision",
+                "work_item_summary",
+                "process_session_file",
+            ])
+                .describe("Action to perform"),
+            session_file_id: zNumber()
+                .optional()
+                .describe("Session file id for process_session_file"),
+            limit: zNumber().optional().describe("Max results / enqueue batch size"),
+            agent: z
+                .string()
+                .optional()
+                .describe("Optional agent filter for attribution backfill"),
+            from: z
+                .string()
+                .optional()
+                .describe("Optional ISO date/datetime lower bound"),
+            to: z
+                .string()
+                .optional()
+                .describe("Optional ISO date/datetime upper bound"),
+            provider: z
+                .string()
+                .optional()
+                .describe("Optional provider filter for attribution review"),
+            review_id: zNumber()
+                .optional()
+                .describe("Review row id for apply_review_decision"),
+            decision: z
+                .enum(["accept", "reject", "skip"])
+                .optional()
+                .describe("Review decision for apply_review_decision"),
+            project_id: z
+                .string()
+                .optional()
+                .describe("Project id for apply_review_decision"),
+            note: z
+                .string()
+                .optional()
+                .describe("Optional note for apply_review_decision"),
+            worker_limit: zNumber()
+                .optional()
+                .describe("Optional worker limit for batch attribution enqueue"),
+        }),
+    }, async (params) => daemonCall("/gc/sessions", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Cash Flow
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_cash", {
+        description: `Track money in/out. Runway, forecasts, drift detection.
+Actions: add, update, delete, get, query, runway, monthly, forecast, drift.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "add",
+                "update",
+                "delete",
+                "get",
+                "query",
+                "runway",
+                "monthly",
+                "forecast",
+                "drift",
+            ])
+                .describe("Action to perform"),
+            id: zNumber().optional().describe("Entry ID"),
+            title: z.string().optional().describe("Entry title"),
+            type: z.string().optional().describe("income or expense"),
+            category: z
+                .string()
+                .optional()
+                .describe("Category: client_work, retainer, infrastructure, subscriptions, etc."),
+            amount: zNumber()
+                .optional()
+                .describe("Amount in cents (1250 = €12.50) or euros as float (12.50)"),
+            date: z.string().optional().describe("Date (ISO: 2026-03-07)"),
+            currency: z.string().optional().describe("Currency code (default EUR)"),
+            status: z
+                .string()
+                .optional()
+                .describe("expected, confirmed, received, or paid"),
+            recurrence: z.string().optional().describe("monthly, quarterly, yearly"),
+            confidence: zNumber()
+                .optional()
+                .describe("0.0-1.0 confidence for expected entries"),
+            source_type: z.string().optional().describe("project, client, bee_issue"),
+            source_id: z.string().optional().describe("Source entity ID"),
+            notes: z.string().optional().describe("Notes"),
+            labels: z.array(z.string()).optional().describe("Labels"),
+            from: z.string().optional().describe("Query range start (ISO date)"),
+            to: z.string().optional().describe("Query range end (ISO date)"),
+            cash_on_hand: zNumber()
+                .optional()
+                .describe("Current cash in euros (for runway)"),
+            months: zNumber().optional().describe("Lookback or lookahead months"),
+            limit: zNumber().optional().describe("Max results"),
+        }),
+    }, async (params) => daemonCall("/gc/cash", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Leases
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_lease", {
+        description: `Leases on shared resources: counted host:heavy slots (full test suites, test DBs; default 2) and exclusive landing:<repo> (Gate → merge → deploy). FIFO waiting; liveness by heartbeat + TTL (a lapsed lease expires and the next waiter is admitted).
+Actions: acquire (returns state held | waiting+position | busy; poll by passing lease_id back), heartbeat, release (idempotent), list, show, run.
+run: the daemon runs a heavy command for you under a lease (default resource host:heavy): {command, cwd, issue}. The command is a plain argv (no shell: no pipes, &&, ;, redirects, quotes, globs or VAR=x) and must start with a permitted prefix (daemon config :lease_run_commands; default: mix test, mix ecto.create|migrate|reset, npm test, npm run test, pnpm test, yarn test, cargo test, pytest); anything else is refused. The allowlist constrains the executable prefix only (e.g. 'mix test <path>' or 'pytest <dir>' run the code they point at). It runs contained: writes are limited to the cwd tree plus a private scratch dir, and the call is refused if the daemon cannot contain it. The network is loopback-only (other destinations are denied; loopback ports and unix sockets stay open except container-runtime sockets, so a local service there can relay what the child sends it) and the child gets an allowlisted environment (no credentials). Children can still read files under the home directory except the containment credential deny list. It answers at once with {job_id, status: running} or {job_id, status: queued, position, resource} and starts by itself when a slot frees. Read the result with gc_dispatch action:status / output job_id=… , or pass wait:true to block until it ends (output tail returned). If a wait:true call errors with a timeout or transport error, the job is still running in the daemon: poll gc_dispatch status with its job_id (a transport may cut a call off after about 5 minutes). resource may be another host: capacity kind, never host:agent or landing:*. cwd must be an absolute directory path. Use this for full test suites, test-DB setup and landings; it needs no hook or install in your harness. The output is readable while the job runs (gc_dispatch action:output job_id=… answers partial: true until it ends), an abort or a timeout keeps what was written, and gc_dispatch action:cancel job_id=… stops it. KNOWN LIMIT: about 50 tests of the daemon suite fail inside a contained run (they signal or probe processes outside the sandbox, write /tmp, or need services the profile denies), so a FULL daemon suite still goes through the separate lease CLI until those tests are made containment-aware.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["acquire", "heartbeat", "release", "list", "show", "run"])
+                .describe("Action to perform"),
+            resource: z
+                .string()
+                .optional()
+                .describe("Resource, e.g. host:heavy or landing:my-project (acquire; optional filter for list)"),
+            holder: z
+                .string()
+                .optional()
+                .describe("Holder label: session/job/agent (acquire)"),
+            issue: z.string().optional().describe("Issue ID"),
+            cwd: z.string().optional().describe("Working directory of the holder"),
+            pid: zNumber().optional().describe("Holder pid, if any"),
+            ttl_s: zNumber()
+                .optional()
+                .describe("Liveness window in seconds, 5-3600 (default 90); heartbeat within it"),
+            wait: zBoolean()
+                .optional()
+                .describe("acquire: queue when no slot is free (default true); false returns state busy"),
+            lease_id: z
+                .string()
+                .optional()
+                .describe("Lease token (heartbeat/release/show; acquire to poll a queued request)"),
+            history: zBoolean().optional().describe("list: include recently ended leases"),
+            limit: zNumber().optional().describe("list: max history rows"),
+            command: z
+                .string()
+                .optional()
+                .describe("run: argv command, plain words only, no shell syntax; must start with a daemon-allowlisted prefix such as `mix test`"),
+            timeout_ms: zNumber()
+                .optional()
+                .describe("run: kill the command after this many ms (default: none, no kill deadline; an explicit value is honoured)"),
+        }),
+    }, 
+    // run + wait:true holds the request until the command ends, so no client-side timeout.
+    async (params) => daemonCall("/gc/lease", params, params.action === "run" && params.wait ? null : 15_000));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Publishing
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_publishing", {
+        description: `Content dissemination metrics. Track pieces, platform posts, and performance over time.
+Actions: create (piece), post (distribution), snapshot (manual metrics), ingest (parse platform export), list, report, compare, trend, funnel.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "create",
+                "post",
+                "snapshot",
+                "ingest",
+                "list",
+                "report",
+                "compare",
+                "trend",
+                "funnel",
+            ])
+                .describe("Action to perform"),
+            // create piece
+            id: z.string().optional().describe("Piece slug ID (for create)"),
+            title: z.string().optional().describe("Piece title"),
+            url: z.string().optional().describe("Canonical URL"),
+            brand: z.string().optional().describe("Brand identifier"),
+            category: z
+                .string()
+                .optional()
+                .describe("Category: essay, video, thread, post"),
+            published_at: z.string().optional().describe("Publish date (ISO)"),
+            tags: z.array(z.string()).optional().describe("Tags"),
+            // post (distribution)
+            piece_id: z.string().optional().describe("Piece ID to link to"),
+            platform: z
+                .string()
+                .optional()
+                .describe("Platform: linkedin, medium, x, youtube, hackernews, tiktok, instagram, substack"),
+            platform_id: z
+                .string()
+                .optional()
+                .describe("Platform-specific post ID/URN"),
+            round: zNumber().optional().describe("Distribution round (1, 2, 3)"),
+            angle: z
+                .string()
+                .optional()
+                .describe("Content angle: behaviour_hook, research_evidence, philosophical, general"),
+            posted_at: z.string().optional().describe("Post date (ISO datetime)"),
+            // metrics
+            post_id: zNumber()
+                .optional()
+                .describe("Post ID (for snapshot, ingest, trend)"),
+            snapshot_at: z.string().optional().describe("Snapshot date (ISO)"),
+            impressions: zNumber().optional().describe("Impressions count"),
+            reach: zNumber().optional().describe("Members reached"),
+            link_clicks: zNumber().optional().describe("Link clicks"),
+            reactions: zNumber().optional().describe("Reactions count"),
+            comments: zNumber().optional().describe("Comments count"),
+            reposts: zNumber().optional().describe("Reposts count"),
+            saves: zNumber().optional().describe("Saves count"),
+            profile_views: zNumber().optional().describe("Profile views from post"),
+            followers_gained: zNumber().optional().describe("Followers gained"),
+            demographics: z.string().optional().describe("Demographics JSON"),
+            // ingest
+            file: z.string().optional().describe("File path for ingest"),
+            snapshot_date: z
+                .string()
+                .optional()
+                .describe("Override snapshot date for ingest (ISO)"),
+            force: zBoolean()
+                .optional()
+                .describe("Force ingest even if duplicate snapshot exists"),
+            // list/compare
+            type: z.string().optional().describe("List type: pieces or posts"),
+            dimension: z
+                .string()
+                .optional()
+                .describe("Compare dimension: round, angle, platform, piece"),
+            limit: zNumber().optional().describe("Max results"),
+        }),
+    }, async (params) => daemonCall("/gc/publishing", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Runtime Records
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_records", {
+        description: `Runtime record definitions and instances.
+Actions: types, get_type, define_type, install_starter_types, create, get, list, update, delete, transition.
+install_starter_types defines the shipped contact and company types; it skips any handle that already exists.
+Use definition for define_type and data for create/update.
+Use params for Records query filters, sort, temporal constraints, and pagination.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "types",
+                "get_type",
+                "define_type",
+                "install_starter_types",
+                "create",
+                "get",
+                "list",
+                "update",
+                "delete",
+                "transition",
+            ])
+                .describe("Action to perform"),
+            handle: z.string().optional().describe("Record type handle for get_type"),
+            type: z.string().optional().describe("Record type handle for create or list"),
+            definition: z.record(z.any()).optional().describe("Record type definition for define_type"),
+            data: z.record(z.any()).optional().describe("Record data for create or update"),
+            pub_id: z.string().optional().describe("Public record ID for get, update, delete, or transition"),
+            event: z.string().optional().describe("Lifecycle event for transition"),
+            params: z.record(z.any()).optional().describe("List filters, sort, temporal constraints, and pagination"),
+        }),
+    }, async (params) => daemonCall("/gc/records", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Planner
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_plan", {
+        description: `Resource-constrained scheduler. "What should I work on next?"
+Actions: next, replan, profile, switch_profile, list_profiles, upsert_profile, resources, upsert_resource, capacity, conflicts, simulate, simulate_single, scenarios, solve, solve_and_validate.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "next",
+                "replan",
+                "profile",
+                "switch_profile",
+                "list_profiles",
+                "upsert_profile",
+                "resources",
+                "upsert_resource",
+                "capacity",
+                "conflicts",
+                "simulate",
+                "simulate_single",
+                "scenarios",
+                "solve",
+                "solve_and_validate",
+            ])
+                .describe("Action to perform"),
+            resource: z
+                .string()
+                .optional()
+                .describe("Resource name (optional; daemon default applies)"),
+            name: z.string().optional().describe("Profile or resource name"),
+            description: z.string().optional().describe("Profile description"),
+            weights: z
+                .any()
+                .optional()
+                .describe("Weight vector: {label: weight, ...}"),
+            active: zBoolean().optional().describe("Set as active profile"),
+            type: z.string().optional().describe("Resource type: human or agent"),
+            capacity_hours_day: zNumber().optional().describe("Hours per day"),
+            capacity_hours_week: zNumber().optional().describe("Hours per week"),
+            availability: z
+                .string()
+                .optional()
+                .describe("weekdays, always, or custom"),
+            labels: z.array(z.string()).optional().describe("Labels"),
+            scenario: z
+                .string()
+                .optional()
+                .describe("Named scenario: current, stress, optimistic, revenue_mode, six_month"),
+            n: zNumber()
+                .optional()
+                .describe("Number of Monte Carlo runs (default: 100)"),
+            horizon_days: zNumber().optional().describe("Simulation horizon in days"),
+            cash_balance: zNumber()
+                .optional()
+                .describe("Override starting cash balance (euros)"),
+            inject_disruptions: zBoolean()
+                .optional()
+                .describe("Inject random disruptions"),
+            base_seed: zNumber()
+                .optional()
+                .describe("Base seed for reproducible Monte Carlo"),
+            seed: zNumber().optional().describe("Random seed for single simulation"),
+            time_limit_ms: zNumber()
+                .optional()
+                .describe("Solver time limit in ms (default: 10000)"),
+        }),
+    }, async (params) => daemonCall("/gc/plan", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Convergence
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_convergence", {
+        description: `Strategic vector tracking — the Fosferon evaluation model.
+Actions: report, vectors, get_vector, create_vector, update_vector, link, unlink, vectors_for, score, leverage, set_leverage, backfill,
+vitality, snapshot, snapshots, events, log_event, record_outcome, outcomes, correlation,
+invest, update_investment, investments, causal_chain, project, projections, expected_value, resolve_projection, accuracy_trend, retrofit, roi, horizon_score.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "report",
+                "vectors",
+                "get_vector",
+                "create_vector",
+                "update_vector",
+                "link",
+                "unlink",
+                "vectors_for",
+                "score",
+                "leverage",
+                "set_leverage",
+                "backfill",
+                "vitality",
+                "snapshot",
+                "snapshots",
+                "events",
+                "log_event",
+                "record_outcome",
+                "outcomes",
+                "correlation",
+                "invest",
+                "update_investment",
+                "investments",
+                "causal_chain",
+                "project",
+                "projections",
+                "expected_value",
+                "resolve_projection",
+                "accuracy_trend",
+                "retrofit",
+                "roi",
+                "horizon_score",
+            ])
+                .describe("Action to perform"),
+            handle: z
+                .string()
+                .optional()
+                .describe("Vector handle (e.g. revenue:my-project)"),
+            vector: z.string().optional().describe("Vector handle for linking"),
+            name: z.string().optional().describe("Vector name"),
+            category: z
+                .string()
+                .optional()
+                .describe("revenue|authority|academic|infrastructure|product|network"),
+            domain: z
+                .string()
+                .optional()
+                .describe("Domain: e.g. my-project, ops, gc"),
+            status: z.string().optional().describe("active|dormant|emerged"),
+            notes: z.string().optional().describe("Notes"),
+            type: z
+                .string()
+                .optional()
+                .describe("Linkable type: bee_issue, cash_entry, time_entry, event, commit, content"),
+            id: z.string().optional().describe("Linkable ID or link ID (for unlink)"),
+            linkable_type: z.string().optional().describe("For set_leverage"),
+            linkable_id: z.string().optional().describe("For set_leverage"),
+            coefficient: zNumber()
+                .optional()
+                .describe("Leverage coefficient (>1 = amplifier)"),
+            evidence: z.string().optional().describe("Why this leverage coefficient"),
+            window: zNumber()
+                .optional()
+                .describe("Window in days for report (default 30)"),
+            days: zNumber()
+                .optional()
+                .describe("Backfill period in days (default 90)"),
+            // Investment tracking
+            investment_id: z
+                .string()
+                .optional()
+                .describe("Investment ID (for causal_chain)"),
+            amount: zNumber().optional().describe("Investment amount"),
+            // Projection
+            projection_id: z
+                .string()
+                .optional()
+                .describe("Projection ID (for expected_value, resolve_projection)"),
+            actual: zNumber()
+                .optional()
+                .describe("Actual outcome value (for resolve_projection)"),
+            // Snapshot
+            label: z.string().optional().describe("Snapshot label"),
+            // Events
+            event_type: z.string().optional().describe("Convergence event type"),
+            limit: zNumber().optional().describe("Max results"),
+        }),
+    }, async (params) => daemonCall("/gc/convergence", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Dispatch (on-demand agent execution)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_project_registry", {
+        description: `Canonical project registry for Grand Central.
+Actions:
+  - list: list all registered projects
+  - get: fetch one project by id
+  - upsert: create or update one project (supports partial payloads; metadata is merged)
+  - sync: sync projects from ~/.config/gc/registry.toml into the registry DB
+  - repos: list registered git repos
+
+Use this as the source of truth for project metadata such as repo paths, canonical docs,
+related projects, and strategy-sync metadata. Prefer this over maintaining sidecar maps.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["list", "get", "upsert", "sync", "repos"])
+                .describe("Project registry action"),
+            id: z
+                .string()
+                .optional()
+                .describe("Project id for action=get or action=upsert"),
+            name: z
+                .string()
+                .optional()
+                .describe("Human-readable project name for action=upsert"),
+            path: z
+                .string()
+                .optional()
+                .describe("Primary repo/worktree path for action=upsert"),
+            canonical_path: z
+                .string()
+                .optional()
+                .describe("Canonical path when path is a worktree or alias"),
+            description: z.string().optional().describe("Project description"),
+            stack: z.string().optional().describe("Tech stack summary"),
+            domain: z.string().optional().describe("Primary domain"),
+            repo_url: z.string().optional().describe("Repo remote URL"),
+            branch: z.string().optional().describe("Default or canonical branch"),
+            binary_path: z.string().optional().describe("Binary path, if applicable"),
+            launchd_service: z
+                .string()
+                .optional()
+                .describe("launchd service name, if applicable"),
+            data_dir: z
+                .string()
+                .optional()
+                .describe("Primary data directory, if applicable"),
+            notes: z.string().optional().describe("Operator notes"),
+            status: z.string().optional().describe("Project status"),
+            ports: z.record(z.unknown()).optional().describe("Named ports map"),
+            domains: z.array(z.string()).optional().describe("Associated domains"),
+            tags: z.array(z.string()).optional().describe("Project tags"),
+            commands: z.array(z.string()).optional().describe("Useful commands"),
+            key_files: z.array(z.string()).optional().describe("Key file paths"),
+            related_projects: z
+                .array(z.string())
+                .optional()
+                .describe("Related project ids"),
+            metadata: z
+                .record(z.unknown())
+                .optional()
+                .describe("Additional metadata; merged into existing metadata_json"),
+            source: z.string().optional().describe("Source tag for upsert"),
+            last_synced_at: z.string().optional().describe("ISO timestamp override"),
+        }),
+    }, async (params) => daemonCall("/gc/project_registry", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Dispatch (on-demand agent execution)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_peer_conversation", {
+        description: `Persistent chat-style sessions with external A2A peers. Use this for dialogue, clarification, synthesis, and back-and-forth coordination. Do NOT use gc_dispatch for conversational turns; gc_dispatch is for job assignments.
+
+Actions:
+  - create: open a new peer conversation session and bind it to a registered A2A peer
+  - turn: send one user message into an existing session and get the peer's reply
+  - get: fetch the full current state of one session, including transcript and remote threading metadata
+  - list: list all peer conversation sessions
+  - delete: destroy one peer conversation session
+
+Important semantics:
+  - Sessions are persistent and conversation-oriented, not job-oriented.
+  - Turns create no dispatch jobs and no dispatch audit rows.
+  - The daemon preserves transcript locally and reuses remote A2A context/threading under the hood.
+  - peer_agent must be the name of a registered A2A peer (for example: "pluto").
+
+Typical flow:
+  1. action="create", peer_agent="pluto"
+  2. action="turn", session_id="<returned id>", message="..."
+  3. action="get" or action="list" to inspect session state later`,
+        inputSchema: z.object({
+            action: z
+                .enum(["create", "turn", "get", "list", "delete"])
+                .describe("Conversation action: create a session, send a turn, fetch one session, list sessions, or delete a session"),
+            peer_agent: z
+                .string()
+                .optional()
+                .describe('Registered A2A peer name for action="create" (for example: "pluto")'),
+            agent: z
+                .string()
+                .optional()
+                .describe('Alias for peer_agent on action="create". Prefer peer_agent for clarity.'),
+            config: z
+                .record(z.unknown())
+                .optional()
+                .describe("Optional session config stored with the conversation at creation time (e.g. purpose, project, strategy context)"),
+            session_id: z
+                .string()
+                .optional()
+                .describe("Existing peer conversation session ID, required for turn/get/delete"),
+            message: z
+                .string()
+                .optional()
+                .describe('User message to send into the peer session, required for action="turn"'),
+        }),
+    }, async (params) => {
+        try {
+            if (params.action === "create") {
+                const result = await gcPost("/gc/peer_conversation", clean({
+                    peer_agent: params.peer_agent ?? params.agent,
+                    config: params.config,
+                }));
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "turn") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="turn"');
+                const result = await gcPost(`/gc/peer_conversation/${sessionId}/turn`, clean({
+                    message: params.message,
+                }), 120_000);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "get") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="get"');
+                const result = await gcGet(`/gc/peer_conversation/${sessionId}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "delete") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="delete"');
+                const result = await gcDelete(`/gc/peer_conversation/${sessionId}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            const result = await gcGet("/gc/peer_conversation");
+            return text(JSON.stringify(result, null, 2));
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    registerTool("gc_peer", {
+        description: `Legacy alias for gc_peer_conversation.
+Actions: spawn, turn, get, list, destroy.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["spawn", "turn", "get", "list", "destroy"])
+                .describe("Legacy peer action"),
+            peer_agent: z
+                .string()
+                .optional()
+                .describe('Registered A2A peer name for action="spawn"'),
+            session_id: z
+                .string()
+                .optional()
+                .describe("Session ID for turn/get/destroy"),
+            message: z.string().optional().describe('User message for action="turn"'),
+            config: z
+                .record(z.unknown())
+                .optional()
+                .describe("Optional conversation config for spawn"),
+        }),
+    }, async (params) => {
+        try {
+            if (params.action === "spawn") {
+                const result = await gcPost("/gc/peer_conversation", clean({
+                    peer_agent: params.peer_agent,
+                    config: params.config,
+                }));
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "turn") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="turn"');
+                const result = await gcPost(`/gc/peer_conversation/${sessionId}/turn`, clean({
+                    message: params.message,
+                }), 120_000);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "get") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="get"');
+                const result = await gcGet(`/gc/peer_conversation/${sessionId}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            if (params.action === "destroy") {
+                const sessionId = params.session_id;
+                if (!sessionId)
+                    return err('ERROR: session_id is required for action="destroy"');
+                const result = await gcDelete(`/gc/peer_conversation/${sessionId}`);
+                return text(JSON.stringify(result, null, 2));
+            }
+            const result = await gcGet("/gc/peer_conversation");
+            return text(JSON.stringify(result, null, 2));
+        }
+        catch (e) {
+            return err(`ERROR: ${activeShared.describeError(e)}`);
+        }
+    });
+    registerTool("gc_project_status", {
+        description: `Legacy alias for gc_ticker/get. Returns the latest ecosystem status snapshot.`,
+        inputSchema: z.object({
+            name: z
+                .string()
+                .optional()
+                .describe("Optional project name or 'all' for overview"),
+        }),
+    }, async (params) => daemonCall("/gc/ticker", { action: "get", ...params }));
+    registerTool("gc_find", {
+        description: `Find documents by metadata — domain, type, project, or title.`,
+        inputSchema: z.object({
+            domain: z.string().optional().describe("Domain filter"),
+            type: z.string().optional().describe("Type filter"),
+            project: z.string().optional().describe("Project name filter"),
+            title: z.string().optional().describe("Title substring (LIKE search)"),
+            limit: zNumber()
+                .optional()
+                .describe("Max results (default 25)"),
+        }),
+    }, async (params) => daemonCall("/gc/tool_call", { name: "gc_find", arguments: params }));
+    registerTool("gc_dispatch", {
+        description: `On-demand agent dispatch. Spawn an agent with a task, inspect dispatchable targets, inspect provider/model availability, preview dispatch resolution, check job status, retrieve output.
+Actions: dispatch (spawn agent), list_agents (local markdown agents only), list_providers (show valid provider overrides and availability), list_models (show provider model inventories with authoritative vs hint provenance), resolve_dispatch (preview what provider/model/mode GC would use for one target), explain_route (read-only routing decision for one agent (agent is required): chosen provider/model, fallback, reason, candidates, and what the availability ledger skipped; the decision is the one a dispatch makes, and the candidate list probes every configured route), availability (the provider availability ledger: no argument lists it; clear:"<route>" forgets a route; set:"<route>" with retry_at enters a known reset time), list_targets (all dispatchable targets, optionally filtered by kind), status (check job), output (get result; page a long report with offset/limit in bytes), list (query jobs), dismiss (hide noisy job), cancel (stop a job and KEEP its record and the output written so far: a running job is aborted, a queued one leaves the queue; the same teardown as gc_run control abort), delete (remove one; force also stops a running job but removes the record), prune (bulk cleanup), repair_stale (reconcile ghost running jobs after crashes/redeploys).
+Default is fire-and-forget (returns job_id immediately). Set wait=true to block until done.
+
+Dispatch options: call_profile "worker" (default, a tool-using agent) or "completion" (one reply, no tools; refused for a route with no completion recipe, and also honoured by explain_route); idempotency_key (a repeated key with the same agent/task/profile returns the same job, a different one is a 409 idempotency_key_reused).
+
+Availability ledger: a route that refused at the door (usage limit, auth, containment denial) is remembered and skipped up front, with the declared fallback used and no attempt spent on the dead route; when retry_at passes the next real call probes it. action=availability lists the entries (state, reason, source, retry_at); clear:"provider" or "provider/model" forgets one; set:"provider[/model]" retry_at:"2026-11-10 13:57" (ISO 8601 with an offset, or in the machine's zone; must be in the future) state:quota|auth_failed|containment_denied|unhealthy reason:"..." records a reset time known from the provider's own page.
+
+Reading output: action=output returns the whole report by default, with total_bytes. A report longer than this tool's 16k-character response cap must be paged: offset/limit are BYTES of the UTF-8 report (a page never splits a character, and is never empty). Each page carries total_bytes, offset, returned_bytes, truncated and next_offset (null on the last page); pass next_offset back as offset. A limit of about 10000 keeps a page under the cap. A read of a job that has not finished carries partial: true (and its status): the text may still grow, and a gc_lease run job refreshes it about once a second.
+
+Use gc_dispatch for assignments and runnable work. If you want an ongoing dialogue with an external A2A peer, use gc_peer_conversation instead — that path preserves session/thread semantics and avoids creating one job per turn.
+Do not inspect past sessions to guess provider/model defaults. Use list_agents, list_providers, list_models, and especially resolve_dispatch instead.
+
+Semantics:
+  - provider = GC dispatch route, not upstream vendor and not CLI binary name
+  - model = real provider-native model id only
+  - resolve_dispatch shows provider_type, binary, model_source, and model_resolution so you can see exactly what GC will do
+
+Provider selection (dispatch backend / route):
+  - Default: omit provider and let the daemon resolve from the agent's declared provider/model fields plus configured fallback order
+  - provider: "native" — explicit in-process/native dispatch route
+  - provider: "native:<backend>" — explicit native backend pin, for example provider: "native:zai"
+  - provider: "claude" | "droid" | "pi" — explicit built-in CLI route override
+  - provider: "kimi" — explicit dynamic CLI route override when kimi is installed
+  - provider: "<other-cli-label>" — any other installed CLI route label or alias accepted by the daemon
+  - action=list_providers — inspect the currently valid native + CLI route strings before choosing one
+
+Model selection:
+  - For CLI providers with model_resolution=provider_runtime, omit model unless you know a valid provider-native model id
+  - Never pass transport labels such as "kimi-cli" or "claude-code-cli" as model values
+  - action=list_models shows exact live inventories where GC can verify them, and clearly labeled hints otherwise
+
+Claude-specific permission controls:
+  - permission_mode: default|auto|dontAsk|acceptEdits|plan|bypassPermissions
+  - dangerously_skip_permissions: true adds --dangerously-skip-permissions
+  - allow_dangerously_skip_permissions: true adds --allow-dangerously-skip-permissions`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "dispatch",
+                "list_agents",
+                "list_providers",
+                "list_models",
+                "resolve_dispatch",
+                "explain_route",
+                "availability",
+                "list_targets",
+                "status",
+                "output",
+                "list",
+                "dismiss",
+                "cancel",
+                "delete",
+                "prune",
+                "repair_stale",
+            ])
+                .describe("Action to perform"),
+            call_profile: z
+                .enum(["worker", "completion"])
+                .optional()
+                .describe('dispatch / explain_route: "worker" (default) or "completion" (one reply, no tools).'),
+            idempotency_key: z
+                .string()
+                .min(1)
+                .optional()
+                .describe("dispatch: a repeated key returns the same job instead of a new one; reusing it for a different agent/task/profile is a 409."),
+            clear: z
+                .string()
+                .optional()
+                .describe('availability: forget this route ("provider" or "provider/model"). A bare provider also drops its model entries; a model also drops the provider-wide entry. If clear and set are both given, clear wins.'),
+            set: z
+                .string()
+                .optional()
+                .describe('availability: record this route ("provider" or "provider/model") as out until retry_at.'),
+            retry_at: z
+                .string()
+                .optional()
+                .describe('availability set: when the route is expected back; ISO 8601 with an offset, or "YYYY-MM-DD HH:MM" in the machine\'s zone. Must be in the future.'),
+            state: z
+                .enum(["quota", "auth_failed", "containment_denied", "unhealthy"])
+                .optional()
+                .describe("availability set: why the route is out (default quota)."),
+            metadata: z
+                .record(z.string(), z.any())
+                .refine((value) => {
+                try {
+                    return Buffer.byteLength(JSON.stringify(value)) <= 16_384;
+                }
+                catch {
+                    // not JSON-encodable (BigInt, cycle): fail validation here rather than
+                    // letting the transport's JSON.stringify throw later
+                    return false;
+                }
+            }, "metadata exceeds 16 KiB or is not JSON-encodable")
+                .nullish()
+                .describe("dispatch: a JSON object (at most 16 KiB, JSON-encodable) recorded on the job; null is the same as omitting it. The size is measured here as the JSON.stringify byte length and by the daemon on its own re-encoding, so a payload within a byte or two of the limit that holds exponent-form numbers (1e+21, 1e-7) can be accepted here and still refused by the daemon (invalid_metadata, 400)."),
+            kind: z
+                .enum(["all", "agent", "persona", "a2a"])
+                .optional()
+                .describe("Target filter for list_targets (default: all)"),
+            agent: z
+                .string()
+                .optional()
+                .describe("Agent name to dispatch (required for dispatch, resolve_dispatch and explain_route)"),
+            task: z.string().optional().describe("Task text (required for dispatch)"),
+            cwd: z
+                .string()
+                .optional()
+                .describe("Working directory (optional, defaults to project default)"),
+            issue: z.string().optional().describe("Work issue ID to link (optional)"),
+            on_complete: z
+                .string()
+                .optional()
+                .describe('Terminal hook for dispatch. Currently supports "notify" to emit a mailbox event when the job finishes.'),
+            wait: zBoolean()
+                .optional()
+                .describe("If true, block until agent completes (default: false)"),
+            provider: z
+                .string()
+                .optional()
+                .describe('Explicit GC dispatch route override, or route hint/filter for list_providers, list_models, resolve_dispatch, or explain_route. This is not the upstream vendor and not the CLI binary name. Accepts dynamic CLI route labels such as "claude", "droid", "pi", "kimi", plus "native" or "native:<backend>" such as "native:zai".'),
+            model: z
+                .string()
+                .optional()
+                .describe('Explicit real model id override, or a model hint for list_providers/resolve_dispatch/explain_route (e.g. "claude-sonnet-4-6", "claude-opus-4-6", "gpt-5.2-codex"). Do not pass CLI labels such as "kimi-cli" or "claude-code-cli". Default: agent-defined, GC default, or provider runtime default depending on resolve_dispatch.'),
+            permission_mode: z
+                .enum([
+                "default",
+                "auto",
+                "dontAsk",
+                "acceptEdits",
+                "plan",
+                "bypassPermissions",
+            ])
+                .optional()
+                .describe("Claude permission mode override (passed as --permission-mode)"),
+            dangerously_skip_permissions: zBoolean()
+                .optional()
+                .describe("Claude only: pass --dangerously-skip-permissions"),
+            allow_dangerously_skip_permissions: zBoolean()
+                .optional()
+                .describe("Claude only: pass --allow-dangerously-skip-permissions"),
+            allowed_tools: z
+                .string()
+                .optional()
+                .describe("Claude only: comma-separated allowed tools"),
+            disallowed_tools: z
+                .string()
+                .optional()
+                .describe("Claude only: comma-separated disallowed tools"),
+            add_dir: z
+                .string()
+                .optional()
+                .describe("Claude only: additional directory to allow tool access to"),
+            timeout: zTimeout()
+                .optional()
+                .describe('Max lifetime of the dispatched CLI subprocess. Default: none (agent work has no kill deadline; a job that stops making progress is surfaced by /gc/health, never killed). Pass integer seconds only to request a hard kill; "infinite"/"infinity"/"none" mean the default. Accepts string-of-int ("600") so LLM stringification is safe.'),
+            job_id: z
+                .string()
+                .optional()
+                .describe("Job ID (for status/output/cancel actions)"),
+            status: z
+                .string()
+                .optional()
+                .describe("Filter by status (for list/prune)"),
+            scheduled: zBoolean()
+                .optional()
+                .describe("Filter scheduled jobs only (for list)"),
+            since_hours: zNumber()
+                .optional()
+                .describe("Only jobs newer than N hours (for list)"),
+            include_hidden: zBoolean()
+                .optional()
+                .describe("Include hidden jobs (list/prune; default false)"),
+            reason: z
+                .string()
+                .optional()
+                .describe('Dismiss reason (for dismiss); availability set: note recorded with the entry (default "set by the operator")'),
+            force: zBoolean()
+                .optional()
+                .describe("delete: also allowed on a RUNNING job — the daemon first aborts it (process group torn down, job marked killed, response carries torn_down), then removes the record. To stop a job and KEEP its record, use gc_run action:control control_action:abort instead."),
+            older_than_hours: zNumber()
+                .optional()
+                .describe("Minimum age in hours for prune (default 24)"),
+            older_than_minutes: zNumber()
+                .optional()
+                .describe("Minimum age in minutes for repair_stale (default 30)"),
+            dry_run: zBoolean()
+                .optional()
+                .describe("Preview repair_stale without mutating"),
+            limit: zNumber()
+                .optional()
+                .describe("list/prune: max rows to return/delete. output: page size in BYTES of the report (snapped back to a whole UTF-8 character; never empty). About 10000 keeps a page under this tool's 16k response cap."),
+            offset: zNumber()
+                .optional()
+                .describe("output: byte offset to start the page at (default 0; moved back to the start of the character it falls in). Pass the previous page's next_offset. Without offset/limit the whole report is returned."),
+        }),
+    }, async (params) => {
+        // Compute the client-side HTTP abort deadline from the user's timeout.
+        // - Non-dispatch actions (status/output) → short default, they return fast.
+        // - wait: false → short default, daemon returns job_id immediately.
+        // - wait: true + "none" / "infinity" / "infinite" → no client abort at all.
+        // - wait: true + integer → (seconds * 1000) + 10s buffer past daemon deadline.
+        //   (The buffer differs by tool for no recorded reason: +10s here, +5s on
+        //   the run and capability watch streams, none on the workflow tool.)
+        // - wait: true + undefined → no client abort (no default deadline).
+        let clientTimeoutMs = 15_000;
+        if (params.action === "dispatch" && params.wait === true) {
+            const t = params.timeout;
+            if (isNoDeadline(t)) {
+                clientTimeoutMs = null; // wait forever
+            }
+            else if (typeof t === "number" && t > 0) {
+                clientTimeoutMs = t * 1000 + 10_000;
+            }
+            else {
+                clientTimeoutMs = null; // the daemon default is no deadline
+            }
+        }
+        return daemonCall("/gc/dispatch", params, clientTimeoutMs, MAX_RESPONSE_CHARS, params.action === "output" ? DISPATCH_OUTPUT_TRUNCATION_HINT : undefined);
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Schedule
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_schedule", {
+        description: `Manage scheduled agent dispatches and scheduled workflows.
+Actions: list, create, enable, disable, delete, history, fire (manual trigger), tick (force check).
+Trigger types: cron, interval, session_start, once.
+
+ACTION TYPES: action_type "dispatch" (default) runs an agent. action_type "workflow" runs a
+workflow directly, with no agent or model dispatch added by the schedule (a workflow's own
+prompt/dispatch steps still call a model): pass 'workflow' (a name from ~/.config/gc/workflows/ or a
+bundled workflow; it must load at create time, and a child-only workflow is refused) and optional 'params' (a JSON object or its JSON string). Each fire starts one async execution;
+history records its execution id in place of a job id (execution_id on the entry). A workflow that
+cannot be loaded at fire time is one failed fire (an error row with the reason) and the schedule
+moves on by its own cron/interval, it is not retried every tick; a transient start failure (e.g. a busy
+workflow database, a draining daemon) advances nothing and the next tick retries. Every workflow run
+gives its shell steps the workflow's own state directory in GC_WORKFLOW_STATE_DIR. fire runs the
+schedule now through the same path (a disabled schedule too) and writes a history row (note "manual");
+it leaves next_fire_at, last_fired_at and fire_count alone, except that a schedule that is due at that
+moment counts as fired (for an enabled schedule that also stops the next tick re-running it).
+
+CRON: pass a standard 5-field expression via 'cron' (preferred):
+  "min hour day-of-month month day-of-week"
+  Examples:
+    "0 9 * * mon-fri"       — weekdays at 09:00
+    "0 10 1 * *"            — 1st of every month at 10:00
+    "0 10 1 1,4,7,10 *"     — 1st of Jan/Apr/Jul/Oct at 10:00
+    "*/15 9-17 * * 1-5"     — every 15 min, 9am-5pm, weekdays
+
+The legacy 'hour'/'minute'/'days' params are deprecated but still accepted
+(the server converts them to a cron expression). They cannot express
+day-of-month, month-of-year, or ranges — use 'cron' for those.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "list",
+                "create",
+                "enable",
+                "disable",
+                "delete",
+                "history",
+                "fire",
+                "tick",
+            ])
+                .describe("Action to perform"),
+            name: z.string().optional().describe("Schedule name"),
+            description: z.string().optional().describe("Schedule description"),
+            trigger: z
+                .string()
+                .optional()
+                .describe("Trigger type: cron, interval, session_start, once"),
+            cron: z
+                .string()
+                .optional()
+                .describe('Standard 5-field cron: "min hour dom month dow". Preferred over hour/minute/days.'),
+            hour: zNumber()
+                .optional()
+                .describe("DEPRECATED — use 'cron'. Legacy cron hour (0-23)"),
+            minute: zNumber()
+                .optional()
+                .describe("DEPRECATED — use 'cron'. Legacy cron minute (0-59), default 0"),
+            days: z
+                .array(z.string())
+                .optional()
+                .describe('DEPRECATED — use \'cron\'. Legacy days of week: ["mon","tue",...]'),
+            interval: zPositiveNumber()
+                .optional()
+                .describe("Interval in minutes (accepts string-of-int)"),
+            fire_at: z.string().optional().describe("ISO timestamp for one-shot"),
+            action_type: z
+                .string()
+                .optional()
+                .describe("What to do: dispatch (default, runs an agent) or workflow (runs a workflow directly)"),
+            agent: z.string().optional().describe("Agent to dispatch"),
+            workflow: z
+                .string()
+                .optional()
+                .describe("action_type workflow: the workflow name (must load at create time)"),
+            params: z
+                .union([z.record(z.string(), z.unknown()), z.string()])
+                .optional()
+                .describe("action_type workflow: the workflow's params, a JSON object (or its JSON string)"),
+            task: z.string().optional().describe("Task text"),
+            cwd: z.string().optional().describe("Working directory"),
+            issue: z.string().optional().describe("Linked bee issue"),
+            id: z.string().optional().describe("Schedule ID"),
+            limit: zNumber().optional().describe("History limit (default 20)"),
+        }),
+    }, async (params) => daemonCall("/gc/schedule", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Reminders
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_remind", {
+        description: `Human reminders. Simple, managed by Eve or directly.
+Actions: add (create reminder), list (show pending/fired), dismiss (mark as handled), snooze (delay), delete.
+Due accepts: ISO timestamps, relative times.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["add", "list", "dismiss", "snooze", "delete"])
+                .describe("Action to perform"),
+            text: z.string().optional().describe("Reminder text"),
+            due: z
+                .string()
+                .optional()
+                .describe("When: ISO timestamp or relative time"),
+            recurrence: z
+                .string()
+                .optional()
+                .describe("Repeat: daily, weekdays, weekly, monthly"),
+            labels: z
+                .array(z.string())
+                .optional()
+                .describe("Labels for categorization"),
+            id: z
+                .string()
+                .optional()
+                .describe("Reminder ID (for dismiss/snooze/delete)"),
+            snooze_for: z.string().optional().describe("Snooze duration"),
+            status: z.string().optional().describe("Filter: pending, fired, all"),
+            created_by: z
+                .string()
+                .optional()
+                .describe("Who created: human (default), eve, or agent name"),
+        }),
+    }, async (params) => daemonCall("/gc/remind", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Workflow
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_workflow", {
+        description: `Run deterministic workflows from ~/.config/gc/workflows/.
+Workflows are YAML pipelines with step types: tool, prompt, dispatch, shell, each, branch, halt.
+
+Actions:
+  - run (sync by default, or async: true)
+  - list_workflows — list YAML definitions (defaults to summary: name/file/description/size).
+    Child-only workflows (started by a protected parent, never run directly) are hidden;
+    include_child_only: true lists them, flagged child_only. An explicit select by name always returns a child-only workflow.
+  - list_executions — list past runs (defaults to summary: no runtime blob)
+  - list — alias for list_executions (backward compat)
+  - show (alias: get_execution) — one execution as a step inventory (return: "full" for the whole runtime).
+    A parent run's show and detail responses carry children: [{ child_id, workflow, step, status, created_at, child_sha256, child_source, preamble_sha256 }] (the hashes and source the daemon recorded when it admitted the child), the child-only runs it started.
+    Takes an execution id, never a workflow name: to read a definition use get_workflow.
+  - get_workflow — one workflow definition: { workflow: { name, file, path, source
+    ("user" | "bundled"), protected, description, size_bytes, body } }. Takes name.
+  - define — propose a new workflow (refused if the name exists). update —
+    propose a replacement (refused if it does not exist). Both take name + yaml
+    (the full YAML body) and NEVER write by themselves:
+      * the body is validated with the workflow parser and compiler; an invalid
+        body is refused with the parser's error;
+      * a name with anything but lowercase letters, digits, _ and - is refused;
+      * the parity-protected workflows (development-*, support-*) are refused —
+        change those in the daemon's workflow config and sync;
+      * a valid proposal is STAGED and answered with an error carrying
+        recovery { kind: "needs_confirmation", confirm_id, expires_at,
+        operator_prompt (with a diff), tool_result_for_model }. The operator
+        confirms or rejects it in the GUI. You cannot confirm it: do not retry,
+        and follow tool_result_for_model.
+    Once confirmed the write is atomic, audited, an update's old body is backed
+    up, and the next run reads the new body.
+  - report — reliability summary, stale-running detection, recent failures
+  - overview — bounded operational state for active runs, recent failures, and attention signals
+  - detail — per-step breakdown for an execution, each step with its result
+  - context — one step's stored output (key = step id), pageable
+  - resume — continue a waiting/halted/failed run from its checkpoint. ASYNC BY
+    DEFAULT: answers { status: "resumed", execution_id } at once and the run
+    carries on server-side — follow with action:watch or action:wait. Pass
+    async: false to hold the call until the next checkpoint (a stage can take
+    7-20 minutes). from_step: "<step_id>" re-runs from an EARLIER step of the
+    run (it re-does work, it never skips a gate); a halt with on_resume goes
+    where the YAML says; a halt whose next step is another halt is refused.
+  - wait — bounded poll until terminal state or timeout
+  - watch — stream daemon SSE continuity through MCP progress notifications, then return the terminal event
+  - cancel — stop one execution and cancel any backing Oban workflow job
+  - dismiss — hide an execution from default listings
+  - delete — remove one execution (and checkpoint)
+  - prune — bulk-delete old terminal executions
+  - repair_stale — mark stale running executions failed and clear checkpoints
+
+Response shaping:
+
+  run (sync):
+    - Default shape: { execution_id, status: "complete", last_step, result }.
+      \`result\` carries the last MEANINGFUL step's output — the shaper walks
+      the trace backwards and skips nil-returning tail steps (gc.retain /
+      gc.notify side-effects). \`last_step\` names whichever step produced
+      \`result\`. If every step returns nil, \`result\` is null but
+      \`last_step\` still names the actual final step.
+    - select: "step_id" — return one specific step's result (bypasses the
+      walk-past-nil default; use when you want an intermediate step or a
+      specific side-effect's receipt).
+    - select: "step_a,step_b" — return multiple specific steps (selected
+      map + \`result\` unset).
+    - return: "full" — everything (all step results + trace).
+    - return: "steps" — all step results keyed by step_id, no trace.
+    - return: "trace" — trace only, no results.
+
+  run (async: true):
+    - Returns { ok: true, status: "started", execution_id } immediately.
+    - Goes through Oban; survives daemon restart (idempotent resume —
+      crash mid-run → row marked failed with reason "crashed-resume").
+
+  list_workflows:
+    - Default: summary — name, file, description, size_bytes (no YAML body)
+    - return: "full" — includes the YAML 'body' field for every workflow
+    - select: "name1,name2" — return full bodies for the named workflows only
+
+  list_executions:
+    - Default: summary — id, workflow, status, started_at, updated_at (no runtime blob)
+    - return: "full" — includes 'runtime' JSON for every row (can be large)
+    - select: "id,status" — return only the named fields per row
+
+  show:
+    - Default: step inventory — one row per step (step_id, status, timing,
+      result_bytes), never a step's result; plus \`halt\` {step_id, message}
+      when the run is halted. Sized to fit any response cap.
+    - return: "lean" — status, current_step, last_error, halted_step,
+      halt_message (capped), liveness
+    - return: "full" — the whole stored runtime (results, trace, meta)
+    - select: "step_a,step_b" — only those steps
+
+  detail:
+    - Default: one row per step WITH its result, in the order the steps
+      first ran; \`halt\` as in show. No repeated top-level results map.
+    - return: "full" — adds the raw results and meta maps
+    - select: "step_a,step_b" — only those steps
+
+  context:
+    - key: "<step_id>" — that step's stored output and its meta (status,
+      timing, audit). This is how to read one step's report in full.
+    - offset / limit (characters) — page one key's output; the response
+      carries total_chars, truncated, next_offset (and encoded: true when
+      a non-string value was paged over its JSON text).
+    - select: "step_a,step_b" — several steps' outputs in one call
+
+  A parameter the action does not read is named in the response's
+  \`warnings\` (with the actions that read it) — never silently ignored.
+
+  overview:
+    - Default: active runs plus failures from the last 24 hours
+    - window_hours: 1-168 (default 24), limit: 1-50 (default 20)
+    - health.active_total and health.active_truncated distinguish all active runs from the bounded active list.
+    - Designed for “How are our workflows coming along?” in one call, rather than client-side aggregation.
+
+Use timeout to control client-side HTTP deadline, or "none" for no timeout.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "run",
+                "list",
+                "list_workflows",
+                "list_executions",
+                "show",
+                "get_execution",
+                "report",
+                "overview",
+                "detail",
+                "context",
+                "wait",
+                "watch",
+                "resume",
+                "cancel",
+                "dismiss",
+                "delete",
+                "prune",
+                "repair_stale",
+                "get_workflow",
+                "define",
+                "update",
+            ])
+                .describe("Action to perform"),
+            workflow: z
+                .string()
+                .optional()
+                .describe("Workflow name for run/resume (also accepted as name for get_workflow/define/update). show/get_execution take an execution id, not this."),
+            name: z
+                .string()
+                .optional()
+                .describe("get_workflow/define/update: the workflow name (letters, digits, _ and -; define/update take lowercase only)"),
+            yaml: z
+                .string()
+                .optional()
+                .describe("define/update: the full workflow YAML body, validated before anything is written"),
+            actor: z
+                .string()
+                .optional()
+                .describe("define/update: who is writing, recorded in the write audit"),
+            params: z
+                .string()
+                .optional()
+                .describe('JSON parameters for the workflow. Pass an object encoded as JSON, for example {"since":"2026-05-02T00:00:00+03:00","projects":["my-project"],"mode":"draft"}. Use JSON arrays for list<string> params such as projects.'),
+            async: zBoolean()
+                .optional()
+                .describe("run: if true, return immediately with execution_id. resume: defaults to TRUE (answers 'resumed' at once); pass false to wait for the next checkpoint."),
+            from_step: z
+                .string()
+                .optional()
+                .describe("resume: the step id to run again — an earlier step of the run, never the one it stopped at or a later one. Omit to continue from the checkpoint (or the halt's on_resume target)."),
+            status: z
+                .string()
+                .optional()
+                .describe("Filter list_executions by status (running/completed/failed/halted)"),
+            limit: zNumber()
+                .optional()
+                .describe("Max rows for list_executions or overview (default 20; overview max 50)"),
+            window_hours: zNumber()
+                .optional()
+                .describe("Recent failure window for overview, 1-168 hours (default 24)"),
+            select: z
+                .string()
+                .optional()
+                .describe('Cherry-pick fields/steps. run: step IDs ("step_a,step_b"). show/detail: keep only those steps. context: read those step ids in one call. list_workflows: workflow names (returns full body). list_executions: execution field names. Takes priority over return.'),
+            return: z
+                .enum(["result", "full", "steps", "trace", "summary", "lean"])
+                .optional()
+                .describe('Response shape. run: "result" (default)/"full"/"steps"/"trace". list_workflows + list_executions: "summary" (default)/"full". show: inventory (default)/"lean"/"full" (whole runtime). detail: step rows (default)/"lean"/"full" (adds results + meta maps).'),
+            offset: zNumber()
+                .optional()
+                .describe("context with key: start of the page in characters (default 0). Pairs with limit_chars."),
+            limit_chars: zNumber()
+                .optional()
+                .describe("context with key: page size in characters (sent to the daemon as `limit`). The response carries total_chars and next_offset."),
+            id: z
+                .string()
+                .optional()
+                .describe("Execution ID (for show/resume/detail/context/wait/watch)."),
+            execution_id: z
+                .string()
+                .optional()
+                .describe("Execution ID (alias for id)"),
+            key: z
+                .string()
+                .optional()
+                .describe("context: a STEP ID — returns that step's stored output and meta. Page a long output with offset + limit_chars."),
+            interval: zPositiveNumber()
+                .optional()
+                .describe("Poll interval in seconds for wait (default: 5). Accepts string-of-int."),
+            timeout: zTimeout()
+                .optional()
+                .describe('Client-side HTTP timeout in seconds. Default: none for resume (it answers only at the next checkpoint), 300 (5 min) for run/wait/watch, 15 for others. "none" / "infinity" / "infinite" disable timeout entirely. A client timeout never stops the daemon-side run. Accepts string-of-int ("600") so LLM stringification is safe.'),
+            run_timeout: zTimeout()
+                .optional()
+                .describe('Server-side workflow execution timeout in seconds for action=run only. Distinct from client timeout. "none" / "infinity" / "infinite" disable the server-side run deadline.'),
+            execution_timeout: zTimeout()
+                .optional()
+                .describe("Alias for run_timeout"),
+            include_hidden: zBoolean()
+                .optional()
+                .describe("Include hidden rows in list/prune (default false for list, true for prune)"),
+            include_child_only: zBoolean()
+                .optional()
+                .describe("list_workflows: also list child-only workflows (hidden by default; a protected parent starts them, they are not run directly). Default false."),
+            reason: z
+                .string()
+                .optional()
+                .describe("Dismiss reason (for action=dismiss)"),
+            force: zBoolean()
+                .optional()
+                .describe("Force deletion of running execution (for action=delete)"),
+            older_than_hours: zNumber()
+                .optional()
+                .describe("Minimum age in hours for action=prune (default 24)"),
+            dry_run: zBoolean()
+                .optional()
+                .describe("Preview repair_stale without mutating"),
+        }),
+    }, async (params, extra) => {
+        // Normalize execution_id -> id for the handler
+        const normalized = { ...params };
+        if (normalized.execution_id && !normalized.id) {
+            normalized.id = normalized.execution_id;
+        }
+        // A workflow write is confirmed by the operator in the GUI
+        // (confirm_write, which is not in this schema). Never forward an approval
+        // a model put in its arguments, whatever the schema let through.
+        delete normalized.approval;
+        // Resume is async unless the caller says otherwise. The daemon
+        // has run resumes in a supervised task for a while; holding an HTTP
+        // request for a whole 7-20 minute stage was the shim's habit, not a need.
+        if (params.action === "resume" && normalized.async === undefined) {
+            normalized.async = true;
+        }
+        // Compute client-side HTTP timeout:
+        // - async: true → 15s (daemon returns immediately)
+        // - timeout: none/infinity/infinite → null (no abort)
+        // - timeout: N → N * 1000
+        // - sync resume (async: false, no explicit timeout) → null: the daemon
+        //   answers a resume only when the run reaches its next checkpoint, and a
+        //   stage routinely takes 7-20 minutes, so any fixed default reports a
+        //   failure that did not happen
+        // - run/wait/watch (no explicit timeout) → 300s default (this is the client's own
+        //   300 s abort; the daemon's sync wait budget is 15 min, :workflow_sync)
+        // - everything else → 15s default
+        let clientTimeoutMs = 15_000;
+        const isLongAction = params.action === "run" ||
+            params.action === "resume" ||
+            params.action === "wait" ||
+            params.action === "watch";
+        if (normalized.async) {
+            clientTimeoutMs = 15_000; // async returns immediately
+        }
+        else if (isNoDeadline(params.timeout)) {
+            clientTimeoutMs = null;
+        }
+        else if (typeof params.timeout === "number" && params.timeout > 0) {
+            clientTimeoutMs = params.timeout * 1000;
+        }
+        else if (params.action === "resume") {
+            clientTimeoutMs = null;
+        }
+        else if (isLongAction) {
+            clientTimeoutMs = 300_000; // 5 min default for sync run/wait/watch
+        }
+        if (params.action === "watch") {
+            const executionId = typeof normalized.id === "string" ? normalized.id : undefined;
+            if (!executionId) {
+                return err("ERROR: execution id is required for action=watch");
+            }
+            try {
+                const { events, terminal, timed_out } = await readWorkflowWatchStream(executionId, clientTimeoutMs, async (event, index) => {
+                    if (extra._meta?.progressToken === undefined)
+                        return;
+                    await extra.sendNotification({
+                        method: "notifications/progress",
+                        params: {
+                            progressToken: extra._meta.progressToken,
+                            progress: index,
+                            message: summarizeWatchEvent(event),
+                        },
+                    });
+                });
+                const finalEvent = terminal || events.at(-1);
+                const payload = {
+                    ok: true,
+                    id: executionId,
+                    event_count: events.length,
+                    timed_out,
+                    final_event: finalEvent?.event ?? null,
+                    terminal: finalEvent?.data ?? null,
+                    events,
+                };
+                return finalEvent && isFailedWatchEvent(finalEvent)
+                    ? err(toJsonText(payload))
+                    : text(toJsonText(payload));
+            }
+            catch (e) {
+                return err(`ERROR: ${activeShared.describeError(e)}`);
+            }
+        }
+        // `limit` already means "max rows" for the list actions; the context
+        // page size travels as limit_chars here and as `limit` to the daemon.
+        if (params.action === "context" && normalized.limit_chars !== undefined) {
+            normalized.limit = normalized.limit_chars;
+            delete normalized.limit_chars;
+        }
+        return daemonCall("/gc/workflow", normalized, clientTimeoutMs, MAX_RESPONSE_CHARS, WORKFLOW_TRUNCATION_HINT);
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Mail
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_mail", {
+        description: `Mail transceiver — read, classify, derive, and SEND. Each endpoint has its own
+identity and a draft->approve autonomy level; every outbound message lands in the outbound ledger.
+Read:      summary, coverage, messages, search, get_message, thread, summarize_thread, attachments, financial, burn_rate, outbound
+Send:      draft, send, reply, approve_draft
+Ingest:    scan, ocr, extract_financials, extract_attachments
+Endpoints: endpoints, folders, add_endpoint, update_endpoint, remove_endpoint, enable_endpoint, disable_endpoint
+Derive:    create_issue_from_message, create_reminder_from_message, create_event_from_message, create_cash_entry_from_financial
+Senders:   seed_rules, sender_queue, classify_sender, dismiss_sender, ignore_sender, backfill_senders
+Start with 'coverage' to see how far back mail has actually been collected before trusting a query's completeness.
+Use 'folders' (needs endpoint_id) when a scan reports 0 new messages but the mailbox is not empty: it lists what the server actually has and names the configured scan_folders that are missing. Gmail's "[Gmail]/All Mail" is localised per account language and its IMAP visibility is a per-label toggle, so the same folder string can work for one account and not the next.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                // Read
+                "summary",
+                "coverage",
+                "messages",
+                "search",
+                "get_message",
+                "thread",
+                "summarize_thread",
+                "attachments",
+                "financial",
+                "burn_rate",
+                "outbound",
+                // Send
+                "draft",
+                "send",
+                "reply",
+                "approve_draft",
+                // Ingest
+                "scan",
+                "ocr",
+                "extract_financials",
+                "extract_attachments",
+                // Endpoints
+                "endpoints",
+                "folders",
+                "add_endpoint",
+                "update_endpoint",
+                "remove_endpoint",
+                "enable_endpoint",
+                "disable_endpoint",
+                // Derive
+                "create_issue_from_message",
+                "create_reminder_from_message",
+                "create_event_from_message",
+                "create_cash_entry_from_financial",
+                // Senders
+                "seed_rules",
+                "sender_queue",
+                "classify_sender",
+                "dismiss_sender",
+                "ignore_sender",
+                "backfill_senders",
+                "repair_sender_queue",
+            ])
+                .describe("Action to perform"),
+            // Identifiers
+            id: z
+                .string()
+                .optional()
+                .describe("Target ID — endpoint (endpoint actions), message (get_message/thread/summarize_thread), outbound draft (approve_draft), or sender (classify/dismiss/ignore_sender)"),
+            message_id: z
+                .string()
+                .optional()
+                .describe("Source message ID for reply and the create_*_from_message actions; also filters attachments"),
+            financial_entry_id: z
+                .string()
+                .optional()
+                .describe("Financial entry ID (create_cash_entry_from_financial)"),
+            endpoint_id: z
+                .string()
+                .optional()
+                .describe("Endpoint to act on: scan, coverage, folders, extract_attachments, outbound, and the sending identity for draft/send/reply"),
+            // Message queries
+            category: z
+                .string()
+                .optional()
+                .describe("Filter messages by category; also the category on a derived cash entry"),
+            subject: z
+                .string()
+                .optional()
+                .describe("Filter messages by subject (substring)"),
+            from: z
+                .string()
+                .optional()
+                .describe("Filter messages by sender (substring)"),
+            since: z
+                .string()
+                .optional()
+                .describe("Messages: filter since date (ISO). Scan: collect back to this date (backfill cutoff)."),
+            has_attachments: zBoolean()
+                .optional()
+                .describe("Filter messages to those with attachments"),
+            limit: zNumber().optional().describe("Max results"),
+            dry_run: zBoolean()
+                .optional()
+                .describe("repair_sender_queue: report invalid UTF-8 rows without rewriting them (default true; pass false to apply)"),
+            fetch_body: zBoolean()
+                .optional()
+                .describe("get_message: fetch the full body over IMAP instead of the stored preview"),
+            // Search
+            q: z.string().optional().describe("Full-text query (required for search)"),
+            include_attachment_text: zBoolean()
+                .optional()
+                .describe("Search extracted attachment text too (default true)"),
+            // Attachments
+            filename: z
+                .string()
+                .optional()
+                .describe("Filter attachments by filename (substring)"),
+            text_extraction: z
+                .string()
+                .optional()
+                .describe("Filter attachments by extraction state"),
+            // Coverage and scanning
+            probe: zBoolean()
+                .optional()
+                .describe("coverage: probe the server for remaining history (network round trip). Default false = instant DB-only read."),
+            mode: z
+                .string()
+                .optional()
+                .describe("Scan mode: incremental (default) or backfill"),
+            folders: z
+                .array(z.string())
+                .optional()
+                .describe("Scan: limit this run to these folders"),
+            batch_size: zNumber()
+                .optional()
+                .describe("Scan: messages per batch (default 200)"),
+            max_batches: zNumber()
+                .optional()
+                .describe("Scan: batch ceiling per run (default 25, max 200)"),
+            // Financial
+            direction: z
+                .string()
+                .optional()
+                .describe("Financial direction: expense or income"),
+            vat_period: z.string().optional().describe("VAT period filter"),
+            months: zNumber()
+                .optional()
+                .describe("Burn rate lookback months (default 3)"),
+            // Endpoint management
+            email: z.string().optional().describe("Email address (for add_endpoint)"),
+            name: z.string().optional().describe("Endpoint name"),
+            provider: z.string().optional().describe("Provider (default: imap)"),
+            labels: z
+                .array(z.string())
+                .optional()
+                .describe("Endpoint labels; also the labels applied by the create_*_from_message actions"),
+            imap_host: z
+                .string()
+                .optional()
+                .describe("IMAP host (default: imap.zoho.com)"),
+            imap_port: zNumber().optional().describe("IMAP port (default: 993)"),
+            username: z.string().optional().describe("IMAP username"),
+            app_key: z
+                .string()
+                .optional()
+                .describe("IMAP app-specific password. Stored in plaintext today — prefer imap_secret_ref where a vault entry exists."),
+            imap_secret_ref: z
+                .string()
+                .optional()
+                .describe("Vault reference for the IMAP password (preferred over app_key)"),
+            from_name: z
+                .string()
+                .optional()
+                .describe("Display name on outbound mail from this endpoint"),
+            smtp_host: z.string().optional().describe("SMTP host (for sending)"),
+            smtp_port: zNumber().optional().describe("SMTP port (default: 587)"),
+            smtp_username: z
+                .string()
+                .optional()
+                .describe("SMTP username (defaults to the IMAP username)"),
+            smtp_password: z
+                .string()
+                .optional()
+                .describe("SMTP password — prefer smtp_secret_ref"),
+            smtp_secret_ref: z
+                .string()
+                .optional()
+                .describe("Vault reference for the SMTP password"),
+            oauth_secret_ref: z
+                .string()
+                .optional()
+                .describe("Vault reference for an OAuth credential"),
+            smtp_tls: z
+                .string()
+                .optional()
+                .describe("STARTTLS mode: always, never, if_available (default)"),
+            smtp_ssl: zBoolean()
+                .optional()
+                .describe("Implicit TLS (SMTPS). Defaults from smtp_port on add_endpoint — 465 is true, " +
+                "anything else false — so you rarely set it. On update_endpoint only an explicit " +
+                "value changes it; moving the port alone leaves it as it was."),
+            scan_folders: z
+                .array(z.string())
+                .optional()
+                .describe("Folders to scan (default: [INBOX]). Include 'Sent' — outbound mail is the highest-signal record."),
+            autonomy: z
+                .string()
+                .optional()
+                .describe("Outbound autonomy gate: 'observe' (default, no outbound at all), " +
+                "'draft' (may compose drafts; live send refused, approve_draft is the gate), " +
+                "'respond' (may send directly). These three are what Outbound.validate_endpoint/2 " +
+                "actually enforces."),
+            // Outbound
+            to: z
+                .union([z.string(), z.array(z.string())])
+                .optional()
+                .describe("Recipients (send/draft; defaults to the sender on reply)"),
+            cc: z.union([z.string(), z.array(z.string())]).optional().describe("CC recipients"),
+            bcc: z.union([z.string(), z.array(z.string())]).optional().describe("BCC recipients"),
+            text: z
+                .string()
+                .optional()
+                .describe("Message body (send/draft/reply); also the reminder text on create_reminder_from_message"),
+            in_reply_to: z
+                .string()
+                .optional()
+                .describe("In-Reply-To header (set automatically by reply)"),
+            references_header: z.string().optional().describe("References header"),
+            attachments: z
+                .array(z.record(z.any()))
+                .optional()
+                .describe("Outbound attachments: [{mail_attachment_id}] to forward a stored attachment, or [{path, filename?}] for a local file"),
+            status: z
+                .string()
+                .optional()
+                .describe("outbound: filter the ledger by status; create_cash_entry_from_financial: entry status"),
+            // Derived records
+            title: z
+                .string()
+                .optional()
+                .describe("Title for a derived issue, event, or cash entry (defaults to the subject)"),
+            description: z.string().optional().describe("Description for a derived issue"),
+            project: z.string().optional().describe("Project for a derived issue"),
+            priority: z.string().optional().describe("Priority for a derived issue"),
+            due: z.string().optional().describe("Due time for a derived reminder"),
+            starts_at: z
+                .string()
+                .optional()
+                .describe("Event start (defaults to the message's own timestamp, not now)"),
+            ends_at: z.string().optional().describe("Event end"),
+            type: z
+                .string()
+                .optional()
+                .describe("Event type (default deadline) or cash entry type"),
+            notes: z.string().optional().describe("Notes on the derived record"),
+            // Sender classification
+            view: z
+                .string()
+                .optional()
+                .describe("Sender queue view: summary or list"),
+            reason: z.string().optional().describe("Reason for dismiss/ignore"),
+        }),
+    }, async (params) => daemonCall("/gc/mail", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — HTTP Client
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_http", {
+        description: `Generic HTTP client for external API calls.
+Actions: get, post, put, delete. Supports bearer, basic, and header auth.`,
+        inputSchema: z.object({
+            action: z.enum(["get", "post", "put", "delete"]).describe("HTTP method"),
+            url: z.string().describe("Target URL"),
+            body: z.any().optional().describe("JSON body (for post/put)"),
+            params: z.record(z.string()).optional().describe("Query parameters"),
+            headers: z.record(z.string()).optional().describe("Custom headers"),
+            auth: z
+                .object({
+                type: z.enum(["bearer", "basic", "header"]).describe("Auth type"),
+                token: z.string().optional().describe("Bearer token"),
+                username: z.string().optional().describe("Basic auth username"),
+                password: z.string().optional().describe("Basic auth password"),
+                name: z.string().optional().describe("Custom header name"),
+                value: z.string().optional().describe("Custom header value"),
+            })
+                .optional()
+                .describe("Authentication config"),
+            timeout: zTimeout()
+                .optional()
+                .describe("Timeout in ms (default 30000). Accepts string-of-int / 'none' / 'infinity'."),
+        }),
+    }, async (params) => daemonCall("/gc/http", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Timing (macOS Timing.app)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_timing", {
+        description: `Read-only queries against macOS Timing.app SQLite database.
+Actions: summary (project totals), capacity (daily hours), duration (estimate from labels), hours_by_label.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["summary", "capacity", "duration", "hours_by_label"])
+                .describe("Action to perform"),
+            since: z.string().optional().describe("Start date filter (ISO)"),
+            until: z.string().optional().describe("End date filter (ISO)"),
+            labels: z
+                .array(z.string())
+                .optional()
+                .describe("Labels for duration estimate"),
+        }),
+    }, async (params) => daemonCall("/gc/timing", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Sync (Reconciliation Engine)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_sync", {
+        description: `Reconciliation engine for data hygiene.
+Actions: status (last runs, pending reviews), run (trigger sync), rules (list rule files), reviews (pending items), classify (resolve item), dismiss (dismiss item).`,
+        inputSchema: z.object({
+            action: z
+                .enum(["status", "run", "rules", "reviews", "classify", "dismiss"])
+                .describe("Action to perform"),
+            rule_file: z
+                .string()
+                .optional()
+                .describe("Specific rule file to run or filter by"),
+            id: z
+                .string()
+                .optional()
+                .describe("Review item ID (for classify/dismiss)"),
+            resolution: z
+                .record(z.unknown())
+                .optional()
+                .describe("Resolution data (for classify)"),
+            reason: z.string().optional().describe("Reason for dismiss"),
+            limit: zNumber().optional().describe("Max results"),
+        }),
+    }, async (params) => daemonCall("/gc/sync", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — MCP Client Proxy
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_mcpclient", {
+        description: `General-purpose MCP client proxy. Connect to any MCP server once, use from any agent.
+Supports all transports: streamable_http (default), sse (e.g. Tidewave), stdio, websocket.
+Actions: connect (register + connect), disconnect, remove, servers (list registered), tools (list tools), call (invoke a tool), scan (health-check all).`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "connect",
+                "disconnect",
+                "remove",
+                "servers",
+                "tools",
+                "call",
+                "scan",
+            ])
+                .describe("Action to perform"),
+            name: z
+                .string()
+                .optional()
+                .describe("Server name (for connect/disconnect/remove)"),
+            url: z.string().optional().describe("Server URL (for connect)"),
+            transport: z
+                .string()
+                .optional()
+                .describe("Transport type: streamable_http (default), sse, stdio, websocket"),
+            description: z
+                .string()
+                .optional()
+                .describe("Server description (for connect)"),
+            metadata: z
+                .record(z.unknown())
+                .optional()
+                .describe("Extra config (e.g. {command, args} for stdio)"),
+            server: z.string().optional().describe("Server name (for tools/call)"),
+            tool: z
+                .string()
+                .optional()
+                .describe("Tool name to call (for call action)"),
+            arguments: z
+                .record(z.unknown())
+                .optional()
+                .describe("Tool arguments (for call)"),
+            timeout: zTimeout()
+                .optional()
+                .describe("Call timeout in seconds. Accepts string-of-int / 'none' / 'infinity'."),
+        }),
+    }, async (params) => daemonCall("/gc/mcpclient", params));
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Ticker (Situational Awareness)
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_ticker", {
+        description: `Situational awareness snapshot. Returns the latest ticker state from the daemon.
+Actions: "get" (default) = latest snapshot, "tick" = force a fresh tick.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["get", "tick"])
+                .optional()
+                .describe("Action: get (default) or tick (force refresh)"),
+        }),
+    }, async (params) => {
+        try {
+            if (params.action === "tick") {
+                const result = await gcPost("/gc/ticker", { action: "tick" });
+                return text(JSON.stringify(result, null, 2));
+            }
+            // Default: GET request
+            const result = await gcGet("/gc/ticker");
+            return text(JSON.stringify(result, null, 2));
+        }
+        catch (e) {
+            return err(`Ticker error: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Notifications
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_notify", {
+        description: `Notification mailbox for durable consumer polling.
+Actions: "push" = append a mailbox event, "drain" = fetch unread items and mark them read, "list" = inspect mailbox contents by status/checkpoint.
+
+Recommended integration pattern:
+  - Persist a per-consumer checkpoint
+  - Poll gc_notify with action: "list", source: <event-source>, status: "all", since: <checkpoint>, cursor_id: <opaque-cursor>
+  - Handle returned events
+  - Advance the checkpoint to the newest handled created_at
+
+Use list rather than drain for multi-harness bridges: drain marks matching events read globally. Daemon guarantees durable mailbox creation plus unread/read semantics. Harnesses decide how to surface events.`,
+        inputSchema: z.object({
+            action: z.enum(["push", "drain", "list"]).describe("Action to perform"),
+            source: z
+                .string()
+                .optional()
+                .describe("Notification source (required for push; optional exact filter for drain/list)"),
+            content: z
+                .string()
+                .optional()
+                .describe("Notification content (for push)"),
+            priority: zNumber()
+                .optional()
+                .describe("Notification priority (for push, default 0)"),
+            limit: zNumber()
+                .optional()
+                .describe("Max rows to drain/list (default 10 for drain, 50 for list)"),
+            status: z
+                .enum(["unread", "read", "all"])
+                .optional()
+                .describe("For list: unread, read, all"),
+            since: z
+                .string()
+                .optional()
+                .describe("Optional ISO timestamp checkpoint. For drain/list, only return notifications newer than this."),
+            cursor_id: z
+                .string()
+                .optional()
+                .describe("Optional opaque cursor returned by the daemon and paired with since for lossless pagination."),
+        }),
+    }, async (params) => daemonCall("/gc/notify", params));
+    // ════════════════════════════════════════════════════════════════
+    // STANDALONE TOOL — DaVinci Resolve
+    // ════════════════════════════════════════════════════════════════
+    function getResolveBridgePath() {
+        // Bridge script lives next to the pi extension
+        const piExtPath = join(homedir(), "Sites", "agents", ".pi", "extensions", "davinci-resolve", "resolve-bridge.py");
+        if (existsSync(piExtPath))
+            return piExtPath;
+        // Fallback: check relative to this file
+        const localPath = resolve(activeShared.packageDir, "..", "..", ".pi", "extensions", "davinci-resolve", "resolve-bridge.py");
+        if (existsSync(localPath))
+            return localPath;
+        throw new Error("resolve-bridge.py not found");
+    }
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOL — A2A (Agent-to-Agent Protocol)
+    // ════════════════════════════════════════════════════════════════
+    const A2A_RPC_METHODS = new Set([
+        "message/send",
+        "tasks/get",
+        "tasks/cancel",
+    ]);
+    async function a2aRpc(method, params) {
+        const url = `${activeShared.gcBase}/a2a`;
+        const id = Date.now();
+        const body = { jsonrpc: "2.0", id, method, params };
+        const resp = await activeShared.fetch(url, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(15_000),
+        });
+        const data = await resp.json();
+        if (data.error) {
+            throw new Error(`A2A ${method} error: ${data.error.message || JSON.stringify(data.error)}`);
+        }
+        return data.result;
+    }
+    registerTool("gc_a2a", {
+        description: `Agent-to-Agent (A2A) protocol client. Interact with the A2A broker to create tasks, check status, cancel tasks, and discover agent capabilities.
+
+Actions:
+- **send**: Create a new A2A task (message/send). Params: message (with role + parts), worker (optional target agent), idempotencyKey (optional dedup).
+- **get**: Get task status by ID (tasks/get). Params: id (task ID).
+- **cancel**: Cancel a running task (tasks/cancel). Params: id (task ID).
+- **card**: Fetch an agent's public card. Params: name (agent name).
+- **list**: List tasks with optional filters. Params: state, worker_agent.
+- **register**: Register as an A2A worker agent. Params: agent_name, card_url?, cascade_priority?.
+- **inbox**: Get submitted tasks for a worker. Params: worker_agent.
+- **respond**: Transition a task state + optionally append a message. Params: task_id, state (working|completed|failed|canceled|rejected), message?.
+
+The A2A protocol follows the Google A2A specification (JSON-RPC 2.0 over HTTP).
+Task states: submitted → working → completed | failed | canceled | rejected.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "send",
+                "get",
+                "cancel",
+                "card",
+                "list",
+                "register",
+                "inbox",
+                "respond",
+            ])
+                .describe("A2A action to perform"),
+            // send / get / cancel
+            id: z.string().optional().describe("Task ID (for get/cancel)"),
+            message: z
+                .object({
+                role: z
+                    .string()
+                    .optional()
+                    .describe("Message role (default: user)"),
+                parts: z
+                    .array(z.object({
+                    type: z.string().describe("Part type (e.g. 'text')"),
+                    text: z.string().optional().describe("Text content"),
+                }))
+                    .optional()
+                    .describe("Message parts"),
+                taskId: z
+                    .string()
+                    .optional()
+                    .describe("Explicit task ID (auto-generated if omitted)"),
+                contextId: z
+                    .string()
+                    .optional()
+                    .describe("Context ID for conversation threading"),
+                metadata: z
+                    .record(z.unknown())
+                    .optional()
+                    .describe("Message metadata"),
+            })
+                .optional()
+                .describe("Message payload (for send action)"),
+            worker: z
+                .string()
+                .optional()
+                .describe("Target worker agent name (for send action)"),
+            idempotencyKey: z
+                .string()
+                .optional()
+                .describe("Deduplication key (for send action)"),
+            // card
+            name: z.string().optional().describe("Agent name (for card action)"),
+            // list / inbox
+            state: z
+                .string()
+                .optional()
+                .describe("Filter by task state (for list)"),
+            worker_agent: z
+                .string()
+                .optional()
+                .describe("Filter by worker agent (for list/inbox)"),
+            // register
+            agent_name: z
+                .string()
+                .optional()
+                .describe("Agent name to register (for register action)"),
+            card_url: z
+                .string()
+                .optional()
+                .describe("Agent card URL (for register action)"),
+            cascade_priority: z
+                .array(z.string())
+                .optional()
+                .describe("Cascade priority list (for register action)"),
+            // respond
+            task_id: z
+                .string()
+                .optional()
+                .describe("Task ID to respond to (for respond action)"),
+        }),
+    }, async (params) => {
+        try {
+            switch (params.action) {
+                case "send": {
+                    const rpcParams = clean({
+                        message: params.message,
+                        worker: params.worker,
+                        idempotencyKey: params.idempotencyKey,
+                    });
+                    const result = await a2aRpc("message/send", rpcParams);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "get": {
+                    const result = await a2aRpc("tasks/get", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "cancel": {
+                    const result = await a2aRpc("tasks/cancel", { id: params.id });
+                    return text(JSON.stringify(result, null, 2));
+                }
+                case "card": {
+                    const result = await gcGet(`/.well-known/agents/${params.name}.json`);
+                    return text(JSON.stringify(result, null, 2));
+                }
+                // Admin actions — route through /gc/a2a_admin
+                case "register":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "register",
+                        agent_name: params.agent_name,
+                        card_url: params.card_url,
+                        cascade_priority: params.cascade_priority,
+                    });
+                case "inbox":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "inbox",
+                        worker_agent: params.worker_agent,
+                    });
+                case "respond":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "respond",
+                        task_id: params.task_id,
+                        state: params.state,
+                        message: params.message,
+                    });
+                case "list":
+                    return daemonCall("/gc/a2a_admin", {
+                        action: "list",
+                        state: params.state,
+                        worker_agent: params.worker_agent,
+                    });
+                default:
+                    return err(`Unknown A2A action: ${params.action}`);
+            }
+        }
+        catch (e) {
+            return err(`gc_a2a error: ${activeShared.describeError(e)}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // DAEMON TOOLS — Hot Config Reload
+    // ════════════════════════════════════════════════════════════════
+    registerTool("gc_reload", {
+        description: `Runtime config reload control plane for YAML/TOML-backed operator config.
+Supports status, preview, apply, selective targets, safe bulk reload, and legacy section-based requests.
+
+Actions:
+  - status:  Show current reload targets and their live-safe status.
+  - preview: Dry-run — show what would change without applying.
+  - apply:   Apply the reload for the specified target(s).
+
+Targets (examples):
+  providers, api_keys, env, paths, telegram_routing, telegram_bot_token,
+  vault, a2a_auth, mcp_client, llm_core_providers, llm_core_routing,
+  workflows, personas, session_registry, sync_rules, project_registry
+
+Use after: editing secrets.toml or YAML config, swapping models in LM Studio,
+rotating API keys, updating workflow definitions, or reloading llm_core.toml
+provider definitions such as custom CLI providers.
+
+Legacy section names (providers, api, env, paths, telegram, vault, a2a, mcp, llm_core)
+are still accepted via the section parameter for backward compatibility.`,
+        inputSchema: z.object({
+            action: z
+                .enum(["status", "preview", "apply"])
+                .optional()
+                .describe("Reload action: status (inspect), preview (dry-run), or apply (execute). Defaults to status."),
+            target: z
+                .string()
+                .optional()
+                .describe("Single reload target (e.g. providers, api_keys, env, paths, telegram_routing, vault, a2a_auth, mcp_client, llm_core_providers, llm_core_routing, workflows, personas, session_registry, sync_rules, project_registry)."),
+            targets: z
+                .array(z.string())
+                .optional()
+                .describe("Multiple reload targets. Use all_safe=true or omit targets to apply all safe targets."),
+            all_safe: zBoolean()
+                .optional()
+                .describe("Expand to all live-safe targets (excludes dangerous-sync and restart-required targets)."),
+            section: z
+                .string()
+                .optional()
+                .describe("Legacy compatibility: section name (providers, api, env, paths, telegram, vault, a2a, mcp, llm_core)."),
+        }),
+    }, async (params) => daemonCall("/gc/reload", params));
+    registerTool("davinci_resolve", {
+        description: `Control DaVinci Resolve Studio via scripting API. Requires Resolve to be running.
+Actions: status, list_projects, open_project, save_project, list_timelines, get_timeline, set_timeline,
+get_clips, get_markers, add_marker, delete_markers, set_playhead, open_page, media_pool, clip_metadata,
+render_setup, add_render_job, render_queue, start_render, stop_render, render_status, render_formats,
+delete_render_jobs, export_timeline, grab_still, export_frame, project_settings, timeline_settings,
+create_timeline, import_media, create_subtitles, detect_scene_cuts, transcribe_audio, node_graph,
+set_lut, copy_grades, quick_export, media_storage.`,
+        inputSchema: z.object({
+            action: z
+                .enum([
+                "status",
+                "list_projects",
+                "open_project",
+                "save_project",
+                "list_timelines",
+                "get_timeline",
+                "set_timeline",
+                "get_clips",
+                "get_markers",
+                "add_marker",
+                "delete_markers",
+                "set_playhead",
+                "open_page",
+                "media_pool",
+                "clip_metadata",
+                "render_setup",
+                "add_render_job",
+                "render_queue",
+                "start_render",
+                "stop_render",
+                "render_status",
+                "render_formats",
+                "delete_render_jobs",
+                "export_timeline",
+                "grab_still",
+                "export_frame",
+                "project_settings",
+                "timeline_settings",
+                "create_timeline",
+                "import_media",
+                "create_subtitles",
+                "detect_scene_cuts",
+                "transcribe_audio",
+                "node_graph",
+                "set_lut",
+                "copy_grades",
+                "quick_export",
+                "media_storage",
+            ])
+                .describe("Action to perform"),
+            name: z.string().optional().describe("Project/timeline name"),
+            index: zNumber().optional().describe("Timeline index (1-based)"),
+            timeline: z.string().optional().describe("Timeline name"),
+            track_type: z
+                .string()
+                .optional()
+                .describe("Track type: video, audio, subtitle"),
+            track_index: zNumber().optional().describe("Track index (1-based)"),
+            frame_id: zNumber().optional().describe("Frame position for marker"),
+            color: z.string().optional().describe("Marker color"),
+            note: z.string().optional().describe("Marker note"),
+            duration: zNumber().optional().describe("Marker duration in frames"),
+            custom_data: z.string().optional().describe("Marker custom data"),
+            source: z.string().optional().describe("Marker source: timeline or clip"),
+            target: z
+                .string()
+                .optional()
+                .describe("Target for marker: timeline or clip"),
+            clip_name: z.string().optional().describe("Clip name"),
+            timecode: z.string().optional().describe("Timecode (HH:MM:SS:FF)"),
+            page: z
+                .string()
+                .optional()
+                .describe("Page: media, cut, edit, fusion, color, fairlight, deliver"),
+            folder: z.string().optional().describe("Media pool folder path"),
+            set_metadata: z.any().optional().describe("Metadata dict to set on clip"),
+            paths: z.array(z.string()).optional().describe("File paths for import"),
+            target_dir: z.string().optional().describe("Render output directory"),
+            filename: z.string().optional().describe("Output filename"),
+            format: z.string().optional().describe("Render format"),
+            codec: z.string().optional().describe("Render codec"),
+            width: zNumber().optional().describe("Output width"),
+            height: zNumber().optional().describe("Output height"),
+            quality: z.any().optional().describe("Video quality"),
+            export_video: zBoolean().optional().describe("Export video track"),
+            export_audio: zBoolean().optional().describe("Export audio track"),
+            job_id: z.string().optional().describe("Render job ID"),
+            job_ids: z
+                .array(z.string())
+                .optional()
+                .describe("Render job IDs to start"),
+            all: zBoolean().optional().describe("Apply to all"),
+            file_path: z.string().optional().describe("File path for export"),
+            export_type: z
+                .string()
+                .optional()
+                .describe("Export type: AAF, EDL, FCPXML_1_10, CSV, OTIO, etc."),
+            key: z.string().optional().describe("Settings key"),
+            value: z.any().optional().describe("Settings value"),
+            language: z
+                .string()
+                .optional()
+                .describe("Language for subtitles/transcription"),
+            node_index: zNumber().optional().describe("Node index (1-based)"),
+            lut_path: z.string().optional().describe("LUT file path"),
+            target_clips: z
+                .array(z.string())
+                .optional()
+                .describe("Target clip names for grade copy"),
+            preset: z.string().optional().describe("Quick export preset name"),
+            path: z.string().optional().describe("Media storage path"),
+        }),
+    }, async (params) => {
+        const { action, ...rest } = params;
+        const cleanParams = {};
+        for (const [k, v] of Object.entries(rest)) {
+            if (v !== undefined && v !== null)
+                cleanParams[k] = v;
+        }
+        try {
+            const bridgePath = getResolveBridgePath();
+            const input = JSON.stringify({ action, params: cleanParams });
+            const raw = execSync(`/opt/homebrew/bin/python3 "${bridgePath}"`, {
+                input,
+                encoding: "utf-8",
+                timeout: 60000,
+                maxBuffer: 10 * 1024 * 1024,
+                env: {
+                    ...process.env,
+                    RESOLVE_SCRIPT_API: "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting",
+                    RESOLVE_SCRIPT_LIB: "/Applications/DaVinci Resolve/DaVinci Resolve.app/Contents/Libraries/Fusion/fusionscript.so",
+                    PYTHONPATH: "/Library/Application Support/Blackmagic Design/DaVinci Resolve/Developer/Scripting/Modules/",
+                },
+            }).trim();
+            const result = JSON.parse(raw);
+            if (!result.ok)
+                throw new Error(result.error || "Unknown bridge error");
+            return text(JSON.stringify(result.data, null, 2));
+        }
+        catch (e) {
+            return err(`DaVinci Resolve ${action}: ${e.message}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // STANDALONE TOOL — DEVONthink
+    // ════════════════════════════════════════════════════════════════
+    function runAppleScript(script) {
+        return execSync(`osascript -e '${script.replace(/'/g, "'\\''")}'`, {
+            encoding: "utf-8",
+            timeout: 30000,
+            maxBuffer: 10 * 1024 * 1024,
+        }).trim();
+    }
+    function escapeForAS(s) {
+        return s.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+    }
+    registerTool("devonthink", {
+        description: `Search and retrieve documents from DEVONthink.
+Actions: search (full-text search), similar (find similar documents), read (get plain text by UUID), databases (list all).`,
+        inputSchema: z.object({
+            action: z
+                .enum(["search", "similar", "read", "databases"])
+                .describe("Action to perform"),
+            query: z
+                .string()
+                .optional()
+                .describe("Search query (supports AND, OR, NOT, NEAR, wildcards, phrase quotes)"),
+            uuid: z
+                .string()
+                .optional()
+                .describe("Document UUID (for read and similar)"),
+            limit: zNumber().optional().describe("Max results (default 20, max 50)"),
+            database: z
+                .string()
+                .optional()
+                .describe("Database name to search in (omit for all)"),
+            content_length: zNumber()
+                .optional()
+                .describe("Max chars of content per search result (default 200, 0 for metadata only)"),
+        }),
+    }, async (params) => {
+        const { action, query, uuid, database, content_length } = params;
+        const limit = Math.min(params.limit || 20, 50);
+        const snippetLen = content_length ?? 200;
+        try {
+            switch (action) {
+                case "databases": {
+                    const script = `
+tell application id "DNtp"
+  set output to ""
+  repeat with db in databases
+    set dbName to name of db
+    set dbCount to count of contents of db
+    set output to output & dbName & " ||| " & dbCount & linefeed
+  end repeat
+  return output
+end tell`;
+                    const result = runAppleScript(script);
+                    const lines = result
+                        .split("\n")
+                        .filter((l) => l.trim())
+                        .map((l) => {
+                        const [name, count] = l.split(" ||| ");
+                        return `- **${name}**: ${count} records`;
+                    });
+                    return text(lines.join("\n"));
+                }
+                case "search": {
+                    if (!query)
+                        return err("Error: query is required for search action");
+                    const dbClause = database
+                        ? `in database "${escapeForAS(database)}"`
+                        : "";
+                    const script = `
+tell application id "DNtp"
+  set results to search "${escapeForAS(query)}" ${dbClause}
+  set output to ""
+  set maxItems to ${limit}
+  if (count of results) < maxItems then set maxItems to (count of results)
+  set totalCount to count of results
+  repeat with i from 1 to maxItems
+    set rec to item i of results
+    set recName to name of rec
+    set recType to type of rec as string
+    set recLoc to location of rec
+    set recUUID to uuid of rec
+    set recDate to modification date of rec
+    set recSize to size of rec
+    set recTags to ""
+    try
+      set recTags to (tags of rec) as string
+    end try
+    set snippet to ""
+    ${snippetLen > 0
+                        ? `try
+      set theText to plain text of rec
+      if length of theText > ${snippetLen} then
+        set snippet to text 1 thru ${snippetLen} of theText
+      else
+        set snippet to theText
+      end if
+    end try`
+                        : ""}
+    set output to output & "<<RECORD>>" & recName & "<<F>>" & recType & "<<F>>" & recLoc & "<<F>>" & recUUID & "<<F>>" & (recDate as string) & "<<F>>" & recSize & "<<F>>" & recTags & "<<F>>" & snippet & linefeed
+  end repeat
+  return (totalCount as string) & "<<TOTAL>>" & output
+end tell`;
+                    const raw = runAppleScript(script);
+                    const [totalPart, ...rest] = raw.split("<<TOTAL>>");
+                    const totalCount = parseInt(totalPart) || 0;
+                    const records = rest
+                        .join("<<TOTAL>>")
+                        .split("<<RECORD>>")
+                        .filter((r) => r.trim());
+                    let output = `## DEVONthink Search: "${query}"\n`;
+                    output += `**${totalCount} total results** (showing ${Math.min(limit, totalCount)})\n\n`;
+                    for (const rec of records) {
+                        const [name, type, location, recUuid, date, size, tags, snippet] = rec.split("<<F>>");
+                        output += `### ${name?.trim()}\n`;
+                        output += `- **Type:** ${type?.trim()} | **Location:** ${location?.trim()}\n`;
+                        output += `- **UUID:** \`${recUuid?.trim()}\` | **Modified:** ${date?.trim()} | **Size:** ${size?.trim()} bytes\n`;
+                        if (tags?.trim())
+                            output += `- **Tags:** ${tags.trim()}\n`;
+                        if (snippet?.trim())
+                            output += `- **Preview:** ${snippet.trim().replace(/\n/g, " ").substring(0, snippetLen)}…\n`;
+                        output += "\n";
+                    }
+                    return text(output);
+                }
+                case "similar": {
+                    if (!uuid)
+                        return err("Error: uuid is required for similar action");
+                    const script = `
+tell application id "DNtp"
+  set rec to get record with uuid "${escapeForAS(uuid)}"
+  set sourceName to name of rec
+  set similar to compare record rec
+  set output to ""
+  set maxItems to ${limit}
+  if (count of similar) < maxItems then set maxItems to (count of similar)
+  set totalCount to count of similar
+  repeat with i from 1 to maxItems
+    set simRec to item i of similar
+    set recName to name of simRec
+    set recType to type of simRec as string
+    set recLoc to location of simRec
+    set recUUID to uuid of simRec
+    set recSize to size of simRec
+    set output to output & "<<RECORD>>" & recName & "<<F>>" & recType & "<<F>>" & recLoc & "<<F>>" & recUUID & "<<F>>" & recSize & linefeed
+  end repeat
+  return sourceName & "<<SOURCE>>" & (totalCount as string) & "<<TOTAL>>" & output
+end tell`;
+                    const raw = runAppleScript(script);
+                    const [sourceName, rest1] = raw.split("<<SOURCE>>");
+                    const [totalPart2, ...rest2] = rest1.split("<<TOTAL>>");
+                    const totalCount2 = parseInt(totalPart2) || 0;
+                    const records2 = rest2
+                        .join("<<TOTAL>>")
+                        .split("<<RECORD>>")
+                        .filter((r) => r.trim());
+                    let output = `## Documents Similar to: "${sourceName?.trim()}"\n`;
+                    output += `**${totalCount2} similar documents** (showing ${Math.min(limit, totalCount2)})\n\n`;
+                    for (let i = 0; i < records2.length; i++) {
+                        const [name, type, location, recUuid, size] = records2[i].split("<<F>>");
+                        output += `${i + 1}. **${name?.trim()}** (${type?.trim()})\n`;
+                        output += `   Location: ${location?.trim()} | UUID: \`${recUuid?.trim()}\` | Size: ${size?.trim()} bytes\n`;
+                    }
+                    return text(output);
+                }
+                case "read": {
+                    if (!uuid)
+                        return err("Error: uuid is required for read action");
+                    const script = `
+tell application id "DNtp"
+  set rec to get record with uuid "${escapeForAS(uuid)}"
+  set recName to name of rec
+  set recType to type of rec as string
+  set recLoc to location of rec
+  set recPath to path of rec
+  set recDate to modification date of rec
+  set recTags to ""
+  try
+    set recTags to (tags of rec) as string
+  end try
+  set theText to plain text of rec
+  return recName & "<<F>>" & recType & "<<F>>" & recLoc & "<<F>>" & recPath & "<<F>>" & (recDate as string) & "<<F>>" & recTags & "<<F>>" & theText
+end tell`;
+                    const raw = runAppleScript(script);
+                    const parts = raw.split("<<F>>");
+                    const [name, type, location, path, date, tags, ...textParts] = parts;
+                    const docText = textParts.join("<<F>>");
+                    let output = `## ${name?.trim()}\n`;
+                    output += `- **Type:** ${type?.trim()} | **Location:** ${location?.trim()}\n`;
+                    output += `- **Path:** ${path?.trim()}\n`;
+                    output += `- **Modified:** ${date?.trim()}\n`;
+                    if (tags?.trim())
+                        output += `- **Tags:** ${tags.trim()}\n`;
+                    output += `\n---\n\n${docText}`;
+                    return text(output);
+                }
+                default:
+                    return err(`Unknown action: ${action}`);
+            }
+        }
+        catch (e) {
+            return err(`DEVONthink error: ${e.message}`);
+        }
+    });
+    // ════════════════════════════════════════════════════════════════
+    // STANDALONE TOOL — GitHub Issues (gh CLI)
+    // ════════════════════════════════════════════════════════════════
+    // Read-only convenience default, supplied by the environment. Deliberately no
+    // baked-in fallback: a shipped repository name aims every installation's bare
+    // calls at whatever tracker the author happened to be working on.
+    //
+    // This default is honoured by the READ tools only. The write tools require an
+    // explicit `repo` — see the note on gh_issue_create.
+    const GH_DEFAULT_REPO = process.env.GH_DEFAULT_REPO ?? "";
+    const GH_TOKEN_PATH = resolve(homedir(), ".config", "gh-token");
+    function getGhToken() {
+        if (process.env.GH_TOKEN)
+            return process.env.GH_TOKEN;
+        if (existsSync(GH_TOKEN_PATH))
+            return readFileSync(GH_TOKEN_PATH, "utf-8").trim();
+        throw new Error(`No GitHub token. Set GH_TOKEN env var or put token in ${GH_TOKEN_PATH}`);
+    }
+    function gh(args, repo) {
+        const r = repo || GH_DEFAULT_REPO;
+        if (!r) {
+            throw new Error("No repository. Pass `repo` as owner/repo, or set GH_DEFAULT_REPO in the environment for read-only defaults.");
+        }
+        const token = getGhToken();
+        return execFileSync("gh", [...args, "-R", r], {
+            encoding: "utf-8",
+            timeout: 15000,
+            env: { ...process.env, GH_TOKEN: token },
+        }).trim();
+    }
+    registerTool("gh_issues", {
+        description: `List GitHub issues. Filter by state, assignee, labels. Repo falls back to $GH_DEFAULT_REPO when omitted.`,
+        inputSchema: z.object({
+            repo: z
+                .string()
+                .optional()
+                .describe("owner/repo — defaults to $GH_DEFAULT_REPO when omitted"),
+            state: z.string().optional().describe("open|closed|all (default: open)"),
+            assignee: z.string().optional().describe("GitHub username filter"),
+            labels: z.string().optional().describe("Comma-separated labels"),
+            limit: zNumber().optional().describe("Max results (default: 30)"),
+        }),
+    }, async (params) => {
+        const parts = ["issue", "list", "--state", params.state || "open"];
+        parts.push("--limit", String(params.limit || 30));
+        if (params.assignee)
+            parts.push("--assignee", params.assignee);
+        if (params.labels)
+            parts.push("--label", params.labels);
+        parts.push("--json", "number,title,state,assignees,labels,createdAt");
+        parts.push("--jq", '.[] | "#\\(.number) [\\(.assignees | map(.login) | join(\",\"))] \\(.title) (\\(.labels | map(.name) | join(\",\")))"');
+        try {
+            const result = gh(parts, params.repo);
+            return text(result || "No issues found.");
+        }
+        catch (e) {
+            return err(`Error: ${e.message}`);
+        }
+    });
+    registerTool("gh_issue_create", {
+        description: `Create a GitHub issue. Returns the issue URL.`,
+        inputSchema: z.object({
+            title: z.string().describe("Issue title"),
+            body: z.string().describe("Issue body (markdown)"),
+            // Required, unlike the read tools. A write that infers its target from
+            // ambient config will eventually file into the wrong tracker, and the
+            // caller who omitted it gets no signal that it happened.
+            repo: z
+                .string()
+                .describe("owner/repo — required; a write never infers its target"),
+            assignee: z.string().optional().describe("GitHub username to assign"),
+            labels: z.string().optional().describe("Comma-separated labels"),
+        }),
+    }, async (params) => {
+        const parts = ["issue", "create", "--title", params.title, "--body", params.body];
+        if (params.assignee)
+            parts.push("--assignee", params.assignee);
+        if (params.labels)
+            parts.push("--label", params.labels);
+        try {
+            const result = gh(parts, params.repo);
+            return text(result);
+        }
+        catch (e) {
+            return err(`Error: ${e.message}`);
+        }
+    });
+    registerTool("gh_issue_view", {
+        description: `View a single GitHub issue with full body and comments.`,
+        inputSchema: z.object({
+            number: zNumber().describe("Issue number"),
+            repo: z
+                .string()
+                .optional()
+                .describe("owner/repo — defaults to $GH_DEFAULT_REPO when omitted"),
+        }),
+    }, async (params) => {
+        try {
+            const result = gh([
+                "issue",
+                "view",
+                String(params.number),
+                "--json",
+                "number,title,state,body,assignees,labels,comments",
+                "--jq",
+                '"#\\(.number) [\\(.state)] \\(.title)\\nAssigned: \\(.assignees | map(.login) | join(\", \"))\\nLabels: \\(.labels | map(.name) | join(\", \"))\\n\\n\\(.body)\\n\\n--- Comments (\\(.comments | length)) ---\\n\\(.comments | map("\\(.author.login): \\(.body)") | join("\\n\\n"))"',
+            ], params.repo);
+            return text(result);
+        }
+        catch (e) {
+            return err(`Error: ${e.message}`);
+        }
+    });
+    registerTool("gh_issue_edit", {
+        description: `Edit a GitHub issue — change assignee, labels, title, or state.`,
+        inputSchema: z.object({
+            number: zNumber().describe("Issue number"),
+            // Required — see gh_issue_create. This tool also closes and reopens, so
+            // an inferred target could change the state of someone else's issue.
+            repo: z
+                .string()
+                .describe("owner/repo — required; a write never infers its target"),
+            title: z.string().optional().describe("New title"),
+            assignee: z.string().optional().describe("Set assignee"),
+            add_labels: z
+                .string()
+                .optional()
+                .describe("Comma-separated labels to add"),
+            remove_labels: z
+                .string()
+                .optional()
+                .describe("Comma-separated labels to remove"),
+            state: z.string().optional().describe("open or closed"),
+        }),
+    }, async (params) => {
+        const results = [];
+        if (params.state) {
+            try {
+                const cmd = params.state === "closed" ? "close" : "reopen";
+                results.push(gh(["issue", cmd, String(params.number)], params.repo));
+            }
+            catch (e) {
+                results.push(`State change error: ${e.message}`);
+            }
+        }
+        const editParts = ["issue", "edit", String(params.number)];
+        let hasEdit = false;
+        if (params.title) {
+            editParts.push("--title", params.title);
+            hasEdit = true;
+        }
+        if (params.assignee !== undefined) {
+            editParts.push("--add-assignee", params.assignee);
+            hasEdit = true;
+        }
+        if (params.add_labels) {
+            editParts.push("--add-label", params.add_labels);
+            hasEdit = true;
+        }
+        if (params.remove_labels) {
+            editParts.push("--remove-label", params.remove_labels);
+            hasEdit = true;
+        }
+        if (hasEdit) {
+            try {
+                results.push(gh(editParts, params.repo));
+            }
+            catch (e) {
+                results.push(`Edit error: ${e.message}`);
+            }
+        }
+        return text(results.filter(Boolean).join("\n") || `Issue #${params.number} updated.`);
+    });
+    registerTool("gh_issue_comment", {
+        description: `Add a comment to a GitHub issue.`,
+        inputSchema: z.object({
+            number: zNumber().describe("Issue number"),
+            body: z.string().describe("Comment body (markdown)"),
+            // Required — see gh_issue_create.
+            repo: z
+                .string()
+                .describe("owner/repo — required; a write never infers its target"),
+        }),
+    }, async (params) => {
+        try {
+            const result = gh(["issue", "comment", String(params.number), "--body", params.body], params.repo);
+            return text(result || `Commented on #${params.number}.`);
+        }
+        catch (e) {
+            return err(`Error: ${e.message}`);
+        }
+    });
+    return handles;
+}
+//# sourceMappingURL=tools.js.map
