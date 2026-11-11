@@ -3,7 +3,7 @@
 - **Bee:** GC-7182.
 - **Repo:** gc_mcp.
 - **Branch:** `gc/7182-schema-reload`, from `master` 4496e1d.
-- **Status:** design, before implementation.
+- **Status:** design rev 2, before implementation. Rev 2 folds design audit round 1 (`audits/audit-gc-7182-design-round1.md`), which found 2 high, 2 medium and 3 low.
 
 ## 1. The problem
 
@@ -15,93 +15,140 @@ A real case: a session started 2026-11-02 rejected `gc_dispatch action: cancel`,
 - `src/index.ts` is a single module.
   - It builds the server in `buildMcpServer()` (`:1000-1995`), registers 65 tools through a wrapper that adds strict root validation and delegation delivery (`:1041-1064`), and overrides `tools/list` to inline local `$ref`s (`:5970-5992`).
   - Its last statement calls `main()`, which connects stdio and/or starts the streamable-HTTP listener (`:6158-6175`).
-- Per-connection state is created inside `buildMcpServer()`: `connection = newConnection()` (`:1034`). That is the GC-6860 delivery address `gcmcp-<uuid>` and its pending acknowledgements (`:79-102`).
-- SDK 1.32.1 (`@modelcontextprotocol/sdk`) already declares `tools: { listChanged: true }` once a tool is registered. A registered tool can be removed (`RegisteredTool.remove()`), and both registering and removing on a connected server send `notifications/tools/list_changed`.
+- **Module-level state that must outlive a reload:**
+  - `daemonDispatcher`, the undici Agent (`:55-62`);
+  - `callStore`, the AsyncLocalStorage that carries each call's connection (`:98`);
+  - `unconfirmedTurnKeys`, GC-7152's at-least-once turn keys (`:554`), with `turnKeyFor`, `finishTurnKey`, `turnKeyKept` and `isClientCutShort` (`:531`, `:583-628`, which the tests import).
+- **Per-connection state:** `newConnection()` (`:100`), created inside `buildMcpServer()` (`:1034`).
+- **SDK 1.32.1 facts, verified in round 1:**
+  - `McpServer` declares `tools.listChanged: true`.
+  - `RegisteredTool.remove()` exists.
+  - Registering or removing a tool on a connected server sends `notifications/tools/list_changed`, once per operation (`mcp.js:690`, `:695`).
+  - The SDK installs its `tools/list` and `tools/call` handlers once per server, lazily, on the first `registerTool` (`mcp.js:96-99`, `:694`).
+  - `setRequestHandler` replaces any existing handler (`shared/protocol.js:912-920`).
+  - A `tools/call` captures the tool object before it runs (`mcp.js:142`), so a removal does not disturb a running call.
 
 ## 2. Decision
 
-**Split the module into a stable entry and a reloadable tool module. Re-register the tools in place when the built tool module changes. Tell the client through `tools/list_changed`, and tell the agent through a stale-build notice until the client re-lists.**
+**Split the module into a stable entry that owns all setup and state, and a reloadable tool module that holds only tool code. Re-register the tools in place when the built tool module changes. Tell the client through `tools/list_changed`, and tell the agent through a stale-build notice until the client re-lists.**
 
-### 2.1 Module split
+### 2.1 Module split and ownership (round 1, Findings 1–3)
 
-1. **`src/tools.ts`** (new, built to `dist/tools.js`) holds everything that defines tools: the helpers, `daemonFetch`, delivery, schemas and all 65 registrations.
-   - It exports `registerTools(server, connection)`. That function performs today's `buildMcpServer()` body after `new McpServer(...)`: the registration wrapper, every `registerTool`, and the `tools/list` shaping.
-   - It also exports `BUILD_ID`, a string fixed at build time. It is the package version plus a hash of the module's own source text, computed when the module is evaluated.
-   - **It imports no local module,** only `node:*` and `node_modules`. This keeps a cache-busted re-import complete (§2.2). Test 1 enforces it.
-   - It has no top-level side effects beyond defining constants.
-2. **`src/index.ts`** (the entry, still `dist/index.js`) keeps the bin path that clients are configured with. It owns:
-   - `new McpServer(...)` with its name, version and instructions. The instructions stay in the entry, because they are part of `initialize`, which a client reads once.
-   - `newConnection()`: per-connection state survives a reload, so delegation delivery keeps its address and pending acknowledgements;
-   - the transports and `main()`;
-   - the reload watcher (§2.2) and the notice (§2.3).
+1. **`src/index.ts`, the entry (built to `dist/index.js`)**, keeps the bin path clients are configured with, and never reloads. It owns everything set up once or holding state:
+   - **Process-wide `shared`**, created once:
+     - `daemonDispatcher` and `daemonFetch`, the only undici Agent;
+     - `callStore`;
+     - the turn-key store `unconfirmedTurnKeys` and its four functions, which `dist/index.js` re-exports so `test/agent-conversation-turn-key.mjs` keeps working;
+     - `noteInlineSeq`;
+     - `GC_BASE`.
+   - **Per server**:
+     - `new McpServer(...)` with its name, version and instructions;
+     - its `connection` (`newConnection()`);
+     - its notice state (§2.3);
+     - the handles the current registration returned.
+   - **Installed once per server, never re-run:**
+     - the `registerTool` wrapper (strict root schema, `callStore.run`, `deliver()`, the notice);
+     - after the first `registerTools`, the `tools/list` override (the `$ref` inlining, plus setting `relisted`).
+     - The override has to come after that first call because the SDK installs its own handler lazily on the first `registerTool`.
+   - Delivery: `deliver()` and `serialized()`.
+   - The transports, `main()`, the server registry and the watcher (§2.2).
+2. **`src/tools.ts`, the tool module (built to `dist/tools.js`)**, holds the 65 registrations and their tool-local helpers: schemas, formatters and the per-tool HTTP shaping. It exports:
+   - **`registerTools(server, shared): RegisteredTool[]`.**
+     - It calls `server.registerTool` 65 times. On a live server that is the entry's wrapper, so nothing is wrapped twice.
+     - It returns the handles.
+     - It reaches daemon HTTP, `callStore`, the turn-key store and `noteInlineSeq` only through `shared`. It assigns `shared` to a module-level `let` on each call. Every server passes the same `shared`, so that is safe.
+   - **Build labels.** There is no build-id export. The entry labels each load as `tools.js@<mtime ISO-8601>`, from the `mtimeMs` the watcher already holds; the first load uses the file's `mtime` at startup. That keeps `tools.ts` free of evaluation-time reads (round 1, Finding 7).
+   - **Purity rules:**
+     - No local imports, static or dynamic, so a cache-busted re-import is complete. Test 1 enforces this.
+     - No top-level side effects beyond defining constants and functions: no Agent, no timers, no env-driven I/O.
+     - `GH_DEFAULT_REPO` and the gh token path stay simple constant reads, which are acceptable.
 
-   The entry imports `./tools.js` statically for the first load. That keeps the existing tests, which `import("../dist/index.js")` and capture the server through `McpServer.prototype.connect`, working unchanged.
+   The entry imports `./tools.js` statically for the first load. Existing tests that `import("../dist/index.js")` and capture the server through `McpServer.prototype.connect` therefore see the same 65 tools.
 
 ### 2.2 Reload
 
-- **Detection.** The entry polls `dist/tools.js` every 5 s, comparing `mtime` and `size` (`fs.stat`).
-  - A change counts only when two consecutive polls agree. `tsc` writes files one at a time, and this avoids reading a half-written build.
-  - Polling, not `fs.watch`. A watch is unreliable across editors and atomic renames, and costs more to get right than a 5 s stat.
-  - The timer is `unref()`'d, so it never keeps the process alive.
+- **Registry.** The entry keeps `{current: toolsModule, servers: Set<{server, connection, notice, handles}>}`.
+  - The stdio server and every HTTP session register in it on creation and unregister on close.
+  - `sessions` stays local to the HTTP listener, but its factory calls `registry.add(...)`.
+- **Detection.** A 5 s `unref()`'d timer `fs.stat`s two files: `dist/tools.js` (or `GC_MCP_TOOLS_PATH`) and the entry's own file (or `GC_MCP_ENTRY_PATH`).
+  - A change counts only when two consecutive polls agree on `mtimeMs` and `size`, so a half-written `tsc` output is never read.
+  - Polling is used rather than `fs.watch`, because a watch is unreliable across editors and atomic renames.
 - **Load.** `await import(pathToFileURL(toolsPath).href + "?v=" + mtimeMs)`.
-  - Node caches ES modules by URL, so the query string evaluates the new file. The superseded module stays in memory, which is acceptable for a rare event.
-  - Because `tools.js` imports no local module, the new code is the whole tool surface.
-- **Swap.** This runs for every live `McpServer` the entry owns: the stdio one, and each HTTP session in `sessions`.
-  1. Build the new registrations first. The new module's `registerTools` runs against a **scratch** `McpServer` whose `connect` is never called. If it throws, nothing is swapped (see Failure, below).
-  2. Then, on the live server:
-     - call `remove()` on every tool the entry recorded as registered;
-     - call the new module's `registerTools(server, connection)` with the same `connection` object.
+  - Node caches ES modules by URL, so the query evaluates the new file.
+  - The superseded module stays in memory. That costs one module per reload; the module holds no Agent and no timers.
+- **Validate.** Call the new module's `registerTools` on a **scratch** `McpServer` that never connects, with its wrapper installed the same way, and the real `shared`. Registration makes no daemon calls, so the scratch run has no side effects.
+  - If the import or this registration throws, nothing is swapped. The entry records `{failed: mtimeMs, error}` and does not retry that `mtimeMs`.
+  - The scratch run catches load-time and schema-construction errors. It cannot catch errors that only appear when a tool is called; those surface as tool errors, the same as on a fresh start.
+- **Swap (round 1, Finding 4).** For each registered server, run this as **one synchronous block with no `await` inside**:
+  1. `handles.forEach((h) => h.remove())`;
+  2. `handles = registry.current.registerTools(server, shared)`;
+  3. set the notice to "reloaded".
 
-     `remove()` and `registerTool` each make the SDK send `notifications/tools/list_changed`. That costs a burst of notifications for one reload.
-  3. New HTTP sessions created after the swap use the new module.
-- **In-flight calls.** A tool call already running keeps the closure it started with and finishes on the old code. Calls that arrive after the swap use the new registrations. No call is cancelled.
-- **Failure.**
-  - If the import or the scratch registration throws, the live tools stay as they are. The entry records `{failed_build: mtime, error: message}` and does not retry that same `mtime`.
-  - The notice (§2.3) reports the failure.
-- **Opt-out.** `GC_MCP_RELOAD=0` disables the watcher (for example when running a published npm package from a read-only install).
+  Because the block is one JS task, no incoming `tools/call` or `tools/list` can observe an empty or partial set. The code carries a comment saying so, so a later refactor does not open the window.
+  - The block emits about 130 `list_changed` notifications per server, one per remove and one per register. That is the accepted cost of the public API. `RegisteredTool.update` cannot take a new ZodObject schema (`mcp.js:678-679`), so remove plus register is the right primitive.
+  - A client that re-lists on the first notification still reads the final set, because the notifications are sent from within the same task and are processed after it.
+- **New HTTP sessions** take `registry.current` when they register. A session whose `initialize` lands while an import is in progress gets whichever module is current when it registers. If that is the old one, it is still in the registry and is swapped with the rest, because the swap iterates the registry after the import resolves.
+- **In-flight calls** keep the closure they started with and finish on the old code. No call is cancelled.
+- **Opt-out.** `GC_MCP_RELOAD=0` disables the watcher.
 
-### 2.3 Stale-build notice
+### 2.3 Stale-build notice (round 1, Findings 2 and 7)
 
-A client may ignore `tools/list_changed`. Claude Code's handling of it is not something this repo controls. The server cannot tell whether the client acted on it, except by seeing a fresh `tools/list` request.
+The notice state is per server, in the entry: `{state: "fresh" | "reloaded" | "failed" | "entry_changed", from, to, error}`.
+- The `tools/list` override sets `relisted`: a `"reloaded"` notice goes back to `"fresh"` once the client re-lists.
+- The wrapper appends at most **one** notice item to each **successful** tool result. It goes after any delegation block, as a separate text content item, so JSON results still parse.
+- A refused unknown action is an SDK-generated error that never reaches the wrapper (`mcp.js:181`). So the notice reaches the agent on its next successful call, which is enough to explain the refusal.
 
-- After a successful swap, the entry sets `relisted = false` for that server. Its `tools/list` handler sets it back to `true`.
-- While `relisted` is false, the delivery wrapper appends one text content item to every tool result, after any delegation block, so JSON results still parse:
-  `[gc_mcp] Tools were reloaded from a newer build (<old BUILD_ID> → <new BUILD_ID>). If an action you expect is refused as unknown, reconnect the gc MCP server.`
-- After a failed reload, the item reads:
-  `[gc_mcp] A newer build failed to load (<error, first 200 characters>); still serving <BUILD_ID>.`
-  It shows until a later reload succeeds.
-- **Entry changes are not reloadable.** If `dist/index.js` itself changes (its `mtime` is polled with `tools.js`), the item reads:
-  `[gc_mcp] The gc_mcp entry was rebuilt; reconnect the gc MCP server to load it.`
-  The entry is small and changes rarely, but a change to it must not pass silently.
+The three texts:
+- **`reloaded`:** `[gc_mcp] Tools were reloaded from a newer build (`<from>` → `<to>`, as `tools.js@<mtime>` labels). If an action you expect is refused as unknown, reconnect the gc MCP server.` It shows until the client issues `tools/list`.
+- **`failed`:** `[gc_mcp] A newer build failed to load (<error, first 200 characters>); still serving <from>.` It shows until a later reload succeeds.
+- **`entry_changed`:** `[gc_mcp] The gc_mcp entry was rebuilt; reconnect the gc MCP server to load it.` It is permanent for that process. If more than one state applies, `entry_changed` wins. A tools reload still runs alongside it.
 
 ### 2.4 Scope
 
 - No daemon change.
 - No change to any tool's name, schema or behaviour.
-- `instructions` stay entry-owned. Changing them still needs a reconnect, and they are not covered by the notice. They change rarely, and their content is advisory text, not a schema.
-- `package.json` `files` must include `dist/tools.js`.
+- `instructions` stay owned by the entry. Changing them still needs a reconnect, and the notice does not cover them, because they are advisory text and rarely change.
+- **Packaging:**
+  - `package.json` `files` must ship `dist/tools.js`.
+  - `bin` and `main` stay `dist/index.js`.
 
 ## 3. Tests
 
-These are added to `npm test`, as `.mjs` files like the existing ones.
+All tests are added to `npm test`. Each one that copies `dist/` puts the copy under the repo's `.tmp/` directory, which is gitignored, so bare-specifier imports resolve against `node_modules` (round 1, Finding 6).
 
-1. **Purity.** `dist/tools.js` contains no `import … from "./` or `"../`.
-2. **Split parity.** Importing `dist/index.js` (the existing capture pattern) registers the same 65 tool names, with the same input schemas, as `master`. Compare against a snapshot of the names and of `tools/list` output generated from 4496e1d and committed with the test.
+1. **Purity.** `dist/tools.js` contains no static `import … from "./"` or `"../"`, and no dynamic `import("./…")` or `import("../…")`.
+2. **Split parity.** Importing `dist/index.js` (the existing capture pattern) registers the same 65 tool names, with identical `tools/list` output, as a committed snapshot generated from 4496e1d.
 3. **Reload swaps in place.**
-   - Connect a server to an in-memory transport pair (`InMemoryTransport.createLinkedPair()` from the SDK) with a client.
-   - Copy `dist/` to a temp directory, then write a modified `tools.js` that adds an action to one enum.
-   - Trigger the reload through the exported hook (§4).
-   - Assert three things:
-     - the client receives `notifications/tools/list_changed`;
-     - `tools/list` now shows the new action;
-     - a call using it validates.
-   - The `connection.id` sent in `x-gc-client` is the same before and after. Assert this with a stub `daemonFetch` target, a local HTTP server.
-4. **Failed reload keeps the old tools.** A `tools.js` that throws on import leaves `tools/list` unchanged and makes the next tool result carry the failure notice.
-5. **Notice lifecycle.** After a successful reload, a tool result carries the reload notice. After the client issues `tools/list`, the next tool result does not.
-6. **Entry change notice.** Touch the temp copy of `dist/index.js`. The next result carries the reconnect notice.
-7. **Debounce.** A single poll that sees a change does not reload. Two agreeing polls do.
+   - Set up an in-memory client and server pair (`InMemoryTransport.createLinkedPair()`).
+   - Point `GC_MCP_TOOLS_PATH` at a `.tmp/` copy, write a modified `tools.js` that adds an enum action, and call `__reloadNow()`.
+   - Assert all of these:
+     - the client receives `tools/list_changed`;
+     - `tools/list` shows the new action;
+     - a call using it validates;
+     - the `x-gc-client` header seen by a stub daemon (a local HTTP server, via `GC_DAEMON_URL`) is identical before and after the reload.
+4. **No stacking (round 1, Finding 1).** After **three** reloads, one successful tool call produces:
+   - exactly **one** `POST /gc/delegations/take` at the stub daemon;
+   - exactly **one** notice item.
+5. **Failed reload keeps the old tools.** A `tools.js` that throws on import leaves `tools/list` unchanged, and the next successful result carries the `failed` notice.
+6. **Notice lifecycle.**
+   - After a reload, a result carries the `reloaded` notice.
+   - After the client issues `tools/list`, the next result has no notice.
+   - An error result never carries one.
+7. **Entry change.** Point `GC_MCP_ENTRY_PATH` at a `.tmp/` file and touch it. After two polls, the next result carries the `entry_changed` notice.
+8. **Debounce.** One poll that sees a change does not reload. Two agreeing polls do.
+9. **Turn-key continuity (round 1, Finding 3).**
+   - A `gc_agent_conversation` turn is cut short, against a stub daemon that holds the response.
+   - Reload, then retry the same turn.
+   - The stub sees the same idempotency key on both requests.
+10. **Atomic swap.** During `__reloadNow()`, a `tools/list` issued concurrently from the client returns either the full old set or the full new set, never a partial one.
+11. **HTTP session after a swap.** A streamable-HTTP session created after a reload lists the new action.
 
 ## 4. Seams
 
-- The entry exports `__reloadNow(path?)` and `__pollOnce()`, used only by the tests, so tests 3–7 do not wait on the 5 s timer.
-- The tools path is resolved from `import.meta.url`. Tests point it at their temp copy through `GC_MCP_TOOLS_PATH`.
+- **`registerTools(server, shared)`.** `shared` is `{fetch, gcBase, callStore, turnKeys: {turnKeyFor, finishTurnKey, turnKeyKept, isClientCutShort}, noteInlineSeq}`. Tests construct it through the entry's exported `createShared()`.
+- **Test hooks.** The entry exports `__reloadNow()`, `__pollOnce()` and `__registry`. Tests use them so they do not wait on the 5 s timer.
+- **Environment.**
+  - `GC_MCP_TOOLS_PATH` and `GC_MCP_ENTRY_PATH` redirect the two polled paths.
+  - `GC_MCP_RELOAD=0` disables polling.
+  - `GC_DAEMON_URL` points delivery at a stub daemon.
+- **Re-exports.** `dist/index.js` re-exports `turnKeyFor`, `finishTurnKey`, `turnKeyKept` and `isClientCutShort`, which are the entry-owned ones.
