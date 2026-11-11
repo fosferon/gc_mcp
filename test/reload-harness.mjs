@@ -1,6 +1,6 @@
 // Shared harness for the GC-7182 reload tests. It never contacts the daemon:
 // every test points GC_DAEMON_URL at a local stub before importing the entry.
-import { copyFileSync, mkdirSync, mkdtempSync } from "node:fs";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer } from "node:http";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -11,10 +11,23 @@ import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 export const repoRoot = fileURLToPath(new URL("..", import.meta.url));
 
 /** A repo-internal .tmp/ copy, so bare specifiers still resolve. */
-export function makeToolsCopy(name = "tools") {
+// GC-7182 impl r1 F4: every scratch dir is removed when the test process exits.
+const scratchDirs = new Set();
+process.on("exit", () => {
+  for (const dir of scratchDirs) rmSync(dir, { recursive: true, force: true });
+});
+
+/** A repo-internal .tmp/ scratch dir, removed at process exit. */
+export function makeScratchDir(name) {
   const tmp = join(repoRoot, ".tmp");
   mkdirSync(tmp, { recursive: true });
   const dir = mkdtempSync(join(tmp, `gc7182-${name}-`));
+  scratchDirs.add(dir);
+  return dir;
+}
+
+export function makeToolsCopy(name = "tools") {
+  const dir = makeScratchDir(name);
   const path = join(dir, "tools.js");
   copyFileSync(join(repoRoot, "dist", "tools.js"), path);
   return { dir, path };

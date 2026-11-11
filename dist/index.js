@@ -173,6 +173,8 @@ function describeError(e) {
 // 30 min) plus a minute, so the client never gives up on a turn the daemon is
 // still allowed to finish.
 // GC_MCP_TURN_TIMEOUT_MS overrides it for tests only.
+// Keep in sync with the copy in src/tools.ts (GC-7182 impl r1 F3): the entry
+// uses it for the turn-key TTL, tools.ts for keyedTurn's fetch deadline.
 const AGENT_CONVERSATION_TURN_TIMEOUT_MS = Number(process.env.GC_MCP_TURN_TIMEOUT_MS) > 0
     ? Number(process.env.GC_MCP_TURN_TIMEOUT_MS)
     : 31 * 60 * 1000;
@@ -452,7 +454,7 @@ function noticeText(notice) {
         return "[gc_mcp] The gc_mcp entry was rebuilt; reconnect the gc MCP server to load it.";
     }
     if (notice.state === "reloaded") {
-        return `[gc_mcp] Tools were reloaded from a newer build (\`${notice.from}\` → \`${notice.to}\`, as \`tools.js@<mtime>\` labels). If an action you expect is refused as unknown, reconnect the gc MCP server.`;
+        return `[gc_mcp] Tools were reloaded from a newer build (${notice.from} → ${notice.to}). If an action you expect is refused as unknown, reconnect the gc MCP server.`;
     }
     if (notice.state === "failed") {
         return `[gc_mcp] A newer build failed to load (${notice.error ?? "unknown error"}); still serving ${notice.from ?? registry.currentLabel}.`;
@@ -716,7 +718,11 @@ export async function __pollOnce() {
         pollInFlight = false;
     }
 }
-/** Test hook: import and swap immediately, bypassing the poll debounce. */
+/**
+ * Test hook: import and swap immediately, bypassing the poll debounce.
+ * It also deliberately bypasses the failed-mtime no-retry rule (force), so a
+ * test can re-import on demand; the watcher path never does (GC-7182 impl r1 F2).
+ */
 export async function __reloadNow() {
     const toolsPath = currentToolsPath();
     await reloadFromDisk(toolsPath, identity(toolsPath), true);

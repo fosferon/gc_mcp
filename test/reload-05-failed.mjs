@@ -38,7 +38,12 @@ try {
     ),
     "the failed notice must reach the next successful result",
   );
-  assert.match(textOf(result), /still serving tools\.js@/);
+  const failedText = result.content.find((item) => item.text?.startsWith("[gc_mcp]")).text;
+  assert.match(
+    failedText,
+    /^\[gc_mcp\] A newer build failed to load \(boom\); still serving tools\.js@\S+\.$/,
+    "the failed notice text is exactly the design §2.3 text",
+  );
 
   process.stdout.write("Verified a failed reload keeps the old tools and reports.\n");
 } finally {

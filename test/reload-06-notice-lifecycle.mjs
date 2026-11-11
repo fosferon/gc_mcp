@@ -45,6 +45,12 @@ try {
   });
   assert.notEqual(success.isError, true, textOf(success));
   assert.ok(hasReloadedNotice(success), "a post-reload result carries the notice");
+  const reloadedText = success.content.find((item) => item.text?.startsWith("[gc_mcp]")).text;
+  assert.match(
+    reloadedText,
+    /^\[gc_mcp\] Tools were reloaded from a newer build \(tools\.js@\S+ → tools\.js@\S+\)\. If an action you expect is refused as unknown, reconnect the gc MCP server\.$/,
+    "the reloaded notice text is exactly the design §2.3 text",
+  );
 
   fail = true;
   const error = await client.callTool({

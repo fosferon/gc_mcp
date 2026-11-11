@@ -107,7 +107,7 @@ The notice state is per server, in the entry: `{state: "fresh" | "reloaded" | "f
 - A refused unknown action is an SDK-generated error that never reaches the wrapper (`mcp.js:181`). So the notice reaches the agent on its next successful call, which is enough to explain the refusal.
 
 The three texts:
-- **`reloaded`:** `[gc_mcp] Tools were reloaded from a newer build (`<from>` → `<to>`, as `tools.js@<mtime>` labels). If an action you expect is refused as unknown, reconnect the gc MCP server.` It shows until the client issues `tools/list`.
+- **`reloaded`:** `[gc_mcp] Tools were reloaded from a newer build (<from> → <to>). If an action you expect is refused as unknown, reconnect the gc MCP server.` It shows until the client issues `tools/list`.
 - **`failed`:** `[gc_mcp] A newer build failed to load (<error, first 200 characters>); still serving <from>.` It shows until a later reload succeeds.
 - **`entry_changed`:** `[gc_mcp] The gc_mcp entry was rebuilt; reconnect the gc MCP server to load it.` It is permanent for that process. If more than one state applies, `entry_changed` wins. A tools reload still runs alongside it.
 

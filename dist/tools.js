@@ -21,6 +21,8 @@ export function registerTools(server, shared) {
     // 30 min) plus a minute, so the client never gives up on a turn the daemon is
     // still allowed to finish.
     // GC_MCP_TURN_TIMEOUT_MS overrides it for tests only.
+    // Keep in sync with the copy in src/index.ts (GC-7182 impl r1 F3): the entry
+    // uses it for the turn-key TTL, this module for keyedTurn's fetch deadline.
     const AGENT_CONVERSATION_TURN_TIMEOUT_MS = Number(process.env.GC_MCP_TURN_TIMEOUT_MS) > 0
         ? Number(process.env.GC_MCP_TURN_TIMEOUT_MS)
         : 31 * 60 * 1000;
@@ -261,6 +263,7 @@ export function registerTools(server, shared) {
             }
         }
     }
+    // Same check as the entry's isClientCutShort uses; keep in sync with src/index.ts.
     function isAbortError(e) {
         const name = e?.name;
         return name === "AbortError" || name === "TimeoutError";

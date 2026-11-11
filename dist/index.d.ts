@@ -56,6 +56,10 @@ export declare const __registry: {
 };
 /** Test hook: one watcher pass, including the two-poll debounce. */
 export declare function __pollOnce(): Promise<void>;
-/** Test hook: import and swap immediately, bypassing the poll debounce. */
+/**
+ * Test hook: import and swap immediately, bypassing the poll debounce.
+ * It also deliberately bypasses the failed-mtime no-retry rule (force), so a
+ * test can re-import on demand; the watcher path never does (GC-7182 impl r1 F2).
+ */
 export declare function __reloadNow(): Promise<void>;
 export {};
