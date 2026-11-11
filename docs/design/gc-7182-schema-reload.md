@@ -3,7 +3,9 @@
 - **Bee:** GC-7182.
 - **Repo:** gc_mcp.
 - **Branch:** `gc/7182-schema-reload`, from `master` 4496e1d.
-- **Status:** design rev 2, before implementation. Rev 2 folds design audit round 1 (`audits/audit-gc-7182-design-round1.md`), which found 2 high, 2 medium and 3 low.
+- **Status:** design rev 3, before implementation.
+  - Rev 2 folded design audit round 1 (`audits/audit-gc-7182-design-round1.md`), which found 2 high, 2 medium and 3 low.
+  - Rev 3 folds round 2 (`audits/audit-gc-7182-design-round2.md`), a PASS with conditions: 2 medium and 1 low.
 
 ## 1. The problem
 
@@ -85,8 +87,13 @@ A real case: a session started 2026-11-02 rejected `gc_dispatch action: cancel`,
   3. set the notice to "reloaded".
 
   Because the block is one JS task, no incoming `tools/call` or `tools/list` can observe an empty or partial set. The code carries a comment saying so, so a later refactor does not open the window.
-  - The block emits about 130 `list_changed` notifications per server, one per remove and one per register. That is the accepted cost of the public API. `RegisteredTool.update` cannot take a new ZodObject schema (`mcp.js:678-679`), so remove plus register is the right primitive.
-  - A client that re-lists on the first notification still reads the final set, because the notifications are sent from within the same task and are processed after it.
+  - Remove plus register is the right primitive: `RegisteredTool.update` cannot take a new ZodObject schema (`mcp.js:678-679`).
+- **Notifications (round 2, Finding N2).** Each `remove()` and `registerTool` calls `McpServer.sendToolListChanged()`. That calls the async `Server.sendToolListChanged()` without awaiting or catching it (`mcp.js:809-812`). If the client has died, the rejection goes unhandled, and Node's default `--unhandled-rejections=throw` would end the whole process. Until now this never happened, because every registration ran before `connect`. The swap is the first code that sends on live connections.
+  - So, at server creation, the entry replaces `server.server.sendToolListChanged`, once, with a wrapper that:
+    - does nothing while that server's `swapping` flag is set;
+    - otherwise calls the original and attaches `.catch(() => {})`. A dead client already shows up through the transport's close path.
+  - The swap block sets `swapping = true`, removes the tools and registers the new ones, then sets `swapping = false` and sends **one** caught `list_changed`. That replaces the burst of about 130 per server.
+  - A client that re-lists on it reads the final set, because the send happens after the block completes.
 - **New HTTP sessions** take `registry.current` when they register. A session whose `initialize` lands while an import is in progress gets whichever module is current when it registers. If that is the old one, it is still in the registry and is swapped with the rest, because the swap iterates the registry after the import resolves.
 - **In-flight calls** keep the closure they started with and finish on the old code. No call is cancelled.
 - **Opt-out.** `GC_MCP_RELOAD=0` disables the watcher.
@@ -140,12 +147,17 @@ All tests are added to `npm test`. Each one that copies `dist/` puts the copy un
    - A `gc_agent_conversation` turn is cut short, against a stub daemon that holds the response.
    - Reload, then retry the same turn.
    - The stub sees the same idempotency key on both requests.
-10. **Atomic swap.** During `__reloadNow()`, a `tools/list` issued concurrently from the client returns either the full old set or the full new set, never a partial one.
-11. **HTTP session after a swap.** A streamable-HTTP session created after a reload lists the new action.
+10. **One notification, no crash (round 2, Finding N2).**
+    - A reload sends exactly one `tools/list_changed` per server.
+    - When the client transport's `send` rejects during a reload, there is no unhandled rejection: the test installs a `process.on('unhandledRejection')` spy and asserts it is never called, and the process stays up.
+11. **Atomic swap.** During `__reloadNow()`, a `tools/list` issued concurrently from the client returns either the full old set or the full new set, never a partial one.
+12. **HTTP session after a swap.** A streamable-HTTP session created after a reload lists the new action.
 
 ## 4. Seams
 
-- **`registerTools(server, shared)`.** `shared` is `{fetch, gcBase, callStore, turnKeys: {turnKeyFor, finishTurnKey, turnKeyKept, isClientCutShort}, noteInlineSeq}`. Tests construct it through the entry's exported `createShared()`.
+- **`registerTools(server, shared)`.** `shared` is `{fetch, gcBase, callStore, turnKeys: {turnKeyFor, finishTurnKey, turnKeyKept, isClientCutShort}, noteInlineSeq, describeError, packageDir}`.
+  - `describeError` is entry-owned because it reads the entry's `daemonDispatcher === undefined` (`src/index.ts:203-220`). That keeps the degraded-mode text `test/missing-undici.mjs:91-96` pins (round 2, Finding N1).
+  - `packageDir` is the entry's own package root. `getResolveBridgePath`'s fallback (`src/index.ts:5108-5114`) resolves from it, not from `import.meta.url`, so a redirected `GC_MCP_TOOLS_PATH` does not move it (round 2, low). Tests construct it through the entry's exported `createShared()`.
 - **Test hooks.** The entry exports `__reloadNow()`, `__pollOnce()` and `__registry`. Tests use them so they do not wait on the 5 s timer.
 - **Environment.**
   - `GC_MCP_TOOLS_PATH` and `GC_MCP_ENTRY_PATH` redirect the two polled paths.
