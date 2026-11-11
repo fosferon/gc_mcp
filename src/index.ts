@@ -227,6 +227,7 @@ const AGENT_CONVERSATION_TURN_TIMEOUT_MS =
     ? Number(process.env.GC_MCP_TURN_TIMEOUT_MS)
     : 31 * 60 * 1000;
 
+// Same check as src/tools.ts's isAbortError; keep in sync (GC-7182 impl r1 F3).
 function isAbortError(e: unknown): boolean {
   const name = (e as { name?: string } | null)?.name;
   return name === "AbortError" || name === "TimeoutError";
