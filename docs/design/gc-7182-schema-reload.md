@@ -42,6 +42,7 @@ A real case: a session started 2026-11-02 rejected `gc_dispatch action: cancel`,
      - `callStore`;
      - the turn-key store `unconfirmedTurnKeys` and its four functions, which `dist/index.js` re-exports so `test/agent-conversation-turn-key.mjs` keeps working;
      - `noteInlineSeq`;
+     - `describeError` and `packageDir` (§4);
      - `GC_BASE`.
    - **Per server**:
      - `new McpServer(...)` with its name, version and instructions;
@@ -156,8 +157,8 @@ All tests are added to `npm test`. Each one that copies `dist/` puts the copy un
 ## 4. Seams
 
 - **`registerTools(server, shared)`.** `shared` is `{fetch, gcBase, callStore, turnKeys: {turnKeyFor, finishTurnKey, turnKeyKept, isClientCutShort}, noteInlineSeq, describeError, packageDir}`.
-  - `describeError` is entry-owned because it reads the entry's `daemonDispatcher === undefined` (`src/index.ts:203-220`). That keeps the degraded-mode text `test/missing-undici.mjs:91-96` pins (round 2, Finding N1).
-  - `packageDir` is the entry's own package root. `getResolveBridgePath`'s fallback (`src/index.ts:5108-5114`) resolves from it, not from `import.meta.url`, so a redirected `GC_MCP_TOOLS_PATH` does not move it (round 2, low).
+  - `describeError` is entry-owned because it reads the entry's `daemonDispatcher === undefined` (`src/index.ts:203-220`). That keeps the degraded-mode text `test/missing-undici.mjs:86-90` pins (round 2, Finding N1).
+  - `packageDir` is the directory containing the entry module, i.e. what `dirname(import.meta.url)` returns in `dist/index.js` today, so the fallback's two `..` hops land exactly where they do now. `getResolveBridgePath`'s fallback (`src/index.ts:5108-5114`) resolves from it, not from `import.meta.url`, so a redirected `GC_MCP_TOOLS_PATH` does not move it (round 2, low).
   - Tests construct `shared` through the entry's exported `createShared()`.
 - **Test hooks.** The entry exports `__reloadNow()`, `__pollOnce()` and `__registry`. Tests use them so they do not wait on the 5 s timer.
 - **Environment.**
