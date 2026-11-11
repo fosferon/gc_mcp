@@ -157,7 +157,8 @@ All tests are added to `npm test`. Each one that copies `dist/` puts the copy un
 
 - **`registerTools(server, shared)`.** `shared` is `{fetch, gcBase, callStore, turnKeys: {turnKeyFor, finishTurnKey, turnKeyKept, isClientCutShort}, noteInlineSeq, describeError, packageDir}`.
   - `describeError` is entry-owned because it reads the entry's `daemonDispatcher === undefined` (`src/index.ts:203-220`). That keeps the degraded-mode text `test/missing-undici.mjs:91-96` pins (round 2, Finding N1).
-  - `packageDir` is the entry's own package root. `getResolveBridgePath`'s fallback (`src/index.ts:5108-5114`) resolves from it, not from `import.meta.url`, so a redirected `GC_MCP_TOOLS_PATH` does not move it (round 2, low). Tests construct it through the entry's exported `createShared()`.
+  - `packageDir` is the entry's own package root. `getResolveBridgePath`'s fallback (`src/index.ts:5108-5114`) resolves from it, not from `import.meta.url`, so a redirected `GC_MCP_TOOLS_PATH` does not move it (round 2, low).
+  - Tests construct `shared` through the entry's exported `createShared()`.
 - **Test hooks.** The entry exports `__reloadNow()`, `__pollOnce()` and `__registry`. Tests use them so they do not wait on the 5 s timer.
 - **Environment.**
   - `GC_MCP_TOOLS_PATH` and `GC_MCP_ENTRY_PATH` redirect the two polled paths.
